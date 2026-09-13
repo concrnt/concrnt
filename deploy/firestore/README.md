@@ -68,8 +68,15 @@ docker run --rm -p 8080:8080 gcr.io/google.com/cloudsdktool/google-cloud-cli:emu
 ## Operational notes
 
 - `conctl op gc-commitlog` / `dump-commitlog` / `import-commitlog` /
-  `create-account` work on both backends. `repair-*` and `migrate-*` are
-  Postgres-only.
+  `dump-subscriptions` / `import-subscriptions` / `create-account` work on
+  both backends. `repair-*` and `migrate-*` are Postgres-only.
+- Moving an existing Postgres server to Firestore is a commit-log replay, not
+  a table copy: `dump-commitlog` + `dump-subscriptions` on the Postgres side,
+  start the Firestore-backed server (same fqdn and key), then
+  `import-commitlog --rejected-out` followed by `import-subscriptions`, and
+  compare a `dump-commitlog` taken from the Firestore side with the source.
+  The step-by-step runbook, what the replay intentionally drops and how to
+  read the diff are in `MIGRATION.md`.
 - Firestore has no cascading deletes; the repository fans them out itself
   (record delete removes the key and its associations, GC removes everything
   hanging off a commit). Re-running GC finishes a partially failed pass.

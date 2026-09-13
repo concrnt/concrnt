@@ -34,7 +34,8 @@ var dumpCommitlogCmd = &cobra.Command{
 		"lives outside the commit log, is written separately to <name>.metas.jsonl, one\n" +
 		"domain.EntityMeta per line. [name] defaults to a timestamp when omitted.\n" +
 		"Use --since/--since-id (and optionally --until/--until-id) to export only commits from\n" +
-		"a given point in time onward. Reads directly from the database; no running server required.",
+		"a given point in time onward. Reads directly from the database; no running server required.\n" +
+		"Web push subscriptions are not part of the commit log: dump them with dump-subscriptions.",
 	Args: cobra.MaximumNArgs(1),
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
 		ctx := cmd.Context()
