@@ -81,10 +81,16 @@ type ackCall struct {
 	createdAt  time.Time
 }
 
-func (r *recordingRecordRepo) BeginTx(ctx context.Context) (RepositoryTx, error) {
+func (r *recordingRecordRepo) RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error {
 	tx := &recordingTx{}
 	r.txs = append(r.txs, tx)
-	return tx, nil
+	err := fn(tx)
+	if err != nil {
+		tx.rolledBack = true
+		return err
+	}
+	tx.committed = true
+	return nil
 }
 func (r *recordingRecordRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
 	r.createdCommitLogs = append(r.createdCommitLogs, id)

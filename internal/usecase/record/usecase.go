@@ -18,7 +18,11 @@ import (
 
 type Repository interface {
 	// Utilities
-	BeginTx(ctx context.Context) (RepositoryTx, error)
+	// RunInTx runs fn atomically. fn may be invoked more than once (a backend
+	// may retry on contention), so it must reach the store only through tx
+	// and must not have side effects of its own. A non-nil error from fn
+	// rolls the transaction back and is returned unchanged.
+	RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error
 
 	// Create / Update
 	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
@@ -69,9 +73,11 @@ type QueryRow struct {
 	CreatedAt time.Time
 }
 
+// RepositoryTx is the opaque per-backend transaction handle passed back into
+// the repository's transactional methods. Implementations mark themselves
+// with IsRepositoryTx; the usecase never drives commit/rollback itself.
 type RepositoryTx interface {
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
+	IsRepositoryTx()
 }
 
 type PostProcessAction func(ctx context.Context) error

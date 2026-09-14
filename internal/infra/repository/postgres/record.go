@@ -29,24 +29,18 @@ type recordTx struct {
 	tx *gorm.DB
 }
 
+func (*recordTx) IsRepositoryTx() {}
+
 func NewRecordRepository(db *gorm.DB) record.Repository {
 	return &RecordRepository{db: db}
 }
 
-func (r *RecordRepository) BeginTx(ctx context.Context) (record.RepositoryTx, error) {
-	tx := r.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, tx.Error
-	}
-	return &recordTx{tx: tx}, nil
-}
-
-func (tx *recordTx) Commit(ctx context.Context) error {
-	return tx.tx.WithContext(ctx).Commit().Error
-}
-
-func (tx *recordTx) Rollback(ctx context.Context) error {
-	return tx.tx.WithContext(ctx).Rollback().Error
+// RunInTx runs fn inside one database transaction: fn's error rolls back and
+// is returned unchanged, a nil return commits.
+func (r *RecordRepository) RunInTx(ctx context.Context, fn func(tx record.RepositoryTx) error) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(&recordTx{tx: tx})
+	})
 }
 
 func getRecordTx(ctx context.Context, tx record.RepositoryTx) (*gorm.DB, error) {
@@ -922,9 +916,9 @@ func (r *RecordRepository) GetAssociatedRecordCountsByVariant(ctx context.Contex
 	defer span.End()
 
 	var counts []struct {
-		Variant  string
-		Count    int64
-		MinCDate time.Time
+		Variant      string
+		Count        int64
+		MinCreatedAt time.Time
 	}
 
 	err := r.db.WithContext(ctx).
@@ -945,7 +939,7 @@ func (r *RecordRepository) GetAssociatedRecordCountsByVariant(ctx context.Contex
 	for _, c := range counts {
 		result[c.Variant] = utils.OrderedKV[int64]{
 			Value: c.Count,
-			Order: c.MinCDate.UnixNano(),
+			Order: c.MinCreatedAt.UnixNano(),
 		}
 	}
 

@@ -10,7 +10,6 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/usecase/residence"
@@ -81,11 +80,9 @@ var createAccountCmd = &cobra.Command{
 		// 登録制限は適用しない
 		op.GlobalConfig.Registration = "open"
 
-		residenceRepo := postgres.NewResidenceRepository(op.DB, op.Client, op.GlobalConfig)
-		recordRepo := postgres.NewRecordRepository(op.DB)
-		serverRepo := postgres.NewServerRepository(&op.GlobalConfig, op.DB, op.Client)
-		serverUC := server.New(serverRepo, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
-		recordUC := record.New(recordRepo, residenceRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
+		residenceRepo := op.Repos.Residence
+		serverUC := server.New(op.Repos.Server, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
+		recordUC := record.New(op.Repos.Record, residenceRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
 		residenceUC := residence.New(residenceRepo, recordUC, &op.GlobalConfig)
 
 		if err := residenceUC.Register(cmd.Context(), "", req); err != nil {

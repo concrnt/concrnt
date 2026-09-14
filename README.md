@@ -75,7 +75,7 @@ go build ./cmd/conctl       # admin CLI (account creation, key generation, v1->v
 go build ./cmd/k8s-elector  # optional Kubernetes sidecar for leader election / peer discovery
 
 go vet ./...
-go test ./...                                    # repository-layer tests spin up Postgres via dockertest (needs a Docker daemon)
+go test ./...                                    # repository-layer tests spin up Postgres and the Firestore emulator via dockertest (needs a Docker daemon)
 go test ./policy/... ./chunkline/... ./client/... # pure-logic packages, no Docker required
 go test ./... -run TestName -v                   # a single test
 ```
@@ -119,7 +119,9 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `delete.go`); `read.go`/`query.go` are the read paths, `deliver.go` the federation
   delivery job, `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  (GORM) and `repository/firestore` (Cloud Firestore), selected by `repository.Open`
+  from `backends.database`, with the shared contract suites in `repository/repotest`;
+  `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).
@@ -155,7 +157,8 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
 ### Config
 
 `internal/infra/config` loads YAML; see `config.example.yaml` for the full shape
-(`concrnt` domain identity and registration mode, `backends` for Postgres/Redis/Memcached,
+(`concrnt` domain identity and registration mode, `backends` for the database
+(`database: postgres | firestore`, see `deploy/firestore/README.md`) plus Redis/Memcached,
 `observability` tracing, `integrations` for captcha/VAPID keys, `meta` for
 instance branding served via well-known, `services` for pluggable modules).
 `domain.Config` is the resulting in-process representation.

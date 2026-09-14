@@ -18,7 +18,6 @@ import (
 	"github.com/labstack/echo/v4"
 	echomiddleware "github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/xinguang/go-recaptcha"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 	"go.opentelemetry.io/otel/trace"
@@ -33,7 +32,7 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/infra/repository"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -190,15 +189,18 @@ func main() {
 	buildInfo.Set(1)
 	prometheus.MustRegister(buildInfo)
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
-	if err != nil {
-		panic("failed to connect database")
+	cl := client.New(domainConfig.FQDN)
+	if conf.Backends.GatewayAddr != "" {
+		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
 	}
+	cl.SetUserAgent("concrnt", version)
 
-	err = database.MigratePostgres(db)
+	repos, err := repository.Open(ctx, conf.Backends, repository.Deps{Client: cl, DomainConfig: domainConfig})
 	if err != nil {
-		panic("failed to migrate database")
+		panic(err.Error())
 	}
+	defer repos.Close()
+	slog.Info("database backend ready", slog.String("backend", repos.Name))
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
@@ -227,12 +229,6 @@ func main() {
 		elector = cluster.AlwaysLeader{}
 	}
 
-	cl := client.New(domainConfig.FQDN)
-	if conf.Backends.GatewayAddr != "" {
-		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
-	}
-	cl.SetUserAgent("concrnt", version)
-
 	moduleManager := service.NewModuleManager(rest.Endpoints, conf.Services)
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
@@ -246,15 +242,12 @@ func main() {
 		cl,
 	)
 
-	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
-	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
+	serverUC := server.New(repos.Server, &domainConfig, softwareInfo, moduleManager, cl)
 
-	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
-	recordRepo := postgres.NewRecordRepository(db)
-	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
+	recordUC := record.New(repos.Record, repos.Residence, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(repos.Residence, recordUC, &domainConfig)
 
-	chunklineRepo := postgres.NewChunklineRepository(db)
+	chunklineRepo := repos.Chunkline
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
@@ -280,8 +273,7 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := postgres.NewNotificationRepository(db)
-	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
+	notificationUC := notification.New(repos.Notification, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery)
 	workerSub := worker.NewWorkerSubscriber(elector)
@@ -325,8 +317,7 @@ func main() {
 		}
 	}()
 
-	abuseRepo := postgres.NewAbuseRepository(db)
-	abuseUC := abuse.New(abuseRepo)
+	abuseUC := abuse.New(repos.Abuse)
 
 	var notificationReactor *worker.NotificationReactor
 	if webpushOpts != nil {
@@ -422,25 +413,23 @@ func main() {
 	var ready atomic.Bool
 	ready.Store(true)
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
+	// backend-specific store metrics (go_sql_* for Postgres: the pool is
+	// small, so saturation and wait time are the first thing to check when
+	// everything gets slow; operation latency for Firestore)
+	for _, collector := range repos.Collectors {
+		prometheus.MustRegister(collector)
 	}
-
-	// connection pool usage (go_sql_*): the pool is small, so saturation
-	// and wait time are the first thing to check when everything gets slow
-	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
 	internal.GET("/ready", func(c echo.Context) (err error) {
 		if !ready.Load() {
 			return c.String(http.StatusServiceUnavailable, "shutting down")
 		}
 
-		// only Postgres gates readiness: redis and memcached are soft
+		// only the database gates readiness: redis and memcached are soft
 		// dependencies (cache misses fall back to origin, publish failures
 		// are logged), and failing all replicas at once on a cache-tier blip
 		// would turn a degradation into a full outage
-		if err := sqlDB.PingContext(c.Request().Context()); err != nil {
+		if err := repos.Ready(c.Request().Context()); err != nil {
 			return c.String(http.StatusServiceUnavailable, "db error")
 		}
 

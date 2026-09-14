@@ -23,6 +23,9 @@ type Repository interface {
 	UpdateMetaInfo(ctx context.Context, ccid string, info string) error
 	DeleteMeta(ctx context.Context, ccid string) error
 	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
+	// ListMetas returns every entity meta, or only the one for owner when
+	// owner is non-empty (offline tooling).
+	ListMetas(ctx context.Context, owner string) ([]domain.EntityMeta, error)
 }
 
 type Usecase struct {

@@ -1,4 +1,4 @@
-package postgres
+package repotest
 
 import (
 	"context"
@@ -7,19 +7,24 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
-	"github.com/concrnt/concrnt/internal/testutil"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// UpdateMetaInfo must touch only the info column (SaveMeta's upsert would
-// clobber inviter) and report NotFound for unregistered ccids.
-func TestResidenceUpdateMetaInfo(t *testing.T) {
-	db, cleanup := testutil.CreateDB()
-	t.Cleanup(cleanup)
+// RunResidenceSuite runs the residence.Repository contract tests. open must
+// return a fresh, isolated backend per call; it is called once per top-level
+// test.
+func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
+	t.Run("UpdateMetaInfo", func(t *testing.T) { testResidenceUpdateMetaInfo(t, open(t)) })
+	t.Run("MarkCommitLogsGcCandidateByOwner", func(t *testing.T) { testResidenceMarkCommitLogsGcCandidateByOwner(t, open(t)) })
+}
 
+// UpdateMetaInfo must touch only the info field (SaveMeta's upsert would
+// clobber inviter) and report NotFound for unregistered ccids.
+func testResidenceUpdateMetaInfo(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo := &ResidenceRepository{db: db}
+	repo := be.Residence
 
 	ccid := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"
@@ -37,7 +42,8 @@ func TestResidenceUpdateMetaInfo(t *testing.T) {
 
 	meta, err := repo.GetMeta(ctx, ccid)
 	require.NoError(t, err)
-	require.Equal(t, `{"email": "b@example.com"}`, meta.Info)
+	// jsonb backends may re-serialize the document; compare as JSON
+	require.JSONEq(t, `{"email":"b@example.com"}`, meta.Info)
 	require.NotNil(t, meta.Inviter)
 	require.Equal(t, inviter, *meta.Inviter)
 }
@@ -45,21 +51,21 @@ func TestResidenceUpdateMetaInfo(t *testing.T) {
 // Unregister flags every commit the departing user owns. Every commit has
 // exactly one owner (an ack between two local users is two commits: the ack
 // owned by the acker and the acked mirror owned by the target), so the whole
-// repository of the departing user is eligible and nobody else's rows are
+// repository of the departing user is eligible and nobody else's commits are
 // touched; commits with no recorded owner are left alone.
-func TestResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T) {
-	db, cleanup := testutil.CreateDB()
-	t.Cleanup(cleanup)
-
+func testResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo := &ResidenceRepository{db: db}
+	repo := be.Residence
+	in := be.Inspect
 
 	userA := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	userB := "con1pppppppppppppppppppppppppppppppppppppppp"
 
 	seed := func(id string, owner string) {
 		t.Helper()
-		require.NoError(t, db.Create(&models.CommitLog{ID: id, Document: "{}", Proof: "{}", Owner: owner}).Error)
+		InTx(t, ctx, be.Record, func(tx record.RepositoryTx) {
+			require.NoError(t, be.Record.CreateCommitLog(ctx, tx, id, "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, owner))
+		})
 	}
 	seed("log-a-ack", userA)
 	seed("log-b-mirror", userB)
@@ -67,11 +73,9 @@ func TestResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T) {
 
 	flagged := func() map[string]bool {
 		t.Helper()
-		var logs []models.CommitLog
-		require.NoError(t, db.Find(&logs).Error)
 		out := map[string]bool{}
-		for _, log := range logs {
-			out[log.ID] = log.GcCandidate
+		for _, id := range []string{"log-a-ack", "log-b-mirror", "log-unowned"} {
+			out[id] = mustCommit(t, ctx, in, id).GcCandidate
 		}
 		return out
 	}

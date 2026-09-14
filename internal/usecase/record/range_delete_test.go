@@ -70,8 +70,7 @@ type recordingTx struct {
 	rolledBack bool
 }
 
-func (t *recordingTx) Commit(ctx context.Context) error   { t.committed = true; return nil }
-func (t *recordingTx) Rollback(ctx context.Context) error { t.rolledBack = true; return nil }
+func (t *recordingTx) IsRepositoryTx() {}
 
 type subtreeQueryCall struct {
 	base        string
@@ -96,10 +95,16 @@ type rangeDeleteRepo struct {
 	gcFlagged []string
 }
 
-func (r *rangeDeleteRepo) BeginTx(ctx context.Context) (RepositoryTx, error) {
+func (r *rangeDeleteRepo) RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error {
 	tx := &recordingTx{}
 	r.txs = append(r.txs, tx)
-	return tx, nil
+	err := fn(tx)
+	if err != nil {
+		tx.rolledBack = true
+		return err
+	}
+	tx.committed = true
+	return nil
 }
 func (r *rangeDeleteRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
 	if r.commitLogOwners == nil {

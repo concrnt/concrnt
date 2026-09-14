@@ -28,7 +28,15 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
+  # database selects the persistence backend: postgres (default) or firestore.
+  database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # firestore is used when database is "firestore". credentials come from
+  # Application Default Credentials (Workload Identity on GKE); deploy the
+  # composite indexes in _etc/firestore/ before switching traffic.
+  # firestore:
+  #   projectID: my-gcp-project   # optional on GKE (detected from metadata)
+  #   databaseID: concrnt         # optional, "(default)" when omitted
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"

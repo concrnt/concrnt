@@ -32,6 +32,10 @@ func GetReferrerFromReferences(sd concrnt.SignedDocument, requesterID string) *s
 	return nil
 }
 
+// errCommitNoop aborts the commit transaction when the applied document lost
+// accept-if-newer; the usecase reports the stored document instead.
+var errCommitNoop = errors.New("commit no-op")
+
 func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Commit")
 	defer span.End()
@@ -244,23 +248,25 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	//  ** start transatction **
+	//  ** start transaction **
 
-	tx, err := uc.repo.BeginTx(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
+	// The store runs applyCommit atomically and may re-run it on contention,
+	// so nothing with external side effects happens inside: those are the
+	// postProcesses executed after the transaction returns.
+	var applyResult *commitApplyResult
+	err = uc.repo.RunInTx(ctx, func(tx RepositoryTx) error {
+		res, err := applyCommit(tx)
+		if err != nil {
+			return err
 		}
-	}()
-
-	applyResult, err := applyCommit(tx)
-	if err != nil {
+		applyResult = res
+		if res.noop {
+			// roll back: the losing commit's log entry must not persist
+			return errCommitNoop
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errCommitNoop) {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -270,12 +276,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
 		return applyResult.result, nil
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	committed = true
 
 	// A same-key overwrite or delete must be visible to this server's own
 	// verification paths immediately, not after the resource cache's TTL:

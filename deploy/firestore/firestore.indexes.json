@@ -1,0 +1,741 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "parentGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "record_keys",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "ancestors",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "recordCreatedAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "recordID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "variant",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "variant",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "targetGen",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "author",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "acks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "from",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "acks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "from",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "acks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "from",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "acks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "from",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "ackeds",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "to",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "ackeds",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "to",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "ackeds",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "to",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "ackeds",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "to",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "valid",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "schema",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "createdAt",
+          "order": "DESCENDING"
+        },
+        {
+          "fieldPath": "documentID",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "commits",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "owner",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "cDate",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": [
+    {
+      "collectionGroup": "abuse_reports",
+      "fieldPath": "body",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "abuse_reports",
+      "fieldPath": "ip",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "abuse_reports",
+      "fieldPath": "reporter",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "abuse_reports",
+      "fieldPath": "targetURI",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "associations",
+      "fieldPath": "owner",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "associations",
+      "fieldPath": "targetKeyID",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "commits",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "commits",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "commits",
+      "fieldPath": "ip",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entity_metas",
+      "fieldPath": "info",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entity_metas",
+      "fieldPath": "inviter",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "policies",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "distributions",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "redirect",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "owner",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "gen",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "cleanOnUpdate",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "policies",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "distributions",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "redirect",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "owner",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "author",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "records",
+      "fieldPath": "schema",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "servers",
+      "fieldPath": "wellKnown",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "servers",
+      "fieldPath": "tag",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "servers",
+      "fieldPath": "layer",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "subscription",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "schemas",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "prefixes",
+      "indexes": []
+    }
+  ]
+}

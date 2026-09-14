@@ -44,11 +44,28 @@ type Cluster struct {
 }
 
 type Backends struct {
-	PostgresDsn   string `yaml:"postgresDsn"`
-	GatewayAddr   string `yaml:"gatewayAddr"`
-	RedisAddr     string `yaml:"redisAddr"`
-	RedisDB       int    `yaml:"redisDB"`
-	MemcachedAddr string `yaml:"memcachedAddr"`
+	// Database selects the persistence backend: "postgres" (the default when
+	// empty) or "firestore".
+	Database      string    `yaml:"database"`
+	PostgresDsn   string    `yaml:"postgresDsn"`
+	Firestore     Firestore `yaml:"firestore"`
+	GatewayAddr   string    `yaml:"gatewayAddr"`
+	RedisAddr     string    `yaml:"redisAddr"`
+	RedisDB       int       `yaml:"redisDB"`
+	MemcachedAddr string    `yaml:"memcachedAddr"`
+}
+
+// Firestore configures the Cloud Firestore (Native mode) backend, used when
+// Backends.Database is "firestore". Credentials come from Application Default
+// Credentials (Workload Identity on GKE, `gcloud auth application-default
+// login` locally); FIRESTORE_EMULATOR_HOST in the environment redirects the
+// client to an emulator.
+type Firestore struct {
+	// ProjectID is the GCP project; empty means detect it from the environment
+	// (metadata server / ADC).
+	ProjectID string `yaml:"projectID"`
+	// DatabaseID names the Firestore database; empty means "(default)".
+	DatabaseID string `yaml:"databaseID"`
 }
 
 type Observability struct {

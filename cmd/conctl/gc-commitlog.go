@@ -32,7 +32,7 @@ var gcCommitlogCmd = &cobra.Command{
 		"This deletes every gc_candidate commit log whose document createdAt is older\n" +
 		"than now minus --retention. Retention below the backdate window would reopen\n" +
 		"the replay hole, so shorter values are refused.\n" +
-		"Reads and writes Postgres directly; safe to run against a live server. Re-running is a no-op.",
+		"Reads and writes the database directly; safe to run against a live server. Re-running is a no-op.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
 		ctx := cmd.Context()
@@ -48,11 +48,10 @@ var gcCommitlogCmd = &cobra.Command{
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
 
+		maint := op.Repos.RecordMaintenance
+
 		if gcCommitlogDryRun {
-			var count int64
-			err := op.DB.WithContext(ctx).
-				Raw("SELECT count(*) FROM commit_logs WHERE gc_candidate AND id < ?", cutoff).
-				Scan(&count).Error
+			count, err := maint.CountGcCandidates(ctx, cutoff)
 			if err != nil {
 				return fmt.Errorf("failed to count commit logs: %w", err)
 			}
@@ -62,18 +61,23 @@ var gcCommitlogCmd = &cobra.Command{
 
 		var total int64
 		for {
-			// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
-			// each statement (and its cascade) bounded.
-			res := op.DB.WithContext(ctx).
-				Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT 1000)", cutoff)
-			if res.Error != nil {
-				return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+			// batching keeps each delete (and its cascade) bounded
+			ids, err := maint.ListGcCandidateIDs(ctx, cutoff, 1000)
+			if err != nil {
+				return fmt.Errorf("failed to list commit logs: %w", err)
 			}
-			if res.RowsAffected == 0 {
+			if len(ids) == 0 {
 				break
 			}
-			total += res.RowsAffected
+			deleted, err := maint.DeleteCommitLogs(ctx, ids)
+			if err != nil {
+				return fmt.Errorf("failed to delete commit logs: %w", err)
+			}
+			total += int64(deleted)
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
+			if deleted == 0 {
+				break
+			}
 		}
 		fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
 		return nil
