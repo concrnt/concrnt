@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 
 	"github.com/concrnt/concrnt"
@@ -185,6 +186,63 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		}
 		return entity, nil
 	}
+}
+
+// getEntityWithReference resolves ccid's entity, first applying the entity
+// document the commit inlines for it under References["cckv://<ccid>"]
+// (CIP-0 §8.5: a document bundled with the request is a resolution source).
+// Clients and federation delivery attach the author's current entity
+// document to every commit, so this is where a remote user's alias or
+// domain change reaches a server that already holds an older copy — there
+// is no other channel that brings a newer entity document here.
+//
+// The inlined document is only committed when it is strictly newer than the
+// stored one: an accept-if-newer loss rolls its commit back without a commit
+// log, so without this pre-check every commit carrying the unchanged self
+// document (the steady state) would pay proof verification, domain
+// resolution and the alias DNS lookup just to be rejected. A failed
+// application never fails the caller's commit; resolution then proceeds as
+// if nothing had been inlined, using the document's domain as a hint.
+func (uc *Usecase) getEntityWithReference(ctx context.Context, ip string, ccid string, sd concrnt.SignedDocument) (*domain.Entity, error) {
+	ctx, span := tracer.Start(ctx, "Usecase.Record.GetEntityWithReference")
+	defer span.End()
+
+	uri := concrnt.CCURI{Scheme: "cckv", Owner: ccid}
+
+	ref, ok := sd.References[uri.String()]
+	if !ok {
+		return uc.GetEntity(ctx, uri.String())
+	}
+
+	var referenced concrnt.Document[schemas.Entity]
+	if err := json.Unmarshal([]byte(ref.Document), &referenced); err != nil || referenced.Kind != "entity" || referenced.Author != ccid {
+		return uc.GetEntity(ctx, uri.String())
+	}
+	uri.Hint = &referenced.Value.Domain
+
+	newer := true
+	stored, err := uc.entity.GetEntityByCCID(ctx, ccid)
+	if err == nil && stored.SignedDocument != nil {
+		var storedDoc concrnt.Document[schemas.Entity]
+		if err := json.Unmarshal([]byte(stored.SignedDocument.Document), &storedDoc); err == nil {
+			newer = referenced.CreatedAt.After(storedDoc.CreatedAt)
+		}
+	} else if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	if newer {
+		if _, err := uc.Commit(ctx, ip, ref, domain.CommitModeExecute); err != nil {
+			span.RecordError(err)
+			slog.Warn("failed to apply inlined entity document",
+				slog.String("ccid", ccid),
+				slog.String("error", err.Error()),
+			)
+		}
+	}
+
+	return uc.GetEntity(ctx, uri.String())
 }
 
 func (uc *Usecase) IsLocalEntity(ctx context.Context, entity *domain.Entity) bool {

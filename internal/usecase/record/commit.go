@@ -2,7 +2,6 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,22 +14,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/schemas"
 )
-
-func GetReferrerFromReferences(sd concrnt.SignedDocument, requesterID string) *string {
-	requesterCCKV := concrnt.CCURI{Scheme: "cckv", Owner: requesterID}.String()
-	entityRef, ok := sd.References[requesterCCKV]
-	if ok {
-		var entity concrnt.Document[schemas.Entity]
-		err := json.Unmarshal([]byte(entityRef.Document), &entity)
-		if err != nil {
-			return nil
-		}
-		return &entity.Value.Domain
-	}
-	return nil
-}
 
 func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Commit")
@@ -142,9 +126,17 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 	}
 
 	requesterID := doc.Author
-	referrer := GetReferrerFromReferences(sd, requesterID)
 
-	requester, requesterErr := uc.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: requesterID, Hint: referrer}.String())
+	// An entity commit is the entity document itself; every other kind may
+	// inline the author's current entity document, which is applied before
+	// the author is resolved so a changed alias/domain takes effect here.
+	var requester *domain.Entity
+	var requesterErr error
+	if doc.Kind == "entity" {
+		requester, requesterErr = uc.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: requesterID}.String())
+	} else {
+		requester, requesterErr = uc.getEntityWithReference(ctx, ip, requesterID, sd)
+	}
 	if requesterErr != nil {
 		span.RecordError(requesterErr)
 	}
@@ -220,12 +212,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 
 	case "ack", "acked", "unack", "unacked":
-		referrer := GetReferrerFromReferences(sd, requester.CCKV())
-		targetUserID := *doc.Associate
-		if referrer != nil {
-			targetUserID = targetUserID + "@" + *referrer
-		}
-		targetUser, err := uc.GetEntity(ctx, targetUserID)
+		targetUser, err := uc.getEntityWithReference(ctx, ip, targetUserID, sd)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -284,6 +271,11 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 	if uc.client != nil {
 		if doc.Key != "" {
 			uc.client.InvalidateResource(doc.Key)
+		}
+		// an entity document has no key; the client resolves routing
+		// (ccid -> domain) through this server's own copy of it
+		if doc.Kind == "entity" {
+			uc.client.InvalidateResource(concrnt.CCURI{Scheme: "cckv", Owner: doc.Author}.String())
 		}
 		if doc.Kind == "delete" {
 			if target, ok := doc.Value.(string); ok && target != "" {

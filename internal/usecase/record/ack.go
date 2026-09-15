@@ -81,6 +81,17 @@ func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, f
 		// acked document; a dump replay (LocalOnlyExecute) leaves the
 		// associate owner's holding to that side's own dump
 		if mode == domain.CommitModeExecute && uc.jobs != nil {
+			// like reference distribution, ship the acker's current entity
+			// document along so the target's server can refresh its copy
+			fromSD, err := uc.GetSigned(ctx, from.CCKVWithHint())
+			if err != nil {
+				span.RecordError(err)
+				return nil, err
+			}
+			ackedSD.References = map[string]concrnt.SignedDocument{
+				from.CCKV(): *fromSD,
+			}
+
 			postProcesses = append(postProcesses,
 				func(ctx context.Context) error {
 					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
