@@ -1384,3 +1384,65 @@ func (r *RecordRepository) GetAllCommitLogs(ctx context.Context, owner string) (
 
 	return sds, nil
 }
+
+func (r *RecordRepository) QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]record.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.QueryCommitLogs")
+	defer span.End()
+
+	var commitLogs []models.CommitLog
+
+	query := r.db.WithContext(ctx).Model(&models.CommitLog{})
+
+	if owner != "" {
+		query = query.Where("owner = ?", owner)
+	}
+	if since != nil {
+		query = query.Where("c_date >= ?", *since)
+	}
+	if until != nil {
+		query = query.Where("c_date <= ?", *until)
+	}
+
+	if order == "desc" {
+		query = query.Order("c_date DESC, id DESC")
+	} else {
+		query = query.Order("c_date ASC, id ASC")
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	if err := query.Find(&commitLogs).Error; err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	rows := make([]record.QueryRow, 0, len(commitLogs))
+	for _, cl := range commitLogs {
+		var proof concrnt.Proof
+		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+
+		row := record.QueryRow{
+			Row: concrnt.SignedDocument{
+				Document: cl.Document,
+				Proof:    proof,
+			},
+			CreatedAt: cl.CDate,
+		}
+		// an ownerless commit (unrepaired legacy row) has no ccfs namespace to
+		// compose; ComposeCCFSURI("") would yield a URI that misparses
+		if cl.Owner != "" {
+			ccfs := concrnt.ComposeCCFSURI(cl.Owner, concrnt.CCFSTypeConcrnt, cl.ID)
+			row.Row.CCFS = &ccfs
+		}
+
+		rows = append(rows, row)
+	}
+
+	return rows, nil
+}

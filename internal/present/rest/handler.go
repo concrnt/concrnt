@@ -69,6 +69,7 @@ var Endpoints = map[string]string{
 	"net.concrnt.core.commit":             apiPrefix + "/commit",
 	"net.concrnt.core.resolve":            apiPrefix + "/resolve?uri={uri}",
 	"net.concrnt.core.query":              apiPrefix + "/query{?prefix,schema,since,until,limit,order,parent,author}",
+	"net.concrnt.core.replication":        apiPrefix + "/replication{?owner,since,until,limit,order}",
 	"net.concrnt.core.associations":       apiPrefix + "/associations{?uri,schema,variant,author,since,until,limit,order}",
 	"net.concrnt.core.association-counts": apiPrefix + "/association-counts{?uri,schema}",
 	"net.concrnt.core.acknowledges":       apiPrefix + "/acknowledges{?from,to,schema,since,until,limit,order}",
@@ -93,6 +94,8 @@ func (h *Handler) RegisterRoutes(app *echo.Echo, e *echo.Group) {
 	api.OPTIONS("/resolve", h.handleNop)
 	api.GET("/query", h.handleQuery)
 	api.OPTIONS("/query", h.handleNop)
+	api.GET("/replication", h.handleReplication)
+	api.OPTIONS("/replication", h.handleNop)
 	api.GET("/associations", h.handleAssociations)
 	api.OPTIONS("/associations", h.handleNop)
 	api.GET("/association-counts", h.handleAssociationCounts)
@@ -364,6 +367,28 @@ func (h *Handler) handleQuery(c echo.Context) error {
 	}
 
 	result, err := h.record.Query(ctx, prefix, parent, schema, author, w.since, w.until, w.limit, w.order)
+	if err != nil {
+		return presenter.InternalError(c, err)
+	}
+	return presenter.OK(c, result)
+}
+
+func (h *Handler) handleReplication(c echo.Context) error {
+	ctx := c.Request().Context()
+
+	owner := c.QueryParam("owner")
+
+	w, err := parseQueryWindow(c)
+	if err != nil {
+		return presenter.BadRequestMessage(c, err.Error())
+	}
+	// replication follows the log forward by default (CIP-16 §3.1), unlike
+	// the newest-first default parseQueryWindow applies to query
+	if c.QueryParam("order") == "" {
+		w.order = "asc"
+	}
+
+	result, err := h.record.Replicate(ctx, owner, w.since, w.until, w.limit, w.order)
 	if err != nil {
 		return presenter.InternalError(c, err)
 	}

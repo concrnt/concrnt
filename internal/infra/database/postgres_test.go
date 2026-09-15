@@ -43,4 +43,16 @@ func TestMigratePostgresIsIdempotent(t *testing.T) {
 		}
 	}
 	require.True(t, hasUnique, "ackeds must have its own unique (from, to, schema) index, got %+v", indexes)
+
+	// The replication feed orders by (c_date, id) without an owner filter; the
+	// composite index that backs that scan must exist on commit_logs itself.
+	indexes = nil
+	require.NoError(t, db.Raw("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'commit_logs'").Scan(&indexes).Error)
+	var hasCDateID bool
+	for _, index := range indexes {
+		if index.Indexname == "idx_commit_logs_c_date_id" && strings.Contains(index.Indexdef, "(c_date, id)") {
+			hasCDateID = true
+		}
+	}
+	require.True(t, hasCDateID, "commit_logs must have idx_commit_logs_c_date_id on (c_date, id), got %+v", indexes)
 }

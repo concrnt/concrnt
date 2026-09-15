@@ -48,6 +48,10 @@ type Repository interface {
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
+	// QueryCommitLogs pages the commit log by server receipt time (c_date,
+	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
+	// that c_date. owner "" means no owner filter.
+	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 
 	GetDistributions(ctx context.Context, uri string) ([]string, error)
 
@@ -61,9 +65,9 @@ type Repository interface {
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
-// (the DB-side created_at the repository ordered by). Pagination cursors are
-// derived from this key, so it must be carried alongside the document rather
-// than re-parsed from it.
+// (the DB-side created_at the repository ordered by — or, for QueryCommitLogs,
+// the commit log's c_date). Pagination cursors are derived from this key, so
+// it must be carried alongside the document rather than re-parsed from it.
 type QueryRow struct {
 	Row       concrnt.SignedDocument
 	CreatedAt time.Time

@@ -10,21 +10,25 @@ import (
 //   - PRIMARY KEY (id): canonical commit/document lookup; used by record,
 //     entity, ack, association foreign keys and direct ccfs lookups in
 //     postgres.RecordRepository.GetSignedDocument/Delete.
-//   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump scan;
-//     used by postgres.RecordRepository.GetAllCommitLogs and
+//   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump and
+//     replication scans; used by postgres.RecordRepository.GetAllCommitLogs,
+//     postgres.RecordRepository.QueryCommitLogs (owner filter) and
 //     postgres.ResidenceRepository.MarkCommitLogsGcCandidateByOwner.
+//   - idx_commit_logs_c_date_id (c_date, id): replication cursor scan without an
+//     owner filter, ordered by receipt time with id as tie-break; used by
+//     postgres.RecordRepository.QueryCommitLogs.
 //   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
 //     scans; set by postgres.RecordRepository.CreateRecord when replacing a key
 //     and by postgres.ResidenceRepository.MarkCommitLogsGcCandidateByOwner on
 //     unregister.
 type CommitLog struct {
-	ID          string    `json:"id" gorm:"primaryKey;type:text"`
+	ID          string    `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
 	IP          string    `json:"ip" gorm:"type:text"`
 	Document    string    `json:"document" gorm:"type:text"`
 	Proof       string    `json:"proof" gorm:"type:text"`
 	Owner       string    `json:"owner" gorm:"type:text;index:idx_commit_logs_owner_c_date,priority:1"`
 	GcCandidate bool      `json:"gcCandidate" gorm:"type:boolean;not null;default:false;index"`
-	CDate       time.Time `json:"cdate" gorm:"type:timestamp with time zone;not null;default:clock_timestamp();index:idx_commit_logs_owner_c_date,priority:2"`
+	CDate       time.Time `json:"cdate" gorm:"type:timestamp with time zone;not null;default:clock_timestamp();index:idx_commit_logs_owner_c_date,priority:2;index:idx_commit_logs_c_date_id,priority:1"`
 }
 
 // Indexes:
