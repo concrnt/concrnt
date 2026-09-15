@@ -116,8 +116,9 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   server resolution) and `chunkline` (removed-item advertisements). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
-  `delete.go`); `read.go`/`query.go` are the read paths, `deliver.go` the federation
-  delivery job, `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
+  `delete.go`); `read.go`/`query.go` are the read paths, `replication.go` the paged
+  commit-log feed for external followers, `deliver.go` the federation delivery job,
+  `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
   (GORM), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
