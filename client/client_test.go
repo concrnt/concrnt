@@ -259,8 +259,9 @@ func TestQuery(t *testing.T) {
 			assertQueryParam(t, r.Header.Get("User-Agent"), "concrnt-test/dev (Concrnt)")
 			assertQueryParam(t, r.Header.Get("Accept"), "application/json")
 
-			next := until.Add(-time.Hour)
-			if err := json.NewEncoder(w).Encode(concrnt.QueryResult{Items: want, Prev: &until, Next: &next}); err != nil {
+			prev := until.Format(time.RFC3339Nano)
+			next := until.Add(-time.Hour).Format(time.RFC3339Nano)
+			if err := json.NewEncoder(w).Encode(concrnt.QueryResult{Items: want, Prev: &prev, Next: &next}); err != nil {
 				t.Fatalf("encode query response: %v", err)
 			}
 		default:
@@ -294,11 +295,92 @@ func TestQuery(t *testing.T) {
 	if got.Items[0].Document != want[0].Document {
 		t.Fatalf("Query returned document %q, want %q", got.Items[0].Document, want[0].Document)
 	}
-	if got.Prev == nil || !got.Prev.Equal(until) {
-		t.Fatalf("Query returned prev %v, want %v", got.Prev, until)
+	if got.Prev == nil || *got.Prev != until.Format(time.RFC3339Nano) {
+		t.Fatalf("Query returned prev %v, want %v", got.Prev, until.Format(time.RFC3339Nano))
 	}
-	if got.Next == nil || !got.Next.Equal(until.Add(-time.Hour)) {
-		t.Fatalf("Query returned next %v, want %v", got.Next, until.Add(-time.Hour))
+	if got.Next == nil || *got.Next != until.Add(-time.Hour).Format(time.RFC3339Nano) {
+		t.Fatalf("Query returned next %v, want %v", got.Next, until.Add(-time.Hour).Format(time.RFC3339Nano))
+	}
+}
+
+// orderby=key pages by cckv: the key cursors are sent verbatim as since/until
+// and the response cursors are keys (CIP-5 §3.3).
+func TestQueryOrderByKey(t *testing.T) {
+	t.Parallel()
+
+	const domain = "example.test"
+	folder := "cckv://con1example/concrnt.world/profiles/main/posts"
+	doc := "cckv://con1example/concrnt.world/profiles/main/lists"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/concrnt":
+			wkc := concrnt.WellKnownConcrnt{
+				Version: "2.0",
+				Domain:  domain,
+				CSID:    "ccs1example",
+				Layer:   "concrnt",
+				Endpoints: map[string]string{
+					"net.concrnt.core.query": "/query{?prefix,schema,since,until,limit,order,parent,author,orderby}",
+				},
+			}
+			if err := json.NewEncoder(w).Encode(wkc); err != nil {
+				t.Fatalf("encode well-known: %v", err)
+			}
+		case "/query":
+			query := r.URL.Query()
+			assertQueryParam(t, query.Get("parent"), "cckv://con1example/concrnt.world/profiles/main")
+			assertQueryParam(t, query.Get("orderby"), "key")
+			assertQueryParam(t, query.Get("since"), doc)
+			assertQueryParam(t, query.Get("until"), "")
+			assertQueryParam(t, query.Get("order"), "asc")
+
+			items := []concrnt.SignedDocument{
+				{CCKV: &doc, Document: `{"kind":"record"}`, Proof: concrnt.Proof{Type: concrnt.ProofTypeNone}},
+				{CCKV: &folder},
+			}
+			if err := json.NewEncoder(w).Encode(concrnt.QueryResult{Items: items, Prev: &doc, Next: &folder}); err != nil {
+				t.Fatalf("encode query response: %v", err)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	got, err := cl.Query(context.Background(), domain, QueryParams{
+		Parent:   "cckv://con1example/concrnt.world/profiles/main",
+		OrderBy:  "key",
+		SinceKey: doc,
+		Order:    "asc",
+	})
+	if err != nil {
+		t.Fatalf("Query returned error: %v", err)
+	}
+	if len(got.Items) != 2 {
+		t.Fatalf("Query returned %d results, want 2", len(got.Items))
+	}
+	if got.Items[1].CCKV == nil || *got.Items[1].CCKV != folder || got.Items[1].Document != "" {
+		t.Fatalf("key-only entry not decoded as such: %+v", got.Items[1])
+	}
+	if got.Next == nil || *got.Next != folder {
+		t.Fatalf("Query returned next %v, want %q", got.Next, folder)
+	}
+}
+
+func TestQueryRejectsOrderByKeyWithPrefix(t *testing.T) {
+	t.Parallel()
+
+	cl := New("example.test")
+	_, err := cl.Query(context.Background(), "example.test", QueryParams{
+		Prefix:  "cckv://",
+		OrderBy: "key",
+	})
+	if err == nil {
+		t.Fatal("Query returned nil error")
 	}
 }
 

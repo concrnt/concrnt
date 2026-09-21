@@ -1001,10 +1001,17 @@ func (r *RecordRepository) QueryByPrefix(
 }
 
 // recordKeysToQueryRows converts preloaded record keys into query rows
-// carrying the created_at sort key the query ordered by.
+// carrying the created_at sort key the query ordered by. A placeholder key
+// (record_id NULL, reachable only through QueryByParentOrderByKey's LEFT
+// JOIN) becomes a key-only row holding just its cckv (CIP-5 §3.2.1).
 func recordKeysToQueryRows(rks []models.RecordKey, span trace.Span) ([]record.QueryRow, error) {
 	rows := make([]record.QueryRow, 0, len(rks))
 	for _, rk := range rks {
+		if rk.RecordID == nil {
+			rows = append(rows, record.QueryRow{Row: concrnt.SignedDocument{CCKV: &rk.URI}})
+			continue
+		}
+
 		var proof concrnt.Proof
 		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
 		if err != nil {
@@ -1094,8 +1101,21 @@ func (r *RecordRepository) QueryByParent(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id").
-		Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+
+	// The owner root (cckv://<owner>) has no record_keys row and its top-level
+	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
+	// matched by URI prefix instead (CIP-5 §3.1).
+	parsedParent, err := concrnt.ParseCCURI(parent)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if parsedParent.Key == "" {
+		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+	} else {
+		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+	}
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
@@ -1114,6 +1134,69 @@ func (r *RecordRepository) QueryByParent(
 		query = query.Order("r.created_at DESC, r.document_id DESC")
 	} else {
 		query = query.Order("r.created_at ASC, r.document_id ASC")
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return recordKeysToQueryRows(rks, span)
+}
+
+// QueryByParentOrderByKey lists parent's direct children ordered by their
+// cckv (CIP-5 orderby=key). The LEFT JOIN keeps placeholder keys (record_id
+// NULL) so intermediate keys come back as key-only rows; a schema or author
+// filter compares record columns and so drops them. since/until are
+// inclusive key bounds, the cursors of §3.3 for this ordering.
+func (r *RecordRepository) QueryByParentOrderByKey(
+	ctx context.Context,
+	parent, schema, author string,
+	since, until *string,
+	limit int,
+	order string,
+) ([]record.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
+	defer span.End()
+
+	var rks []models.RecordKey
+
+	query := r.db.WithContext(ctx).
+		Model(&models.RecordKey{}).
+		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+
+	parsedParent, err := concrnt.ParseCCURI(parent)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if parsedParent.Key == "" {
+		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+	} else {
+		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+	}
+
+	if schema != "" {
+		query = query.Where("r.schema = ?", schema)
+	}
+	if author != "" {
+		query = query.Where("r.author = ?", author)
+	}
+	if since != nil {
+		query = query.Where("record_keys.uri >= ?", *since)
+	}
+	if until != nil {
+		query = query.Where("record_keys.uri <= ?", *until)
+	}
+
+	if order == "desc" {
+		query = query.Order("record_keys.uri DESC")
+	} else {
+		query = query.Order("record_keys.uri ASC")
 	}
 
 	if limit > 0 {

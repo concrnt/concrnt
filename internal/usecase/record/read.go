@@ -75,11 +75,18 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 		return err
 	}
 
+	// A key-only query row (CIP-5 §3.2.1 intermediate key) has no document;
+	// its read access is record:read on the key itself, evaluated against the
+	// ancestor policy stack alone.
 	var doc concrnt.Document[any]
-	err := json.Unmarshal([]byte(sd.Document), &doc)
-	if err != nil {
-		span.RecordError(err)
-		return err
+	if sd.Document == "" {
+		doc = concrnt.Document[any]{Kind: "record", Key: uri}
+	} else {
+		err := json.Unmarshal([]byte(sd.Document), &doc)
+		if err != nil {
+			span.RecordError(err)
+			return err
+		}
 	}
 
 	// Associations have no record_keys row of their own; their policy stack is

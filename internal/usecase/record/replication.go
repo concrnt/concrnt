@@ -31,7 +31,7 @@ func (uc *Usecase) Replicate(
 		return concrnt.QueryResult{}, err
 	}
 
-	items, prev, next := paginateWindow(rows, limit)
+	items, prev, next := paginateWindow(rows, limit, "createdAt")
 
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
 	if serviceAccountType == "system" {

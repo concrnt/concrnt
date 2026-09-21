@@ -43,6 +43,12 @@ type Repository interface {
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
+	// QueryByParentOrderByKey lists parent's direct children in cckv order
+	// (CIP-5 orderby=key). Intermediate keys without a document are returned
+	// as key-only rows (Row.CCKV set, Document empty) unless schema or author
+	// filters them out; since/until are inclusive key bounds and QueryRow.CreatedAt
+	// is unused.
+	QueryByParentOrderByKey(ctx context.Context, parent, schema, author string, since, until *string, limit int, order string) ([]QueryRow, error)
 
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
@@ -71,6 +77,23 @@ type Repository interface {
 type QueryRow struct {
 	Row       concrnt.SignedDocument
 	CreatedAt time.Time
+}
+
+// QueryParams are the CIP-5 §3.1 query parameters. Since/Until carry the
+// createdAt cursors; SinceKey/UntilKey carry the key cursors used when
+// OrderBy is "key" (only valid with Parent).
+type QueryParams struct {
+	Prefix   string
+	Parent   string
+	Schema   string
+	Author   string
+	OrderBy  string
+	Since    *time.Time
+	Until    *time.Time
+	SinceKey *string
+	UntilKey *string
+	Limit    int
+	Order    string
 }
 
 type RepositoryTx interface {

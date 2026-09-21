@@ -213,3 +213,30 @@ func TestSignedDocumentCDIDAndParsedDocument(t *testing.T) {
 		t.Fatal("CDID of an unparseable document must fail")
 	}
 }
+
+// CIP-5 §3.2.1: a key-only query entry (intermediate key) serializes as just
+// its cckv, while a document-bearing entry keeps document and proof.
+func TestSignedDocumentKeyOnlyJSON(t *testing.T) {
+	key := "cckv://con1owner/app/posts"
+	keyOnly, err := json.Marshal(SignedDocument{CCKV: &key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(keyOnly) != `{"cckv":"cckv://con1owner/app/posts"}` {
+		t.Fatalf("key-only entry must carry only cckv, got %s", keyOnly)
+	}
+
+	full, err := json.Marshal(SignedDocument{CCKV: &key, Document: `{"kind":"record"}`, Proof: Proof{Type: ProofTypeNone}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(full, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"cckv", "document", "proof"} {
+		if _, ok := decoded[field]; !ok {
+			t.Fatalf("document-bearing entry must keep %q, got %s", field, full)
+		}
+	}
+}

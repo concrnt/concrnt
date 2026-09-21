@@ -207,15 +207,21 @@ type Options struct {
 	AllowedProofTypes []string
 }
 
+// QueryParams are the CIP-5 §3.1 query parameters. OrderBy "" or "createdAt"
+// pages by Since/Until; OrderBy "key" (Parent only) pages by the SinceKey/
+// UntilKey cckv cursors instead.
 type QueryParams struct {
-	Prefix string
-	Parent string
-	Schema string
-	Author string
-	Since  *time.Time
-	Until  *time.Time
-	Limit  int
-	Order  string
+	Prefix   string
+	Parent   string
+	Schema   string
+	Author   string
+	OrderBy  string
+	Since    *time.Time
+	Until    *time.Time
+	SinceKey string
+	UntilKey string
+	Limit    int
+	Order    string
 }
 
 var ErrEndpointMissing = errors.New("concrnt endpoint missing")
@@ -695,6 +701,17 @@ func (c *Client) Query(ctx context.Context, resolver string, params QueryParams)
 		return concrnt.QueryResult{}, err
 	}
 
+	if params.OrderBy != "" && params.OrderBy != "createdAt" && params.OrderBy != "key" {
+		err := fmt.Errorf("invalid orderby parameter: %s", params.OrderBy)
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+	if params.OrderBy == "key" && params.Prefix != "" {
+		err := errors.New("orderby=key is only available with parent")
+		span.RecordError(err)
+		return concrnt.QueryResult{}, err
+	}
+
 	domain, err := c.resolveResolver(ctx, resolver)
 	if err != nil {
 		err := errors.Join(fmt.Errorf("failed to resolve resolver %s", resolver), err)
@@ -734,11 +751,24 @@ func (c *Client) Query(ctx context.Context, resolver string, params QueryParams)
 	if params.Author != "" {
 		args["author"] = params.Author
 	}
-	if params.Since != nil {
-		args["since"] = params.Since.UTC().Format(time.RFC3339Nano)
-	}
-	if params.Until != nil {
-		args["until"] = params.Until.UTC().Format(time.RFC3339Nano)
+	if params.OrderBy == "key" {
+		args["orderby"] = params.OrderBy
+		if params.SinceKey != "" {
+			args["since"] = params.SinceKey
+		}
+		if params.UntilKey != "" {
+			args["until"] = params.UntilKey
+		}
+	} else {
+		if params.OrderBy != "" {
+			args["orderby"] = params.OrderBy
+		}
+		if params.Since != nil {
+			args["since"] = params.Since.UTC().Format(time.RFC3339Nano)
+		}
+		if params.Until != nil {
+			args["until"] = params.Until.UTC().Format(time.RFC3339Nano)
+		}
 	}
 	if params.Limit > 0 {
 		args["limit"] = fmt.Sprint(params.Limit)

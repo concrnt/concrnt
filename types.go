@@ -102,11 +102,15 @@ type Proof struct {
 	Proof     *Proof  `json:"proof,omitempty"`
 }
 
+// SignedDocument is a document with its proof. A query row for an
+// intermediate key (CIP-5 §3.2.1) carries only CCKV: Document and Proof are
+// omitted from the wire form when empty so such key-only entries serialize
+// as {"cckv": "..."}.
 type SignedDocument struct {
 	CCKV       *string                   `json:"cckv,omitempty"`
 	CCFS       *string                   `json:"ccfs,omitempty"`
-	Document   string                    `json:"document"`
-	Proof      Proof                     `json:"proof"`
+	Document   string                    `json:"document,omitempty"`
+	Proof      Proof                     `json:"proof,omitzero"`
 	References map[string]SignedDocument `json:"references,omitempty"`
 
 	// IsPublic is an internal, publish-time annotation (not part of the CCAPI
@@ -175,12 +179,14 @@ func (sd *SignedDocument) DeriveAcked() (SignedDocument, error) {
 }
 
 // QueryResult is the paged envelope returned by the query/associations/
-// acknowledges endpoints (CIP-5 §3.2). Prev and Next are datetime cursors
-// over the server-side sort key; nil means no more rows in that direction.
+// acknowledges endpoints (CIP-5 §3.2). Prev and Next are cursors holding the
+// server-side sort key of the boundary rows: an RFC3339Nano datetime for
+// orderby=createdAt (the default everywhere) or the cckv URI for
+// orderby=key (CIP-5 §3.3). nil means no more rows in that direction.
 type QueryResult struct {
 	Items []SignedDocument `json:"items"`
-	Prev  *time.Time       `json:"prev"`
-	Next  *time.Time       `json:"next"`
+	Prev  *string          `json:"prev"`
+	Next  *string          `json:"next"`
 }
 
 type RegisterRequest struct {

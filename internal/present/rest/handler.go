@@ -68,7 +68,7 @@ const apiPrefix = "/api/v2"
 var Endpoints = map[string]string{
 	"net.concrnt.core.commit":             apiPrefix + "/commit",
 	"net.concrnt.core.resolve":            apiPrefix + "/resolve?uri={uri}",
-	"net.concrnt.core.query":              apiPrefix + "/query{?prefix,schema,since,until,limit,order,parent,author}",
+	"net.concrnt.core.query":              apiPrefix + "/query{?prefix,schema,since,until,limit,order,parent,author,orderby}",
 	"net.concrnt.core.replication":        apiPrefix + "/replication{?owner,since,until,limit,order}",
 	"net.concrnt.core.associations":       apiPrefix + "/associations{?uri,schema,variant,author,since,until,limit,order}",
 	"net.concrnt.core.association-counts": apiPrefix + "/association-counts{?uri,schema}",
@@ -293,33 +293,45 @@ func (h *Handler) handleResolve(c echo.Context) error {
 }
 
 // queryWindow holds the paging parameters shared by the query, associations
-// and acknowledges endpoints (CIP-5 §3.1).
+// and acknowledges endpoints (CIP-5 §3.1). since/until are the createdAt
+// cursors; sinceKey/untilKey hold the raw strings instead when the caller
+// pages by key (query orderby=key, CIP-5 §3.3).
 type queryWindow struct {
-	since *time.Time
-	until *time.Time
-	limit int
-	order string
+	since    *time.Time
+	until    *time.Time
+	sinceKey *string
+	untilKey *string
+	limit    int
+	order    string
 }
 
-func parseQueryWindow(c echo.Context) (queryWindow, error) {
+func parseQueryWindow(c echo.Context, keyCursors bool) (queryWindow, error) {
 	w := queryWindow{limit: 10, order: "desc"}
 
 	sinceStr := c.QueryParam("since")
 	if sinceStr != "" {
-		parsed, err := time.Parse(time.RFC3339, sinceStr)
-		if err != nil {
-			return w, errors.New("invalid since parameter")
+		if keyCursors {
+			w.sinceKey = &sinceStr
+		} else {
+			parsed, err := time.Parse(time.RFC3339, sinceStr)
+			if err != nil {
+				return w, errors.New("invalid since parameter")
+			}
+			w.since = &parsed
 		}
-		w.since = &parsed
 	}
 
 	untilStr := c.QueryParam("until")
 	if untilStr != "" {
-		parsed, err := time.Parse(time.RFC3339, untilStr)
-		if err != nil {
-			return w, errors.New("invalid until parameter")
+		if keyCursors {
+			w.untilKey = &untilStr
+		} else {
+			parsed, err := time.Parse(time.RFC3339, untilStr)
+			if err != nil {
+				return w, errors.New("invalid until parameter")
+			}
+			w.until = &parsed
 		}
-		w.until = &parsed
 	}
 
 	limitStr := c.QueryParam("limit")
@@ -361,12 +373,35 @@ func (h *Handler) handleQuery(c echo.Context) error {
 	schema := c.QueryParam("schema")
 	author := c.QueryParam("author")
 
-	w, err := parseQueryWindow(c)
+	orderBy := c.QueryParam("orderby")
+	if orderBy == "" {
+		orderBy = "createdAt"
+	}
+	if orderBy != "createdAt" && orderBy != "key" {
+		return presenter.BadRequestMessage(c, "invalid orderby parameter")
+	}
+	if orderBy == "key" && prefix != "" {
+		return presenter.BadRequestMessage(c, "orderby=key is only available with parent")
+	}
+
+	w, err := parseQueryWindow(c, orderBy == "key")
 	if err != nil {
 		return presenter.BadRequestMessage(c, err.Error())
 	}
 
-	result, err := h.record.Query(ctx, prefix, parent, schema, author, w.since, w.until, w.limit, w.order)
+	result, err := h.record.Query(ctx, record.QueryParams{
+		Prefix:   prefix,
+		Parent:   parent,
+		Schema:   schema,
+		Author:   author,
+		OrderBy:  orderBy,
+		Since:    w.since,
+		Until:    w.until,
+		SinceKey: w.sinceKey,
+		UntilKey: w.untilKey,
+		Limit:    w.limit,
+		Order:    w.order,
+	})
 	if err != nil {
 		return presenter.InternalError(c, err)
 	}
@@ -378,7 +413,7 @@ func (h *Handler) handleReplication(c echo.Context) error {
 
 	owner := c.QueryParam("owner")
 
-	w, err := parseQueryWindow(c)
+	w, err := parseQueryWindow(c, false)
 	if err != nil {
 		return presenter.BadRequestMessage(c, err.Error())
 	}
@@ -803,7 +838,7 @@ func (h *Handler) handleAssociations(c echo.Context) error {
 		return presenter.BadRequestMessage(c, "uri parameter is required")
 	}
 
-	w, err := parseQueryWindow(c)
+	w, err := parseQueryWindow(c, false)
 	if err != nil {
 		return presenter.BadRequestMessage(c, err.Error())
 	}
@@ -970,7 +1005,7 @@ func (h *Handler) handleAcknowledges(c echo.Context) error {
 		return presenter.BadRequestMessage(c, "specify exactly one of the from / to parameters")
 	}
 
-	w, err := parseQueryWindow(c)
+	w, err := parseQueryWindow(c, false)
 	if err != nil {
 		return presenter.BadRequestMessage(c, err.Error())
 	}

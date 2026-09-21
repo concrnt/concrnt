@@ -159,9 +159,9 @@ func TestReplicateReadAccess(t *testing.T) {
 		require.NoError(t, err)
 		require.Empty(t, result.Items)
 		require.NotNil(t, result.Prev)
-		require.Equal(t, denied[0].CreatedAt, *result.Prev)
+		require.Equal(t, denied[0].CreatedAt.Format(time.RFC3339Nano), *result.Prev)
 		require.NotNil(t, result.Next)
-		require.Equal(t, denied[2].CreatedAt, *result.Next)
+		require.Equal(t, denied[2].CreatedAt.Format(time.RFC3339Nano), *result.Next)
 	})
 
 	t.Run("policy failures other than denial abort", func(t *testing.T) {

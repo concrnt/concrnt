@@ -1127,3 +1127,108 @@ func TestGetAllCommitLogsByOwner(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, logs)
 }
+
+// CIP-5 orderby=key: a parent listing in cckv order that keeps placeholder
+// (intermediate) keys as key-only rows, pages by inclusive key bounds, drops
+// placeholders under a record-column filter, and accepts the owner root.
+func TestRecordQueryByParentOrderByKey(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := NewRecordRepository(db)
+
+	owner := "con1keyorder"
+	root := "cckv://" + owner
+	parent := root + "/app"
+	keys := []string{parent + "/b", parent + "/a", parent + "/posts/1"}
+	createdAt := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
+	for i, key := range keys {
+		id := fmt.Sprintf("keyorder-%d", i)
+		sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"body": key},
+			Author:    owner,
+			Schema:    "https://schema.example/item.json",
+			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
+		})
+		withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
+			return err
+		})
+	}
+
+	urisOfRows := func(rows []record.QueryRow) []string {
+		uris := make([]string, 0, len(rows))
+		for _, row := range rows {
+			require.NotNil(t, row.Row.CCKV)
+			uris = append(uris, *row.Row.CCKV)
+		}
+		return uris
+	}
+
+	t.Run("ascending with the placeholder as a key-only row", func(t *testing.T) {
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/a", parent + "/b", parent + "/posts"}, urisOfRows(rows))
+		require.NotEmpty(t, rows[0].Row.Document)
+		require.NotNil(t, rows[0].Row.CCFS)
+		require.Empty(t, rows[2].Row.Document, "a placeholder key carries no document")
+		require.Nil(t, rows[2].Row.CCFS)
+		require.Equal(t, concrnt.Proof{}, rows[2].Row.Proof)
+	})
+
+	t.Run("descending", func(t *testing.T) {
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "desc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/posts", parent + "/b", parent + "/a"}, urisOfRows(rows))
+	})
+
+	t.Run("since and until are inclusive key bounds", func(t *testing.T) {
+		since := parent + "/b"
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", &since, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/b", parent + "/posts"}, urisOfRows(rows))
+
+		until := parent + "/b"
+		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, &until, 0, "desc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows))
+
+		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 2, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/a", parent + "/b"}, urisOfRows(rows))
+	})
+
+	t.Run("schema filter drops placeholders", func(t *testing.T) {
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "https://schema.example/item.json", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/a", parent + "/b"}, urisOfRows(rows))
+
+		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "con1someoneelse", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows)
+	})
+
+	t.Run("owner root lists the top-level keys", func(t *testing.T) {
+		rows, err := repo.QueryByParentOrderByKey(ctx, root, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent}, urisOfRows(rows))
+		require.Empty(t, rows[0].Row.Document)
+
+		rows, err = repo.QueryByParentOrderByKey(ctx, "cckv://con1keyorderx", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows, "a sibling owner sharing the prefix must not match")
+	})
+
+	t.Run("createdAt ordering also accepts the owner root", func(t *testing.T) {
+		rows, err := repo.QueryByParent(ctx, root, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows, "top-level placeholder keys have no document to list")
+
+		rows, err = repo.QueryByParent(ctx, parent, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows), "placeholders stay out of the createdAt listing")
+	})
+}
