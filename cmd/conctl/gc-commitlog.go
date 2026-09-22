@@ -1,22 +1,13 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
-	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
@@ -32,16 +23,6 @@ var (
 )
 
 const gcCommitlogBatchSize = 1000
-
-// gcCommitlogMeta is the "meta" of each backup line: what the commit_logs row
-// held besides the document itself, so the backup is lossless even though the
-// wire fields stay a plain SignedDocument.
-type gcCommitlogMeta struct {
-	ID    string    `json:"id"`
-	Owner string    `json:"owner"`
-	IP    string    `json:"ip"`
-	CDate time.Time `json:"cdate"`
-}
 
 var gcCommitlogCmd = &cobra.Command{
 	Use:   "gc-commitlog",
@@ -89,16 +70,11 @@ var gcCommitlogCmd = &cobra.Command{
 		}
 		bucket, prefix := "", ""
 		if gcCommitlogBackup != "" {
-			u, err := url.Parse(gcCommitlogBackup)
-			if err != nil || u.Scheme != "s3" || u.Host == "" {
-				return fmt.Errorf("invalid --backup %q: expected s3://bucket[/prefix]", gcCommitlogBackup)
+			var err error
+			bucket, prefix, err = parseBackupDestination(gcCommitlogBackup, "gc-commitlog")
+			if err != nil {
+				return err
 			}
-			bucket = u.Host
-			prefix = strings.Trim(u.Path, "/")
-			if prefix != "" {
-				prefix += "/"
-			}
-			prefix += "gc-commitlog/"
 		}
 		if !gcCommitlogDryRun && bucket == "" && !gcCommitlogNoBackup {
 			return fmt.Errorf("no backup destination: pass --backup s3://bucket/prefix, or --no-backup to delete without a backup")
@@ -153,13 +129,11 @@ var gcCommitlogCmd = &cobra.Command{
 			return err
 		}
 
-		f, err := os.CreateTemp("", "gc-commitlog-*.jsonl")
+		backup, err := newBackupFile("gc-commitlog-*.jsonl")
 		if err != nil {
-			return fmt.Errorf("failed to create temp file: %w", err)
+			return err
 		}
-		defer os.Remove(f.Name())
-		defer f.Close()
-		w := bufio.NewWriter(f)
+		defer backup.close()
 
 		// Snapshot every candidate into the backup file, remembering the ids so
 		// the delete below touches exactly the rows that were backed up. Paging
@@ -181,29 +155,8 @@ var gcCommitlogCmd = &cobra.Command{
 				break
 			}
 			for _, cl := range logs {
-				var proof concrnt.Proof
-				if cl.Proof != "" {
-					if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
-						return fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
-					}
-				}
-				line, err := json.Marshal(concrnt.SignedDocumentWithMeta{
-					SignedDocument: concrnt.SignedDocument{
-						Document: cl.Document,
-						Proof:    proof,
-					},
-					Meta: gcCommitlogMeta{
-						ID:    cl.ID,
-						Owner: cl.Owner,
-						IP:    cl.IP,
-						CDate: cl.CDate.UTC(),
-					},
-				})
-				if err != nil {
-					return fmt.Errorf("failed to marshal commit %s: %w", cl.ID, err)
-				}
-				if _, err := w.Write(append(line, '\n')); err != nil {
-					return fmt.Errorf("failed to write backup file: %w", err)
+				if err := backup.writeCommitLog(cl); err != nil {
+					return err
 				}
 				ids = append(ids, cl.ID)
 			}
@@ -215,37 +168,14 @@ var gcCommitlogCmd = &cobra.Command{
 			return nil
 		}
 
-		if err := w.Flush(); err != nil {
-			return fmt.Errorf("failed to flush backup file: %w", err)
-		}
-		if err := f.Sync(); err != nil {
-			return fmt.Errorf("failed to sync backup file: %w", err)
-		}
-		st, err := f.Stat()
-		if err != nil {
-			return fmt.Errorf("failed to stat backup file: %w", err)
-		}
-		if st.Size() == 0 {
-			return fmt.Errorf("backup file is empty despite %d collected commit logs", len(ids))
-		}
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return fmt.Errorf("failed to rewind backup file: %w", err)
-		}
-
-		key := prefix + time.Now().UTC().Format("20060102T150405.000Z") + ".jsonl"
-		_, err = manager.NewUploader(s3client).Upload(ctx, &s3.PutObjectInput{
-			Bucket:      aws.String(bucket),
-			Key:         aws.String(key),
-			Body:        f,
-			ContentType: aws.String("application/x-ndjson"),
-			Metadata: map[string]string{
-				"rows":   strconv.Itoa(len(ids)),
-				"cutoff": cutoff,
-				"fqdn":   op.GlobalConfig.FQDN,
-			},
+		key := prefix + backupTimestamp() + ".jsonl"
+		err = backup.upload(ctx, s3client, bucket, key, map[string]string{
+			"rows":   strconv.Itoa(len(ids)),
+			"cutoff": cutoff,
+			"fqdn":   op.GlobalConfig.FQDN,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to upload backup to s3://%s/%s (nothing deleted): %w", bucket, key, err)
+			return err
 		}
 		fmt.Fprintf(os.Stderr, "backed up %d commit logs -> s3://%s/%s\n", len(ids), bucket, key)
 
