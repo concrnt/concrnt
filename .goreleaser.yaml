@@ -126,3 +126,8 @@ release:
   mode: keep-existing
   # v2.0.0-beta13 etc. become pre-releases, matching the docker `latest` rule
   prerelease: auto
+  # when goreleaser creates the release itself, lead with the annotated tag's
+  # body (git tag -a vX.Y.Z -m "vX.Y.Z" -m "<notes>") and put the generated
+  # commit list below it. Falls back to the commit body for lightweight tags.
+  header: |
+    {{ .TagBody }}
