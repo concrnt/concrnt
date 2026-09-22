@@ -122,6 +122,16 @@ type SignedDocument struct {
 	IsPublic *bool `json:"isPublic,omitempty"`
 }
 
+// SignedDocumentWithMeta is a SignedDocument line annotated with out-of-band
+// metadata (for example the commit-log id/owner/ip/cdate in a gc-commitlog
+// backup). SignedDocument is embedded so the JSON is a strict superset of a
+// SignedDocument line: consumers that only know SignedDocument ignore "meta",
+// so such a file can be replayed by import-commitlog as-is.
+type SignedDocumentWithMeta struct {
+	SignedDocument
+	Meta any `json:"meta,omitempty"`
+}
+
 func (sd *SignedDocument) ParsedDocument() (Document[any], error) {
 	var doc Document[any]
 	err := json.Unmarshal([]byte(sd.Document), &doc)

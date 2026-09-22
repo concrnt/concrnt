@@ -1,20 +1,47 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/spf13/cobra"
 
+	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/objectstore"
 )
 
 var (
-	gcCommitlogDryRun    bool
-	gcCommitlogRetention time.Duration
+	gcCommitlogDryRun      bool
+	gcCommitlogRetention   time.Duration
+	gcCommitlogBackup      string
+	gcCommitlogS3PathStyle bool
+	gcCommitlogNoBackup    bool
 )
+
+const gcCommitlogBatchSize = 1000
+
+// gcCommitlogMeta is the "meta" of each backup line: what the commit_logs row
+// held besides the document itself, so the backup is lossless even though the
+// wire fields stay a plain SignedDocument.
+type gcCommitlogMeta struct {
+	ID    string    `json:"id"`
+	Owner string    `json:"owner"`
+	IP    string    `json:"ip"`
+	CDate time.Time `json:"cdate"`
+}
 
 var gcCommitlogCmd = &cobra.Command{
 	Use:   "gc-commitlog",
@@ -32,6 +59,22 @@ var gcCommitlogCmd = &cobra.Command{
 		"This deletes every gc_candidate commit log whose document createdAt is older\n" +
 		"than now minus --retention. Retention below the backdate window would reopen\n" +
 		"the replay hole, so shorter values are refused.\n" +
+		"\n" +
+		"With --backup s3://bucket/prefix the rows are first written to\n" +
+		"<prefix>/gc-commitlog/<timestamp>.jsonl, one concrnt.SignedDocumentWithMeta per\n" +
+		"line (the replayable document/proof plus meta {id, owner, ip, cdate}), and nothing\n" +
+		"is deleted until the upload has succeeded; rows flagged while the backup was being\n" +
+		"taken are left for the next run. The file can be replayed as-is with import-commitlog.\n" +
+		"AWS connection settings (credentials, region, endpoint_url for S3-compatible stores,\n" +
+		"request_checksum_calculation=when_required for stores that reject checksum trailers)\n" +
+		"come from the AWS SDK default chain — ~/.aws/config, ~/.aws/credentials, AWS_PROFILE,\n" +
+		"AWS_ENDPOINT_URL_S3 and friends — not from the concrnt config; MinIO additionally\n" +
+		"needs --s3-path-style. The backup is written to a temp file first (TMPDIR).\n" +
+		"Without --backup the command refuses to delete unless --no-backup is given.\n" +
+		"Note that for unregistered users the backup re-materialises exactly the data (and\n" +
+		"request IPs) the erase path removes: treat the bucket as personal data — restrict\n" +
+		"access, set an expiration lifecycle (and one aborting incomplete multipart uploads),\n" +
+		"or use --no-backup when erasure must be final.\n" +
 		"Reads and writes Postgres directly; safe to run against a live server. Re-running is a no-op.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
@@ -39,6 +82,26 @@ var gcCommitlogCmd = &cobra.Command{
 
 		if gcCommitlogRetention < domain.MaxBackdate {
 			return fmt.Errorf("retention %s is shorter than the backdate window %s: a captured document could be replayed after its tombstone is gone", gcCommitlogRetention, domain.MaxBackdate)
+		}
+
+		if gcCommitlogBackup != "" && gcCommitlogNoBackup {
+			return fmt.Errorf("--backup and --no-backup are mutually exclusive")
+		}
+		bucket, prefix := "", ""
+		if gcCommitlogBackup != "" {
+			u, err := url.Parse(gcCommitlogBackup)
+			if err != nil || u.Scheme != "s3" || u.Host == "" {
+				return fmt.Errorf("invalid --backup %q: expected s3://bucket[/prefix]", gcCommitlogBackup)
+			}
+			bucket = u.Host
+			prefix = strings.Trim(u.Path, "/")
+			if prefix != "" {
+				prefix += "/"
+			}
+			prefix += "gc-commitlog/"
+		}
+		if !gcCommitlogDryRun && bucket == "" && !gcCommitlogNoBackup {
+			return fmt.Errorf("no backup destination: pass --backup s3://bucket/prefix, or --no-backup to delete without a backup")
 		}
 
 		// Commit log ids are time-prefixed CDIDs of the document's author-signed
@@ -57,20 +120,144 @@ var gcCommitlogCmd = &cobra.Command{
 				return fmt.Errorf("failed to count commit logs: %w", err)
 			}
 			fmt.Fprintf(os.Stderr, "would delete %d commit logs\n", count)
+			if bucket != "" {
+				fmt.Fprintf(os.Stderr, "backup: s3://%s/%s\n", bucket, prefix)
+			} else {
+				fmt.Fprintf(os.Stderr, "backup: none (would refuse without --no-backup)\n")
+			}
 			return nil
 		}
 
 		var total int64
+		if bucket == "" {
+			for {
+				// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
+				// each statement (and its cascade) bounded.
+				res := op.DB.WithContext(ctx).
+					Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT ?)", cutoff, gcCommitlogBatchSize)
+				if res.Error != nil {
+					return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+				}
+				if res.RowsAffected == 0 {
+					break
+				}
+				total += res.RowsAffected
+				fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
+			}
+			fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
+			return nil
+		}
+
+		s3client, err := objectstore.NewS3(ctx, gcCommitlogS3PathStyle)
+		if err != nil {
+			return err
+		}
+
+		f, err := os.CreateTemp("", "gc-commitlog-*.jsonl")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %w", err)
+		}
+		defer os.Remove(f.Name())
+		defer f.Close()
+		w := bufio.NewWriter(f)
+
+		// Snapshot every candidate into the backup file, remembering the ids so
+		// the delete below touches exactly the rows that were backed up. Paging
+		// by id keeps the primary-key index in use (see dump-commitlog).
+		var ids []string
+		cursor := ""
 		for {
-			// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
-			// each statement (and its cascade) bounded.
-			res := op.DB.WithContext(ctx).
-				Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT 1000)", cutoff)
+			var logs []models.CommitLog
+			q := op.DB.WithContext(ctx).
+				Where("gc_candidate AND id < ?", cutoff).
+				Order("id ASC").Limit(gcCommitlogBatchSize)
+			if cursor != "" {
+				q = q.Where("id > ?", cursor)
+			}
+			if err := q.Find(&logs).Error; err != nil {
+				return fmt.Errorf("failed to query commit logs: %w", err)
+			}
+			if len(logs) == 0 {
+				break
+			}
+			for _, cl := range logs {
+				var proof concrnt.Proof
+				if cl.Proof != "" {
+					if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+						return fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
+					}
+				}
+				line, err := json.Marshal(concrnt.SignedDocumentWithMeta{
+					SignedDocument: concrnt.SignedDocument{
+						Document: cl.Document,
+						Proof:    proof,
+					},
+					Meta: gcCommitlogMeta{
+						ID:    cl.ID,
+						Owner: cl.Owner,
+						IP:    cl.IP,
+						CDate: cl.CDate.UTC(),
+					},
+				})
+				if err != nil {
+					return fmt.Errorf("failed to marshal commit %s: %w", cl.ID, err)
+				}
+				if _, err := w.Write(append(line, '\n')); err != nil {
+					return fmt.Errorf("failed to write backup file: %w", err)
+				}
+				ids = append(ids, cl.ID)
+			}
+			cursor = logs[len(logs)-1].ID
+			fmt.Fprintf(os.Stderr, "collected %d commit logs so far...\n", len(ids))
+		}
+		if len(ids) == 0 {
+			fmt.Fprintf(os.Stderr, "nothing to delete\n")
+			return nil
+		}
+
+		if err := w.Flush(); err != nil {
+			return fmt.Errorf("failed to flush backup file: %w", err)
+		}
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("failed to sync backup file: %w", err)
+		}
+		st, err := f.Stat()
+		if err != nil {
+			return fmt.Errorf("failed to stat backup file: %w", err)
+		}
+		if st.Size() == 0 {
+			return fmt.Errorf("backup file is empty despite %d collected commit logs", len(ids))
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("failed to rewind backup file: %w", err)
+		}
+
+		key := prefix + time.Now().UTC().Format("20060102T150405.000Z") + ".jsonl"
+		_, err = manager.NewUploader(s3client).Upload(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(bucket),
+			Key:         aws.String(key),
+			Body:        f,
+			ContentType: aws.String("application/x-ndjson"),
+			Metadata: map[string]string{
+				"rows":   strconv.Itoa(len(ids)),
+				"cutoff": cutoff,
+				"fqdn":   op.GlobalConfig.FQDN,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to upload backup to s3://%s/%s (nothing deleted): %w", bucket, key, err)
+		}
+		fmt.Fprintf(os.Stderr, "backed up %d commit logs -> s3://%s/%s\n", len(ids), bucket, key)
+
+		// Only now, with the backup durable, delete exactly the backed-up rows.
+		for start := 0; start < len(ids); start += gcCommitlogBatchSize {
+			batch := ids[start:min(start+gcCommitlogBatchSize, len(ids))]
+			res := op.DB.WithContext(ctx).Exec("DELETE FROM commit_logs WHERE id IN ?", batch)
 			if res.Error != nil {
 				return fmt.Errorf("failed to delete commit logs: %w", res.Error)
 			}
-			if res.RowsAffected == 0 {
-				break
+			if res.RowsAffected != int64(len(batch)) {
+				fmt.Fprintf(os.Stderr, "warning: expected to delete %d commit logs but deleted %d (concurrent gc?)\n", len(batch), res.RowsAffected)
 			}
 			total += res.RowsAffected
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
@@ -85,4 +272,7 @@ func init() {
 
 	gcCommitlogCmd.Flags().BoolVar(&gcCommitlogDryRun, "dry-run", false, "Only count the commit logs that would be deleted")
 	gcCommitlogCmd.Flags().DurationVar(&gcCommitlogRetention, "retention", domain.MaxBackdate, "How far back to keep GC-flagged commit logs; must be at least the backdate window")
+	gcCommitlogCmd.Flags().StringVar(&gcCommitlogBackup, "backup", "", "Back the deleted commit logs up to this S3 location (s3://bucket[/prefix]) before deleting; AWS settings come from the SDK default chain")
+	gcCommitlogCmd.Flags().BoolVar(&gcCommitlogS3PathStyle, "s3-path-style", false, "Use path-style S3 addressing for --backup (required for MinIO)")
+	gcCommitlogCmd.Flags().BoolVar(&gcCommitlogNoBackup, "no-backup", false, "Delete without a backup (required when --backup is not given)")
 }

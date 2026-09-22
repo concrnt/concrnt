@@ -240,3 +240,40 @@ func TestSignedDocumentKeyOnlyJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestSignedDocumentWithMetaJSON(t *testing.T) {
+	sd := SignedDocument{
+		Document: `{"kind":"record"}`,
+		Proof:    Proof{Type: "none"},
+	}
+	line, err := json.Marshal(SignedDocumentWithMeta{
+		SignedDocument: sd,
+		Meta:           map[string]any{"id": "abc", "ip": "127.0.0.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(line, &top); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"document", "proof", "meta"} {
+		if _, ok := top[k]; !ok {
+			t.Fatalf("missing top-level key %q in %s", k, line)
+		}
+	}
+	if len(top) != 3 {
+		t.Fatalf("expected exactly document/proof/meta, got %s", line)
+	}
+
+	// A plain SignedDocument reader must see the same document and proof and
+	// ignore meta.
+	var back SignedDocument
+	if err := json.Unmarshal(line, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Document != sd.Document || back.Proof.Type != sd.Proof.Type {
+		t.Fatalf("round trip mismatch: %+v", back)
+	}
+}
