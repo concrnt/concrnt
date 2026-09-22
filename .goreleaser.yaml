@@ -7,6 +7,13 @@ version: 2
 
 project_name: concrnt
 
+git:
+  # A release tag (v1.11.6) is usually cut on the same commit as its last
+  # pre-release (v1.11.6-beta3). Without this, git's version sort ranks the
+  # "-beta3" tag above the bare one and goreleaser picks the wrong tag,
+  # then trips over the already-uploaded assets of that pre-release.
+  prerelease_suffix: "-"
+
 before:
   hooks:
     - go mod download

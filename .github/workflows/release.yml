@@ -36,3 +36,6 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # release exactly the tag that triggered this run, even when other
+          # tags (e.g. the last pre-release) point at the same commit
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
