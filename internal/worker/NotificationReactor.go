@@ -15,6 +15,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/concrnt/concrnt/internal/infra/push"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -43,19 +44,28 @@ type NotificationReactor struct {
 	realtime     RealtimeUsecase
 	dedup        NotificationDeduper
 	opts         webpush.Options
+	heartbeat    *health.Heartbeat
 }
 
+// reactorDeadline is the liveness deadline of the sync loop: its 10s tick
+// plus one subscription listing, with margin.
+const reactorDeadline = 2 * time.Minute
+
+// NewNotificationReactor wires the push reactor; watchdog (nil to skip)
+// gets the sync loop's liveness heartbeat.
 func NewNotificationReactor(
 	notification NotificationUsecase,
 	realtime RealtimeUsecase,
 	dedup NotificationDeduper,
 	opts webpush.Options,
+	watchdog *health.Watchdog,
 ) *NotificationReactor {
 	return &NotificationReactor{
 		notification: notification,
 		realtime:     realtime,
 		dedup:        dedup,
 		opts:         opts,
+		heartbeat:    watchdog.Register("worker/notification-reactor", reactorDeadline),
 	}
 }
 
@@ -74,6 +84,8 @@ func (r *NotificationReactor) run(ctx context.Context) {
 
 	workers := make(map[string]notificationWorker)
 
+	defer r.heartbeat.Stop()
+	r.heartbeat.Beat()
 	for {
 		select {
 		case <-ctx.Done():
@@ -82,6 +94,7 @@ func (r *NotificationReactor) run(ctx context.Context) {
 			}
 			return
 		case <-ticker.C:
+			r.heartbeat.Beat()
 			r.syncWorkers(ctx, workers)
 		}
 	}

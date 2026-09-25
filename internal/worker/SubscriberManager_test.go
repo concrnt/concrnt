@@ -22,7 +22,7 @@ func (f fakeLeaderState) IsLeader() bool { return f.leader }
 func TestSubscriberManagerDelegatesToLeaderWhenLeading(t *testing.T) {
 	ws := newWSTestServer(t)
 	fake := &fakeSubClient{ws: ws}
-	leaderSub := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil)
+	leaderSub := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil, nil)
 
 	// registered so the keeper's own demand snapshot agrees with the manual
 	// ensure below; otherwise the very next tick's deleteExcessSubscriptions
@@ -61,7 +61,7 @@ func TestSubscriberManagerDelegatesToWorkerWhenNotLeading(t *testing.T) {
 	defer leader.Close()
 
 	fake := &fakeSubClient{}
-	leaderSub := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil)
+	leaderSub := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil, nil)
 	workerSub := NewWorkerSubscriber(fakeLeaderLocator{url: leader.URL, ok: true})
 	m := NewSubscriberManager(fakeLeaderState{leader: false}, leaderSub, workerSub)
 

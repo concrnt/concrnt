@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/concrnt/concrnt/internal/testutil"
 )
 
@@ -38,7 +39,7 @@ func (f *fakeElectorService) handler() http.Handler {
 }
 
 func newTestElector(endpoint string) *HTTPElector {
-	e := NewHTTPElector(endpoint)
+	e := NewHTTPElector(endpoint, nil)
 	e.pollInterval = 20 * time.Millisecond
 	e.failureGrace = 200 * time.Millisecond
 	return e
@@ -129,5 +130,39 @@ func TestHTTPElectorDemotesWhenServiceUnreachable(t *testing.T) {
 	}
 	if _, err := e.Peers(context.Background()); err == nil {
 		t.Fatal("peers must be unavailable with a dead elector service")
+	}
+}
+
+// The poll loop beats the liveness watchdog on every poll and releases the
+// heartbeat when Run returns.
+func TestHTTPElectorReportsHeartbeat(t *testing.T) {
+	fake := &fakeElectorService{}
+	fake.set(ElectorStatus{IsLeader: false})
+	server := httptest.NewServer(fake.handler())
+	defer server.Close()
+
+	watchdog := health.NewWatchdog()
+	e := NewHTTPElector(server.URL, watchdog)
+	e.pollInterval = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		e.Run(ctx, func(context.Context) {})
+		close(done)
+	}()
+
+	testutil.WaitFor(t, func() bool {
+		_, running := watchdog.Stalled(time.Now().Add(time.Hour))["cluster/elector"]
+		return running
+	})
+	if stalled := watchdog.Stalled(time.Now()); len(stalled) != 0 {
+		t.Fatalf("poll loop must not read as stalled while running: %v", stalled)
+	}
+
+	cancel()
+	<-done
+	if stalled := watchdog.Stalled(time.Now().Add(time.Hour)); len(stalled) != 0 {
+		t.Fatalf("a returned poll loop must release its heartbeat: %v", stalled)
 	}
 }

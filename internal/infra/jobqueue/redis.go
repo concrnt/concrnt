@@ -20,6 +20,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/concrnt/concrnt/internal/infra/health"
 )
 
 const (
@@ -40,6 +42,12 @@ const (
 	bookkeepingTimeout   = 5 * time.Second
 	handlerTimeout       = 30 * time.Second
 	groupCreateRetryWait = 2 * time.Second
+
+	// liveness deadlines for the queue's loops: each beats between jobs, so
+	// the longest legitimate silence is one blocking read or one tick plus
+	// one handler timeout; the margin on top covers a slow Redis round trip
+	consumerDeadline    = 2 * time.Minute
+	bookkeepingDeadline = time.Minute
 )
 
 // Job is the envelope the queue persists: a job type, its serialized
@@ -78,6 +86,8 @@ type RedisJobQueue struct {
 	moverInterval   time.Duration
 	reclaimInterval time.Duration
 	streamMaxLen    int64
+
+	watchdog *health.Watchdog
 }
 
 type Option func(*RedisJobQueue)
@@ -112,6 +122,11 @@ func WithReclaimInterval(d time.Duration) Option {
 
 func WithConsumerName(name string) Option {
 	return func(q *RedisJobQueue) { q.consumerName = name }
+}
+
+// WithWatchdog reports the queue's loops to the liveness watchdog.
+func WithWatchdog(w *health.Watchdog) Option {
+	return func(q *RedisJobQueue) { q.watchdog = w }
 }
 
 func NewRedisJobQueue(rdb *redis.Client, opts ...Option) *RedisJobQueue {
@@ -203,29 +218,30 @@ func (q *RedisJobQueue) Run(ctx context.Context) error {
 
 	for i := 0; i < q.concurrency; i++ {
 		consumer := q.consumerName + "-" + strconv.Itoa(i)
+		heartbeat := q.watchdog.Register("jobqueue/consumer-"+strconv.Itoa(i), consumerDeadline)
 		wg.Add(1)
-		go func(consumer string) {
+		go func(consumer string, heartbeat *health.Heartbeat) {
 			defer wg.Done()
-			q.consumeLoop(ctx, consumer)
-		}(consumer)
+			q.consumeLoop(ctx, consumer, heartbeat)
+		}(consumer, heartbeat)
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		q.moverLoop(ctx)
+		q.moverLoop(ctx, q.watchdog.Register("jobqueue/mover", bookkeepingDeadline))
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		q.reclaimLoop(ctx)
+		q.reclaimLoop(ctx, q.watchdog.Register("jobqueue/reclaimer", consumerDeadline))
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		q.statsLoop(ctx)
+		q.statsLoop(ctx, q.watchdog.Register("jobqueue/stats", bookkeepingDeadline))
 	}()
 
 	<-ctx.Done()
@@ -251,8 +267,10 @@ func (q *RedisJobQueue) ensureGroup(ctx context.Context) error {
 	}
 }
 
-func (q *RedisJobQueue) consumeLoop(ctx context.Context, consumer string) {
+func (q *RedisJobQueue) consumeLoop(ctx context.Context, consumer string, heartbeat *health.Heartbeat) {
+	defer heartbeat.Stop()
 	for ctx.Err() == nil {
+		heartbeat.Beat()
 		streams, err := q.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    groupName,
 			Consumer: consumer,
@@ -270,22 +288,26 @@ func (q *RedisJobQueue) consumeLoop(ctx context.Context, consumer string) {
 		}
 		for _, stream := range streams {
 			for _, msg := range stream.Messages {
+				heartbeat.Beat()
 				q.process(ctx, msg)
 			}
 		}
 	}
 }
 
-func (q *RedisJobQueue) reclaimLoop(ctx context.Context) {
+func (q *RedisJobQueue) reclaimLoop(ctx context.Context, heartbeat *health.Heartbeat) {
 	ticker := time.NewTicker(q.reclaimInterval)
 	defer ticker.Stop()
+	defer heartbeat.Stop()
 	consumer := q.consumerName + "-reclaimer"
 
+	heartbeat.Beat()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			heartbeat.Beat()
 			messages, _, err := q.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
 				Stream:   streamKey,
 				Group:    groupName,
@@ -301,21 +323,25 @@ func (q *RedisJobQueue) reclaimLoop(ctx context.Context) {
 				continue
 			}
 			for _, msg := range messages {
+				heartbeat.Beat()
 				q.process(ctx, msg)
 			}
 		}
 	}
 }
 
-func (q *RedisJobQueue) moverLoop(ctx context.Context) {
+func (q *RedisJobQueue) moverLoop(ctx context.Context, heartbeat *health.Heartbeat) {
 	ticker := time.NewTicker(q.moverInterval)
 	defer ticker.Stop()
+	defer heartbeat.Stop()
 
+	heartbeat.Beat()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			heartbeat.Beat()
 			q.moveDueRetries(ctx)
 		}
 	}

@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/concrnt/concrnt/internal/infra/health"
 )
 
 // Elector decides which replica runs the singleton workers.
@@ -60,6 +62,9 @@ type httpElectorState struct {
 
 const (
 	electorPollInterval = 2 * time.Second
+	// liveness deadline of the poll loop: one interval plus one client
+	// timeout is the longest legitimate silence between beats
+	electorLoopDeadline = 30 * time.Second
 	// electorFailureGrace must stay below the elector's lease duration: if the
 	// elector service dies it also stops renewing the lease, so dropping
 	// leadership locally before another replica can acquire it prevents two
@@ -77,15 +82,19 @@ type HTTPElector struct {
 	pollInterval time.Duration
 	failureGrace time.Duration
 
-	state atomic.Pointer[httpElectorState]
+	state     atomic.Pointer[httpElectorState]
+	heartbeat *health.Heartbeat
 }
 
-func NewHTTPElector(endpoint string) *HTTPElector {
+// NewHTTPElector polls endpoint; watchdog (nil to skip) gets the poll
+// loop's liveness heartbeat.
+func NewHTTPElector(endpoint string, watchdog *health.Watchdog) *HTTPElector {
 	return &HTTPElector{
 		endpoint:     strings.TrimRight(endpoint, "/"),
 		client:       &http.Client{Timeout: 2 * time.Second},
 		pollInterval: electorPollInterval,
 		failureGrace: electorFailureGrace,
+		heartbeat:    watchdog.Register("cluster/elector", electorLoopDeadline),
 	}
 }
 
@@ -155,8 +164,10 @@ func (e *HTTPElector) Run(ctx context.Context, onLead func(ctx context.Context))
 
 	var lead leadState
 	defer lead.stop()
+	defer e.heartbeat.Stop()
 
 	for {
+		e.heartbeat.Beat()
 		if err := e.fetch(ctx); err != nil && ctx.Err() == nil {
 			slog.Warn(
 				"failed to poll elector",

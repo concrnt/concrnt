@@ -29,6 +29,7 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/gateway"
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/concrnt/concrnt/internal/infra/jobqueue"
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
@@ -47,6 +48,11 @@ import (
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/internal/worker"
 )
+
+// readinessTimeout bounds one /ready sweep. The kubelet gives a probe one
+// second by default, so a backend that has not answered by then must
+// already be reported as down inside that window.
+const readinessTimeout = 800 * time.Millisecond
 
 var (
 	version      = "unknown"
@@ -217,10 +223,13 @@ func main() {
 		panic("concrnt.cluster.enable requires concrnt.cluster.electorEndpoint")
 	}
 
+	// every long-running loop reports here; a stalled one fails liveness
+	watchdog := health.NewWatchdog()
+
 	var elector cluster.Elector
 	var discovery worker.PeerDiscovery // nil in standalone mode: no peers to poll
 	if clustered {
-		httpElector := cluster.NewHTTPElector(conf.Concrnt.Cluster.ElectorEndpoint)
+		httpElector := cluster.NewHTTPElector(conf.Concrnt.Cluster.ElectorEndpoint, watchdog)
 		elector = httpElector
 		discovery = httpElector
 	} else {
@@ -237,7 +246,7 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueue := jobqueue.NewRedisJobQueue(redis)
+	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
 		service.GlobalParameters{
@@ -283,7 +292,7 @@ func main() {
 	notificationRepo := postgres.NewNotificationRepository(db)
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
-	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery)
+	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
 	workerSub := worker.NewWorkerSubscriber(elector)
 	subscriber := worker.NewSubscriberManager(elector, leaderSub, workerSub)
 
@@ -337,7 +346,7 @@ func main() {
 		if clustered {
 			notificationDeduper = pubsub.NewRedisDeduper(redis)
 		}
-		notificationReactor = worker.NewNotificationReactor(notificationUC, subscriptionUC, notificationDeduper, *webpushOpts)
+		notificationReactor = worker.NewNotificationReactor(notificationUC, subscriptionUC, notificationDeduper, *webpushOpts, watchdog)
 	}
 
 	// singleton workers run only while this replica holds the leadership: the
@@ -413,14 +422,7 @@ func main() {
 	internal.HideBanner = true
 	internal.HidePort = true
 
-	internal.GET("/health", func(c echo.Context) (err error) {
-		return c.String(http.StatusOK, "ok")
-	})
-
 	internal.GET("/metrics", echoprometheus.NewHandler())
-
-	var ready atomic.Bool
-	ready.Store(true)
 
 	sqlDB, err := db.DB()
 	if err != nil {
@@ -431,21 +433,22 @@ func main() {
 	// and wait time are the first thing to check when everything gets slow
 	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-	internal.GET("/ready", func(c echo.Context) (err error) {
-		if !ready.Load() {
-			return c.String(http.StatusServiceUnavailable, "shutting down")
-		}
-
-		// only Postgres gates readiness: redis and memcached are soft
-		// dependencies (cache misses fall back to origin, publish failures
-		// are logged), and failing all replicas at once on a cache-tier blip
-		// would turn a degradation into a full outage
-		if err := sqlDB.PingContext(c.Request().Context()); err != nil {
-			return c.String(http.StatusServiceUnavailable, "db error")
-		}
-
-		return c.String(http.StatusOK, "ok")
+	// every backend the public API needs gates readiness: postgres holds
+	// the data, redis carries delivery jobs and realtime events, memcached
+	// serves the timeline chunks. the sweep stays under the kubelet's probe
+	// timeout so a hung backend reads as "down" rather than as a timed-out
+	// probe with no body
+	readiness := health.NewReadiness(readinessTimeout)
+	readiness.Add("postgres", sqlDB.PingContext)
+	readiness.Add("redis", func(ctx context.Context) error {
+		return redis.Ping(ctx).Err()
 	})
+	readiness.Add("memcached", func(ctx context.Context) error {
+		return mc.Ping()
+	})
+
+	probes := rest.NewProbeHandler(watchdog, readiness)
+	probes.RegisterRoutes(internal)
 
 	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
 	coordination.RegisterRoutes(internal)
@@ -471,7 +474,7 @@ func main() {
 	<-ctx.Done()
 
 	slog.Info("shutting down")
-	ready.Store(false)
+	probes.Drain()
 
 	if clustered {
 		// keep serving briefly so the endpoint controller stops routing to

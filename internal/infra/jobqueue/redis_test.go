@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
+	"reflect"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/concrnt/concrnt/internal/infra/jobqueue"
 	"github.com/concrnt/concrnt/internal/testutil"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
@@ -287,5 +291,48 @@ func TestRedisJobQueue_PurgeDLQBefore(t *testing.T) {
 	}
 	if len(remaining) != 3 || remaining[0] != "2000-0" {
 		t.Fatalf("remaining DLQ entries = %v, want [2000-0 2000-1 3000-0]", remaining)
+	}
+}
+
+// Every loop of a running queue must keep its liveness heartbeat, and must
+// release it when the queue stops, so a shut-down queue does not read as a
+// wedged process.
+func TestRedisJobQueue_ReportsLoopHeartbeats(t *testing.T) {
+	rdb, cleanup := testutil.CreateRDB()
+	defer cleanup()
+
+	watchdog := health.NewWatchdog()
+	q := jobqueue.NewRedisJobQueue(rdb,
+		jobqueue.WithConsumerName("test-heartbeat"),
+		jobqueue.WithConcurrency(2),
+		jobqueue.WithWatchdog(watchdog),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		q.Run(ctx)
+		close(done)
+	}()
+
+	want := []string{"jobqueue/consumer-0", "jobqueue/consumer-1", "jobqueue/mover", "jobqueue/reclaimer", "jobqueue/stats"}
+	testutil.WaitFor(t, func() bool { return len(watchdog.Loops(time.Now())) == len(want) })
+	if got := slices.Sorted(maps.Keys(watchdog.Loops(time.Now()))); !reflect.DeepEqual(got, want) {
+		t.Fatalf("registered loops %v, want %v", got, want)
+	}
+
+	// each loop has beaten at least once: seen from far in the future, every
+	// one of them is overdue, which proves they are all running
+	testutil.WaitFor(t, func() bool {
+		return len(watchdog.Stalled(time.Now().Add(time.Hour))) == len(want)
+	})
+	if stalled := watchdog.Stalled(time.Now()); len(stalled) != 0 {
+		t.Fatalf("no loop should be stalled while running: %v", stalled)
+	}
+
+	cancel()
+	<-done
+	if stalled := watchdog.Stalled(time.Now().Add(time.Hour)); len(stalled) != 0 {
+		t.Fatalf("stopped loops must release their heartbeat: %v", stalled)
 	}
 }

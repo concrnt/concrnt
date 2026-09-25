@@ -7,6 +7,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"github.com/concrnt/concrnt/internal/infra/health"
 )
 
 const (
@@ -56,16 +58,19 @@ var (
 )
 
 // statsLoop refreshes the backlog gauges from Redis until ctx is cancelled.
-func (q *RedisJobQueue) statsLoop(ctx context.Context) {
+func (q *RedisJobQueue) statsLoop(ctx context.Context, heartbeat *health.Heartbeat) {
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
+	defer heartbeat.Stop()
 
+	heartbeat.Beat()
 	q.updateBacklog(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			heartbeat.Beat()
 			q.updateBacklog(ctx)
 		}
 	}

@@ -13,6 +13,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/gorilla/websocket"
 )
@@ -157,7 +158,7 @@ func (nopPubSub) SubscribeAll(ctx context.Context, response chan<- concrnt.Event
 }
 
 func newTestSubscriber(fake *fakeSubClient) *LeaderSubscriber {
-	return NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil)
+	return NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, fake, nopPubSub{}, nil, nil)
 }
 
 func (s *LeaderSubscriber) trackedEntries() (count int, connected int) {
@@ -574,7 +575,7 @@ func TestPollPeerDemandUnion(t *testing.T) {
 	peerB := newDemandPeerServer(t, `["cckv://bob/home"]`)
 	discovery := &staticPeerDiscovery{peers: []string{peerA.srv.URL, peerB.srv.URL}}
 
-	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery)
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery, nil)
 
 	got := s.pollPeerDemand(context.Background())
 	if !slices.Contains(got, "cckv://alice/home") || !slices.Contains(got, "cckv://bob/home") {
@@ -588,7 +589,7 @@ func TestPollPeerDemandUnion(t *testing.T) {
 func TestPollPeerDemandDropsPeerGoneFromDiscovery(t *testing.T) {
 	peerA := newDemandPeerServer(t, `["cckv://alice/home"]`)
 	discovery := &staticPeerDiscovery{peers: []string{peerA.srv.URL}}
-	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery)
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery, nil)
 
 	got := s.pollPeerDemand(context.Background())
 	if !slices.Contains(got, "cckv://alice/home") {
@@ -609,7 +610,7 @@ func TestPollPeerDemandDropsPeerGoneFromDiscovery(t *testing.T) {
 func TestPollPeerDemandKeepsLastKnownOnPollFailure(t *testing.T) {
 	peerA := newDemandPeerServer(t, `["cckv://alice/home"]`)
 	discovery := &staticPeerDiscovery{peers: []string{peerA.srv.URL}}
-	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery)
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery, nil)
 
 	got := s.pollPeerDemand(context.Background())
 	if !slices.Contains(got, "cckv://alice/home") {
@@ -629,7 +630,7 @@ func TestPollPeerDemandKeepsLastKnownOnPollFailure(t *testing.T) {
 func TestPollPeerDemandFreezesWhileDiscoveryFails(t *testing.T) {
 	peerA := newDemandPeerServer(t, `["cckv://alice/home"]`)
 	discovery := &staticPeerDiscovery{peers: []string{peerA.srv.URL}}
-	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery)
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery, nil)
 
 	got := s.pollPeerDemand(context.Background())
 	if !slices.Contains(got, "cckv://alice/home") {
@@ -702,7 +703,7 @@ func TestCurrentSubscriptionsRemovesOnDrop(t *testing.T) {
 func TestCurrentSubscriptionsDoesNotPollPeers(t *testing.T) {
 	var calls atomic.Int64
 	discovery := countingDiscovery{calls: &calls}
-	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery)
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, discovery, nil)
 
 	for range 5 {
 		s.CurrentSubscriptions()
@@ -860,4 +861,28 @@ func TestCloseAllSkipsNewerTerm(t *testing.T) {
 	if count, _ := s.trackedEntries(); count != 0 {
 		t.Fatalf("expected the owning term's closeAll to sweep, got %d entries", count)
 	}
+}
+
+// The keeper loop beats the liveness watchdog on every tick and releases the
+// heartbeat when its lead term ends, so a demoted replica does not read as
+// a wedged process.
+func TestLeaderSubscriberKeeperReportsHeartbeat(t *testing.T) {
+	watchdog := health.NewWatchdog()
+	s := NewLeaderSubscriber(&domain.Config{FQDN: "local.example"}, &fakeSubClient{}, nopPubSub{}, nil, watchdog)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx)
+
+	testutil.WaitFor(t, func() bool {
+		_, running := watchdog.Stalled(time.Now().Add(time.Hour))["worker/leader-subscriber"]
+		return running
+	})
+	if stalled := watchdog.Stalled(time.Now()); len(stalled) != 0 {
+		t.Fatalf("keeper must not read as stalled while running: %v", stalled)
+	}
+
+	cancel()
+	testutil.WaitFor(t, func() bool {
+		return len(watchdog.Stalled(time.Now().Add(time.Hour))) == 0
+	})
 }

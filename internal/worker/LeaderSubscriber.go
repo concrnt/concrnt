@@ -14,6 +14,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/health"
 	"github.com/gorilla/websocket"
 )
 
@@ -23,6 +24,12 @@ var (
 )
 
 const peerPollTimeout = 2 * time.Second
+
+// keeperDeadline is the liveness deadline of the keeper loop: its 10s tick
+// plus a full round of peer polls and dials, with margin. The keeper takes
+// the subscriber lock on every tick, so a stall here is how a deadlock in
+// the subscription bookkeeping surfaces.
+const keeperDeadline = 2 * time.Minute
 
 type SubscribeClient interface {
 	CurrentSubscriptions() []string
@@ -112,6 +119,8 @@ type LeaderSubscriber struct {
 	// taken at tick start) can spare prefixes ensured concurrently after the
 	// snapshot instead of stripping a subscription that was just opened.
 	ensuredAt map[string]time.Time
+
+	heartbeat *health.Heartbeat
 }
 
 // listenUpdate is a pending "listen" request to send once s.mu is released.
@@ -123,13 +132,17 @@ type listenUpdate struct {
 	added    []string // prefixes newly opened by this update (purged depth 2 after the listen)
 }
 
+// NewLeaderSubscriber wires the singleton federation subscriber; watchdog
+// (nil to skip) gets the keeper loop's liveness heartbeat.
 func NewLeaderSubscriber(
 	config *domain.Config,
 	client SubscriberClient,
 	pubsub PubSub,
 	discovery PeerDiscovery,
+	watchdog *health.Watchdog,
 ) *LeaderSubscriber {
 	return &LeaderSubscriber{
+		heartbeat:     watchdog.Register("worker/leader-subscriber", keeperDeadline),
 		Subscriptions: make(map[string]*SubState),
 		Clients:       make(map[string]SubscribeClient),
 		keepAlive:     make(map[string]SubscribeClient),
@@ -410,9 +423,11 @@ func (s *LeaderSubscriber) pollPeerDemand(ctx context.Context) []string {
 func (s *LeaderSubscriber) keeperRoutine(ctx context.Context) {
 	ticker := time.NewTicker(time.Second * 10)
 	defer ticker.Stop()
+	defer s.heartbeat.Stop()
 
 	for {
 		tickStart := time.Now()
+		s.heartbeat.Beat()
 
 		s.mu.Lock()
 		clients := make([]SubscribeClient, 0, len(s.Clients)+len(s.keepAlive))
