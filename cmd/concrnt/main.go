@@ -367,7 +367,12 @@ func main() {
 	meta["vapidKey"] = conf.Integrations.VapidPublicKey
 	meta["registration"] = conf.Concrnt.Registration
 
-	wellKnownHandler := rest.NewWellKnownHandler(serverUC, meta)
+	additionalWellKnown, err := rest.RenderWellKnown(conf.AdditionalWellKnown)
+	if err != nil {
+		panic("invalid additionalWellKnown: " + err.Error())
+	}
+
+	wellKnownHandler := rest.NewWellKnownHandler(serverUC, meta, additionalWellKnown)
 
 	wellKnownHandler.RegisterRoutes(e)
 

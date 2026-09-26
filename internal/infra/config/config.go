@@ -21,6 +21,21 @@ type Config struct {
 	Integrations  Integrations      `yaml:"integrations"`
 	Services      []interop.Service `yaml:"services"`
 	Meta          map[string]any    `yaml:"meta"`
+	// AdditionalWellKnown serves static documents under /.well-known/<name>.
+	// Each entry is either a plain string (text/plain) or a json document
+	// (application/json), see WellKnownEntry.
+	AdditionalWellKnown map[string]WellKnownEntry `yaml:"additionalWellKnown"`
+}
+
+// WellKnownEntry is one static /.well-known/<name> document.
+type WellKnownEntry struct {
+	// Type is "string" (served as text/plain) or "json" (served as
+	// application/json).
+	Type string `yaml:"type"`
+	// Value is the document body. For "string" it must be a string. For
+	// "json" it is either a string holding a JSON document, served as is, or
+	// a YAML mapping/sequence that is encoded to JSON.
+	Value any `yaml:"value"`
 }
 
 type Concrnt struct {

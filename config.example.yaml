@@ -52,6 +52,21 @@ meta:
   maintainerName: notset
   maintainerEmail: notset@example.com
 
+# additionalWellKnown serves static documents under /.well-known/<name>.
+# optional; leave it out if you have nothing to publish.
+# type is 'string' (served as text/plain) or 'json' (served as application/json).
+# for json, value can be a YAML mapping (encoded to JSON) or a string holding JSON.
+# additionalWellKnown:
+#   my-service:
+#     type: string
+#     value: "hello"
+#   my-json:
+#     type: json
+#     value:
+#       links:
+#         - rel: self
+#           href: https://example.com/
+
 services:
   - name: world.concrnt.web
     host: web

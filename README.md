@@ -158,7 +158,8 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
 `internal/infra/config` loads YAML; see `config.example.yaml` for the full shape
 (`concrnt` domain identity and registration mode, `backends` for Postgres/Redis/Memcached,
 `observability` tracing, `integrations` for captcha/VAPID keys, `meta` for
-instance branding served via well-known, `services` for pluggable modules).
+instance branding served via well-known, `additionalWellKnown` for extra static
+`/.well-known/<name>` documents, `services` for pluggable modules).
 `domain.Config` is the resulting in-process representation.
 
 ### Migration
