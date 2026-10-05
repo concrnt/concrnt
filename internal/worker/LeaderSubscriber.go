@@ -874,6 +874,12 @@ func (s *LeaderSubscriber) runRelayer(ctx context.Context, cancel context.Cancel
 				continue
 			}
 
+			// protocol replies (the "subscribed" acknowledgement of our
+			// listen) carry no source and are not events to relay
+			if event.Source == "" {
+				continue
+			}
+
 			// The remote edge already applied its anonymous filter to its
 			// public realtime feed, so whatever arrived is public by
 			// definition — flag it so the local websocket edge (fail-closed

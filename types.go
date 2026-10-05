@@ -323,6 +323,13 @@ type RealtimeRequest struct {
 	Prefixes []string `json:"prefixes"`
 }
 
+// RealtimeSubscribed acknowledges a subscribe request on a realtime websocket
+// session with the subscription list now in effect.
+type RealtimeSubscribed struct {
+	Type     string   `json:"type"`
+	Prefixes []string `json:"prefixes"`
+}
+
 type AbuseReport struct {
 	TargetURI string `json:"target" gorm:"type:text"`
 	Body      string `json:"body" gorm:"type:text"`

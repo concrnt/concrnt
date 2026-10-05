@@ -885,6 +885,13 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// The server never drops a realtime session for being quiet: no ping, no read
+// deadline, so ad-hoc clients (wscat etc.) stay connected. Liveness is the
+// client's concern (it re-sends subscribe and expects the "subscribed" reply).
+// Writes do get a deadline so a peer that stopped reading cannot block the
+// write loop forever.
+const realtimeWriteWait = 10 * time.Second
+
 func (h *Handler) handleRealtime(c echo.Context) error {
 	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
@@ -909,6 +916,10 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 
 	input := make(chan []string)
 	output := make(chan concrnt.Event)
+	// subscription lists handed to the usecase, to be acknowledged on the
+	// socket. Answered by the write loop below because gorilla allows only one
+	// concurrent writer.
+	subscribed := make(chan []string)
 
 	go h.subscribe.Realtime(ctx, input, output)
 
@@ -940,16 +951,31 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 			}
 
 			switch req.Type {
-			case "listen", "subscribe": // listen is for backward compatibility
+			case "listen", "subscribe", "unlisten": // listen/unlisten are for backward compatibility
+				// CIP-11 §3.1: every subscribe replaces the whole list, so an
+				// "unlisten" carrying the shrunk list is the same operation.
+				// Clients may re-send an unchanged list as a heartbeat: the
+				// usecase skips the re-subscribe, and the "subscribed" reply
+				// below doubles as the liveness answer (a half-open socket
+				// never answers)
+				prefixes := req.Prefixes
+				if prefixes == nil {
+					prefixes = []string{}
+				}
 				select {
-				case input <- req.Prefixes:
+				case input <- prefixes:
 				case <-ctx.Done():
 					return
 				}
 				slog.DebugContext(
-					ctx, fmt.Sprintf("Socket subscribe: %s", req.Prefixes),
+					ctx, fmt.Sprintf("Socket subscribe: %s", prefixes),
 					slog.String("module", "socket"),
 				)
+				select {
+				case subscribed <- prefixes:
+				case <-ctx.Done():
+					return
+				}
 			case "h": // heartbeat
 				// do nothing
 			default:
@@ -966,9 +992,23 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
+		case prefixes := <-subscribed:
+			// the usecase replaces its list on every subscribe, so the list
+			// just handed over is the list in effect
+			ws.SetWriteDeadline(time.Now().Add(realtimeWriteWait))
+			err := ws.WriteJSON(concrnt.RealtimeSubscribed{Type: "subscribed", Prefixes: prefixes})
+			if err != nil {
+				slog.DebugContext(
+					ctx, "Error writing subscribed",
+					slog.String("error", err.Error()),
+					slog.String("module", "socket"),
+				)
+				return nil
+			}
 		case items := <-output:
 			// realtime subscriptions carry no authentication, so every
 			// websocket client gets the anonymous baseline view (CIP-11 §3.2)
+			ws.SetWriteDeadline(time.Now().Add(realtimeWriteWait))
 			err := ws.WriteJSON(items.PublicView())
 			if err != nil {
 				slog.ErrorContext(

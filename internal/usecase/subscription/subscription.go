@@ -97,11 +97,19 @@ func (uc *Usecase) Realtime(ctx context.Context, request <-chan []string, respon
 		}
 	}()
 
+	var current []string
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case newSubscriptions := <-request:
+			// a re-sent identical list (clients use it as a heartbeat) keeps
+			// the live redis subscription: tearing it down and re-subscribing
+			// would open a gap in which events are lost
+			if current != nil && samePrefixSet(current, newSubscriptions) {
+				continue
+			}
+			current = newSubscriptions
 			if cancel != nil {
 				cancel()
 			}
@@ -118,4 +126,28 @@ func (uc *Usecase) Realtime(ctx context.Context, request <-chan []string, respon
 			uc.ensurer.EnsureSubscriptions(ctx, newSubscriptions)
 		}
 	}
+}
+
+// samePrefixSet reports whether both lists hold the same prefixes regardless
+// of order or duplicates.
+func samePrefixSet(a, b []string) bool {
+	set := make(map[string]struct{}, len(a))
+	for _, p := range a {
+		set[p] = struct{}{}
+	}
+	for _, p := range b {
+		if _, ok := set[p]; !ok {
+			return false
+		}
+	}
+	seen := make(map[string]struct{}, len(b))
+	for _, p := range b {
+		seen[p] = struct{}{}
+	}
+	for _, p := range a {
+		if _, ok := seen[p]; !ok {
+			return false
+		}
+	}
+	return true
 }
