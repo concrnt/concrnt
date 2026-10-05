@@ -981,9 +981,26 @@ func TestGetServerNotConcrntServerStaysOnline(t *testing.T) {
 		t.Fatal("a 4xx well-known must not mark the host offline")
 	}
 	if hits := wellKnownHits.Load(); hits != 1 {
-		t.Fatalf("well-known fetched %d times, want 1 (negative verdict is cached)", hits)
+		t.Fatalf("well-known fetched %d times, want 1 (plain-host verdict is remembered)", hits)
+	}
+
+	// a plain host is outside the offline tracking: a later timeout or 5xx
+	// marking is ignored and it is always queried
+	cl.markOffline(domain)
+	cl.markOfflineIfTimeout(domain, "test", timeoutErr{})
+	if !cl.IsOnline(domain) {
+		t.Fatal("a plain host must never be marked offline")
+	}
+	if hosts := cl.offlineHosts(); len(hosts) != 0 {
+		t.Fatalf("plain host leaked into the offline list: %v", hosts)
 	}
 }
+
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }
 
 // A 5xx on well-known is still an outage and enters the offline backoff.
 func TestGetServerServerErrorMarksOffline(t *testing.T) {
@@ -1056,5 +1073,53 @@ func TestBatchGetFallsBackToDirectGetForNonConcrntHost(t *testing.T) {
 	}
 	if !cl.IsOnline(domain) {
 		t.Fatal("static host must stay online after BatchGet")
+	}
+}
+
+// A host marked offline (timeout, 5xx) that answers well-known with a 4xx is
+// reachable and must come back online: static chunkline hosts never serve
+// well-known, so requiring a 200 would leave them offline forever.
+func TestHealthCheckRecoversNonConcrntHost(t *testing.T) {
+	t.Parallel()
+
+	const domain = "static.test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+	cl.markOffline(domain)
+	if cl.IsOnline(domain) {
+		t.Fatal("precondition: host should be offline")
+	}
+
+	if err := cl.healthCheckDomain(context.Background(), domain); err != nil {
+		t.Fatalf("health check must pass on a 4xx well-known, got %v", err)
+	}
+	if !cl.IsOnline(domain) {
+		t.Fatal("the host must be back online (and a plain host) after the check")
+	}
+	if _, err := cl.GetServer(context.Background(), domain, nil); !errors.Is(err, ErrNotConcrntServer) {
+		t.Fatalf("GetServer after the check returned %v, want ErrNotConcrntServer", err)
+	}
+}
+
+// A 5xx on well-known still fails the health check.
+func TestHealthCheckKeepsServerErrorOffline(t *testing.T) {
+	t.Parallel()
+
+	const domain = "broken.test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	if err := cl.healthCheckDomain(context.Background(), domain); err == nil {
+		t.Fatal("health check must fail on a 5xx well-known")
 	}
 }

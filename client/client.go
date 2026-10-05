@@ -38,10 +38,16 @@ const (
 )
 
 type Client struct {
-	client          *http.Client
-	cache           *cache.Cache
-	lastFailed      map[string]time.Time
-	failCount       map[string]int
+	client     *http.Client
+	cache      *cache.Cache
+	lastFailed map[string]time.Time
+	failCount  map[string]int
+	// plainHosts are hosts that answered /.well-known/concrnt with a 4xx:
+	// reachable web hosts that are not concrnt servers (e.g. static chunkline
+	// timelines). They are never marked offline and never health-checked;
+	// requests to them are always made directly. The value is when the
+	// verdict was reached, re-probed after plainHostTTL
+	plainHosts      map[string]time.Time
 	onlineMu        sync.RWMutex
 	userAgent       string
 	defaultResolver string
@@ -58,6 +64,7 @@ func New(defaultResolver string) *Client {
 		cache:           cache.New(10*time.Minute, 15*time.Minute),
 		lastFailed:      make(map[string]time.Time),
 		failCount:       make(map[string]int),
+		plainHosts:      make(map[string]time.Time),
 		defaultResolver: defaultResolver,
 		remappings:      make(map[string]*url.URL),
 	}
@@ -109,6 +116,11 @@ func (c *Client) AddHostRemapping(host string, target string) {
 func (c *Client) IsOnline(domain string) bool {
 	c.onlineMu.RLock()
 	defer c.onlineMu.RUnlock()
+
+	// plain hosts are outside the offline tracking: always query them
+	if since, ok := c.plainHosts[domain]; ok && time.Since(since) < plainHostTTL {
+		return true
+	}
 
 	lastFailed, ok := c.lastFailed[domain]
 	if !ok {
@@ -169,6 +181,14 @@ func (c *Client) healthCheckDomain(ctx context.Context, domain string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	// a 4xx is a reachable host that simply has no well-known (a static
+	// chunkline host): it is a plain host, which leaves the offline tracking
+	// for good. Requiring a 200 here would keep such a host offline forever
+	// once a timeout had marked it before the verdict was known
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		c.markPlainHost(domain)
+		return nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to get well-known concrnt from %s: status code %d", domain, resp.StatusCode)
 	}
@@ -180,6 +200,9 @@ func (c *Client) healthCheckDomain(ctx context.Context, domain string) error {
 func (c *Client) markOffline(domain string) {
 	c.onlineMu.Lock()
 	defer c.onlineMu.Unlock()
+	if since, ok := c.plainHosts[domain]; ok && time.Since(since) < plainHostTTL {
+		return // plain hosts are never tracked as offline
+	}
 	c.lastFailed[domain] = time.Now()
 }
 
@@ -229,17 +252,32 @@ var ErrEndpointMissing = errors.New("concrnt endpoint missing")
 // ErrNotConcrntServer is returned by GetServer when the host answers
 // /.well-known/concrnt with a 4xx: it is reachable but is not a concrnt
 // server (e.g. a static host serving a chunkline timeline). Such a host is
-// never marked offline; callers that only need plain HTTP (BatchGet) fall
-// back to direct requests instead.
+// a plain host (see Client.plainHosts): never marked offline, and callers
+// that only need plain HTTP (BatchGet) request it directly instead.
 var ErrNotConcrntServer = errors.New("not a concrnt server")
 
-// notServerCacheTTL bounds how long a 4xx well-known verdict is remembered,
-// so a static host is not re-probed on every chunkline query while a host
-// that later becomes a concrnt server is picked up soon enough.
-const notServerCacheTTL = time.Minute
+// plainHostTTL bounds how long a plain-host verdict is kept before the
+// well-known is probed again, so a host that later becomes a concrnt server
+// is picked up without a restart.
+const plainHostTTL = time.Hour
 
-func notServerCacheKey(domain string) string {
-	return "server-miss:" + domain
+// isPlainHost reports whether domain is known to be a non-concrnt host.
+func (c *Client) isPlainHost(domain string) bool {
+	c.onlineMu.RLock()
+	defer c.onlineMu.RUnlock()
+	since, ok := c.plainHosts[domain]
+	return ok && time.Since(since) < plainHostTTL
+}
+
+// markPlainHost records a 4xx well-known verdict and takes the host out of
+// the offline tracking (it may have been marked by a timeout before the
+// verdict was known).
+func (c *Client) markPlainHost(domain string) {
+	c.onlineMu.Lock()
+	defer c.onlineMu.Unlock()
+	c.plainHosts[domain] = time.Now()
+	delete(c.lastFailed, domain)
+	delete(c.failCount, domain)
 }
 
 func (c *Client) GetClient() *http.Client {
@@ -368,12 +406,12 @@ func (c *Client) GetServer(ctx context.Context, domainOrCSID string, hint *strin
 
 		domain := domainOrCSID
 
-		if !c.IsOnline(domain) {
-			return concrnt.WellKnownConcrnt{}, fmt.Errorf("Domain is offline")
+		if c.isPlainHost(domain) {
+			return concrnt.WellKnownConcrnt{}, fmt.Errorf("%w: %s", ErrNotConcrntServer, domain)
 		}
 
-		if _, miss := c.cache.Get(notServerCacheKey(domain)); miss {
-			return concrnt.WellKnownConcrnt{}, fmt.Errorf("%w: %s", ErrNotConcrntServer, domain)
+		if !c.IsOnline(domain) {
+			return concrnt.WellKnownConcrnt{}, fmt.Errorf("Domain is offline")
 		}
 
 		url := "https://" + domain + "/.well-known/concrnt"
@@ -397,7 +435,7 @@ func (c *Client) GetServer(ctx context.Context, domainOrCSID string, hint *strin
 			// offline backoff (which would also block direct fetches of
 			// static timelines hosted there)
 			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-				c.cache.Set(notServerCacheKey(domain), true, notServerCacheTTL)
+				c.markPlainHost(domain)
 				err := fmt.Errorf("%w: %s returned %d for well-known concrnt", ErrNotConcrntServer, domain, resp.StatusCode)
 				span.RecordError(err)
 				return concrnt.WellKnownConcrnt{}, err
