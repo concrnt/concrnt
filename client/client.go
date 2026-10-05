@@ -226,6 +226,22 @@ type QueryParams struct {
 
 var ErrEndpointMissing = errors.New("concrnt endpoint missing")
 
+// ErrNotConcrntServer is returned by GetServer when the host answers
+// /.well-known/concrnt with a 4xx: it is reachable but is not a concrnt
+// server (e.g. a static host serving a chunkline timeline). Such a host is
+// never marked offline; callers that only need plain HTTP (BatchGet) fall
+// back to direct requests instead.
+var ErrNotConcrntServer = errors.New("not a concrnt server")
+
+// notServerCacheTTL bounds how long a 4xx well-known verdict is remembered,
+// so a static host is not re-probed on every chunkline query while a host
+// that later becomes a concrnt server is picked up soon enough.
+const notServerCacheTTL = time.Minute
+
+func notServerCacheKey(domain string) string {
+	return "server-miss:" + domain
+}
+
 func (c *Client) GetClient() *http.Client {
 	return c.client
 }
@@ -356,6 +372,10 @@ func (c *Client) GetServer(ctx context.Context, domainOrCSID string, hint *strin
 			return concrnt.WellKnownConcrnt{}, fmt.Errorf("Domain is offline")
 		}
 
+		if _, miss := c.cache.Get(notServerCacheKey(domain)); miss {
+			return concrnt.WellKnownConcrnt{}, fmt.Errorf("%w: %s", ErrNotConcrntServer, domain)
+		}
+
 		url := "https://" + domain + "/.well-known/concrnt"
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
@@ -372,7 +392,17 @@ func (c *Client) GetServer(ctx context.Context, domainOrCSID string, hint *strin
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			err := errors.Join(fmt.Errorf("failed to get well-known concrnt from %s", url), err)
+			// a 4xx means the host answered but has no well-known: it is a
+			// plain web host, not an outage, so it must not enter the
+			// offline backoff (which would also block direct fetches of
+			// static timelines hosted there)
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				c.cache.Set(notServerCacheKey(domain), true, notServerCacheTTL)
+				err := fmt.Errorf("%w: %s returned %d for well-known concrnt", ErrNotConcrntServer, domain, resp.StatusCode)
+				span.RecordError(err)
+				return concrnt.WellKnownConcrnt{}, err
+			}
+			err := fmt.Errorf("failed to get well-known concrnt from %s: status code %d", url, resp.StatusCode)
 			span.RecordError(err)
 			c.markOffline(domain)
 			return concrnt.WellKnownConcrnt{}, err
@@ -1087,8 +1117,11 @@ func (c *Client) BatchGet(ctx context.Context, requests map[string]map[string]st
 			return
 		}
 
+		// a host without well-known (static chunkline timelines) has no batch
+		// endpoint by definition: take the plain GET path below instead of
+		// failing the whole domain
 		info, err := c.GetServer(ctx, domain, nil)
-		if err != nil {
+		if err != nil && !errors.Is(err, ErrNotConcrntServer) {
 			err := errors.Join(fmt.Errorf("failed to get server for domain %s", domain), err)
 			span.RecordError(err)
 			return

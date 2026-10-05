@@ -950,3 +950,111 @@ func TestBatchGetIsolatesDomainFailures(t *testing.T) {
 		}
 	}
 }
+
+// A host that answers /.well-known/concrnt with a 4xx is a plain web host
+// (e.g. one serving a static chunkline timeline), not an outage: GetServer
+// reports ErrNotConcrntServer and the host stays online so direct fetches
+// there keep working.
+func TestGetServerNotConcrntServerStaysOnline(t *testing.T) {
+	t.Parallel()
+
+	const domain = "static.test"
+	var wellKnownHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/concrnt" {
+			wellKnownHits.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	for i := 0; i < 2; i++ {
+		_, err := cl.GetServer(context.Background(), domain, nil)
+		if !errors.Is(err, ErrNotConcrntServer) {
+			t.Fatalf("GetServer returned %v, want ErrNotConcrntServer", err)
+		}
+	}
+	if !cl.IsOnline(domain) {
+		t.Fatal("a 4xx well-known must not mark the host offline")
+	}
+	if hits := wellKnownHits.Load(); hits != 1 {
+		t.Fatalf("well-known fetched %d times, want 1 (negative verdict is cached)", hits)
+	}
+}
+
+// A 5xx on well-known is still an outage and enters the offline backoff.
+func TestGetServerServerErrorMarksOffline(t *testing.T) {
+	t.Parallel()
+
+	const domain = "broken.test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	_, err := cl.GetServer(context.Background(), domain, nil)
+	if err == nil || errors.Is(err, ErrNotConcrntServer) {
+		t.Fatalf("GetServer returned %v, want a plain failure", err)
+	}
+	if cl.IsOnline(domain) {
+		t.Fatal("a 5xx well-known must mark the host offline")
+	}
+}
+
+// BatchGet against a host without well-known (static chunkline timelines)
+// falls back to plain GETs instead of failing the whole domain.
+func TestBatchGetFallsBackToDirectGetForNonConcrntHost(t *testing.T) {
+	t.Parallel()
+
+	const domain = "static.test"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tl/itr/42":
+			fmt.Fprint(w, "42")
+		case "/tl/body/42":
+			fmt.Fprint(w, `[{"timestamp":"2023-05-23T23:31:45Z","content":"{}"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cl := New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	responses, err := cl.BatchGet(context.Background(), map[string]map[string]string{
+		domain: {
+			"itr":  "https://" + domain + "/tl/itr/42",
+			"body": "https://" + domain + "/tl/body/42",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"itr": "42", "body": `[{"timestamp":"2023-05-23T23:31:45Z","content":"{}"}]`} {
+		resp, ok := responses[key]
+		if !ok {
+			t.Fatalf("missing response for %s", key)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d", key, resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(body) != want {
+			t.Fatalf("%s: body %q, want %q", key, body, want)
+		}
+	}
+	if !cl.IsOnline(domain) {
+		t.Fatal("static host must stay online after BatchGet")
+	}
+}

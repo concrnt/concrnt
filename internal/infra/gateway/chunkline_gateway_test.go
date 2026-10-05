@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
+	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -452,4 +455,65 @@ func TestGetRemovedItemsFreshMarkerSkipsRefresh(t *testing.T) {
 	}
 
 	time.Sleep(100 * time.Millisecond) // let the refresh goroutine run (and panic if buggy)
+}
+
+type noDemand struct{}
+
+func (noDemand) CurrentSubscriptions() []string { return nil }
+
+// A timeline given as an https:// manifest URL on a plain static host (no
+// /.well-known/concrnt) is read end to end: manifest, then itr and body
+// resolved relative to the manifest URL and fetched with plain GETs.
+func TestQueryDescendingStaticManifestHost(t *testing.T) {
+	const domain = "archive.test"
+	mc, cleanup := testutil.CreateMC()
+	t.Cleanup(cleanup)
+
+	newest := time.Date(2023, 5, 23, 14, 31, 45, 0, time.UTC)
+	older := newest.Add(-time.Hour)
+	manifest := chunkline.Manifest{
+		Version:    "1.0",
+		ChunkSize:  14400,
+		Descending: &chunkline.Endpoint{Iterator: "itr/{chunk}", Body: "body/{chunk}.json"},
+	}
+	chunk := manifest.Time2Chunk(newest)
+	manifest.FirstChunk = &chunk
+	manifest.LastChunk = &chunk
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backrooms/manifest.json":
+			json.NewEncoder(w).Encode(manifest)
+		case "/backrooms/itr/" + strconv.FormatInt(chunk, 10):
+			fmt.Fprint(w, chunk)
+		case "/backrooms/body/" + strconv.FormatInt(chunk, 10) + ".json":
+			json.NewEncoder(w).Encode([]chunkline.BodyItem{
+				{Timestamp: newest, Content: "newest"},
+				{Timestamp: older, Content: "older"},
+			})
+		default:
+			http.NotFound(w, r) // no /.well-known/concrnt
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	cl := client.New(domain)
+	cl.AddHostRemapping(domain, server.URL)
+
+	r := &resolver{mc: mc, client: cl, demand: noDemand{}}
+	timeline := "https://" + domain + "/backrooms/manifest.json"
+
+	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, newest.Add(time.Minute), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Content != "newest" || items[1].Content != "older" {
+		t.Fatalf("unexpected items: %+v", items)
+	}
+	if items[0].Source != timeline {
+		t.Fatalf("source %q, want the manifest URL", items[0].Source)
+	}
+	if !cl.IsOnline(domain) {
+		t.Fatal("static host must stay online")
+	}
 }
