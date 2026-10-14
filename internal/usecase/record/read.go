@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
@@ -30,6 +31,12 @@ func (uc *Usecase) GetSigned(ctx context.Context, uri string) (*concrnt.SignedDo
 		}
 		return entity.SignedDocument, nil
 	} else {
+		uri, err = uc.CanonicalizeURI(ctx, uri)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+
 		sd, err := uc.repo.GetSignedDocument(ctx, uri)
 		if err != nil {
 			return nil, err
@@ -58,6 +65,26 @@ func (uc *Usecase) GetSigned(ctx context.Context, uri string) (*concrnt.SignedDo
 
 		return sd, nil
 	}
+}
+
+// CanonicalizeURI rewrites an alias-form owner (cckv://@<alias FQDN>/<key>,
+// CIP-0 §7.2) to the CCID form that keys are stored under: commits reject
+// alias owners, so a lookup by the alias form can never hit. Any other URI
+// is returned unchanged.
+func (uc *Usecase) CanonicalizeURI(ctx context.Context, uri string) (string, error) {
+	parsed, err := concrnt.ParseCCURI(uri)
+	if err != nil {
+		return "", err
+	}
+	if !strings.HasPrefix(parsed.Owner, "@") {
+		return uri, nil
+	}
+	entity, err := uc.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
+	if err != nil {
+		return "", err
+	}
+	parsed.Owner = entity.ID
+	return parsed.String(), nil
 }
 
 func (uc *Usecase) checkReadAccess(ctx context.Context, uri string, sd concrnt.SignedDocument) error {

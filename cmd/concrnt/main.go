@@ -326,7 +326,7 @@ func main() {
 	}))
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
-	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS)
+	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
 
 	go func() {
 		if err := jobQueue.Run(ctx); err != nil {

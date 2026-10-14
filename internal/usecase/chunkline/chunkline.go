@@ -19,9 +19,10 @@ const RemovedItemsTTL = 48 * time.Hour
 func RemovedItemsKey(timeline string) string { return "removed:" + timeline }
 
 type Usecase struct {
-	repo    Repository
-	gateway Gateway
-	kvs     usecase.KVS
+	repo     Repository
+	gateway  Gateway
+	kvs      usecase.KVS
+	resolver URIResolver
 }
 
 // Repository defines storage operations for chunkline timelines.
@@ -36,15 +37,30 @@ type Gateway interface {
 	QueryDescending(ctx context.Context, uris []string, until time.Time, limit int) ([]chunkline.BodyItemWithSource, error)
 }
 
-func New(repo Repository, gateway Gateway, kvs usecase.KVS) *Usecase {
+// URIResolver rewrites a timeline URI to the form it is stored under
+// (cckv://@<alias FQDN>/<key> to the CCID form, CIP-0 §7.2). The record
+// usecase implements it.
+type URIResolver interface {
+	CanonicalizeURI(ctx context.Context, uri string) (string, error)
+}
+
+func New(repo Repository, gateway Gateway, kvs usecase.KVS, resolver URIResolver) *Usecase {
 	return &Usecase{
-		repo:    repo,
-		gateway: gateway,
-		kvs:     kvs,
+		repo:     repo,
+		gateway:  gateway,
+		kvs:      kvs,
+		resolver: resolver,
 	}
 }
 
 func (uc *Usecase) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+	if uc.resolver != nil {
+		canonical, err := uc.resolver.CanonicalizeURI(ctx, uri)
+		if err != nil {
+			return nil, err
+		}
+		uri = canonical
+	}
 	return uc.repo.GetChunklineManifest(ctx, uri)
 }
 
