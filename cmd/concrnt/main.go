@@ -404,20 +404,7 @@ func main() {
 
 	static := e.Group("", echomiddleware.CORS())
 
-	static.GET("/tos", func(c echo.Context) (err error) {
-		return c.File("/etc/concrnt/static/tos.txt")
-	})
-	static.OPTIONS("/tos", handleNop)
-
-	static.GET("/code-of-conduct", func(c echo.Context) (err error) {
-		return c.File("/etc/concrnt/static/code-of-conduct.txt")
-	})
-	static.OPTIONS("/code-of-conduct", handleNop)
-
-	static.GET("/register-template", func(c echo.Context) (err error) {
-		return c.File("/etc/concrnt/static/register-template.json")
-	})
-	static.OPTIONS("/register-template", handleNop)
+	rest.RegisterStaticFiles(static, conf.Static)
 
 	// the internal listener carries everything operational — liveness and
 	// readiness probes, the Prometheus scrape endpoint, and the
@@ -510,8 +497,4 @@ func main() {
 		// supervisors keying on exit status restart the process
 		os.Exit(1)
 	}
-}
-
-func handleNop(c echo.Context) error {
-	return c.NoContent(http.StatusOK)
 }

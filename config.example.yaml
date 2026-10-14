@@ -67,6 +67,19 @@ meta:
 #         - rel: self
 #           href: https://example.com/
 
+# static maps the fixed document paths to files. every entry is optional and
+# defaults to the file of the same role under /etc/concrnt/static; a path
+# whose file does not exist makes that route answer 404.
+# the concrnt crawler identifies itself as "concrnt-crawler"; to opt this
+# server out of being indexed, put this in robots.txt:
+#   User-agent: concrnt-crawler
+#   Disallow: /
+# static:
+#   tos: /etc/concrnt/static/tos.txt                            # /tos
+#   codeOfConduct: /etc/concrnt/static/code-of-conduct.txt      # /code-of-conduct
+#   registerTemplate: /etc/concrnt/static/register-template.json # /register-template
+#   robotsTxt: /etc/concrnt/static/robots.txt                   # /robots.txt
+
 services:
   - name: world.concrnt.web
     host: web

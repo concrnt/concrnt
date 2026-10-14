@@ -25,6 +25,37 @@ type Config struct {
 	// Each entry is either a plain string (text/plain) or a json document
 	// (application/json), see WellKnownEntry.
 	AdditionalWellKnown map[string]WellKnownEntry `yaml:"additionalWellKnown"`
+	// Static points at the files served under the fixed top-level paths
+	// (/tos, /code-of-conduct, /register-template, /robots.txt).
+	Static Static `yaml:"static"`
+}
+
+// DefaultStaticDir is where the static files live unless Static says
+// otherwise.
+const DefaultStaticDir = "/etc/concrnt/static"
+
+// Static is the file behind each static route. Every entry is optional: an
+// empty one falls back to its file under DefaultStaticDir, and a path whose
+// file does not exist makes the route answer 404.
+type Static struct {
+	TOS              string `yaml:"tos"`              // /tos
+	CodeOfConduct    string `yaml:"codeOfConduct"`    // /code-of-conduct
+	RegisterTemplate string `yaml:"registerTemplate"` // /register-template
+	RobotsTxt        string `yaml:"robotsTxt"`        // /robots.txt
+}
+
+// WithDefaults fills the unset entries with their default paths.
+func (s Static) WithDefaults() Static {
+	fill := func(path *string, name string) {
+		if *path == "" {
+			*path = filepath.Join(DefaultStaticDir, name)
+		}
+	}
+	fill(&s.TOS, "tos.txt")
+	fill(&s.CodeOfConduct, "code-of-conduct.txt")
+	fill(&s.RegisterTemplate, "register-template.json")
+	fill(&s.RobotsTxt, "robots.txt")
+	return s
 }
 
 // WellKnownEntry is one static /.well-known/<name> document.
