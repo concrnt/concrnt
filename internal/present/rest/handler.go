@@ -227,7 +227,8 @@ func (h *Handler) handleResolve(c echo.Context) error {
 	}
 
 	if parsed.Key == "" && parsed.CDID == "" {
-		if concrnt.IsCCID(parsed.Owner) {
+		// owner が CCID または @alias (CIP-0 §8.3) なら entity document。それ以外は FQDN としてサーバー解決
+		if concrnt.IsCCID(parsed.Owner) || strings.HasPrefix(parsed.Owner, "@") {
 			entity, err := h.record.GetSigned(ctx, uri.String())
 			if err != nil {
 				if errors.Is(err, domain.ErrPermissionDenied) {

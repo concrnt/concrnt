@@ -132,6 +132,11 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		name := "_concrnt." + alias
 		txtrecords, err := net.DefaultResolver.LookupTXT(ctx, name)
 		if err != nil {
+			// TXT レコード自体が無い alias は「存在しないエンティティ」として 404 で返す(DNS 障害は 5xx のまま)
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+				return nil, domain.NotFoundError{Resource: uri}
+			}
 			span.RecordError(err)
 			return nil, err
 		}
@@ -145,7 +150,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 			}
 		}
 		if redirect == "" {
-			return nil, errors.New("no valid CCURI found in TXT records")
+			return nil, domain.NotFoundError{Resource: uri}
 		}
 
 		return uc.GetEntity(ctx, redirect)
