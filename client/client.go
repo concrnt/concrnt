@@ -55,8 +55,16 @@ type Client struct {
 }
 
 func New(defaultResolver string) *Client {
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.HTTP2 = &http.HTTP2Config{
+		SendPingTimeout: 5 * time.Second,
+		PingTimeout:     3 * time.Second,
+	}
+
 	httpClient := http.Client{
-		Timeout: defaultTimeout,
+		Timeout:   defaultTimeout,
+		Transport: otelhttp.NewTransport(transport),
 	}
 
 	c := &Client{
@@ -68,9 +76,7 @@ func New(defaultResolver string) *Client {
 		defaultResolver: defaultResolver,
 		remappings:      make(map[string]*url.URL),
 	}
-	httpClient.Transport = otelhttp.NewTransport(c)
-	// a process normally has exactly one federation client; a second one
-	// (tests) must not panic on the duplicate collector, so ignore that error
+
 	_ = prometheus.Register(newPeerOfflineCollector(c))
 	go c.UpKeeper()
 	return c
