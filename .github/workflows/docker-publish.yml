@@ -72,6 +72,8 @@ jobs:
           outputs: type=image,name=${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # apt/ca-certificates layer must be rebuilt every time (eMudhra 2026-10 lesson)
+          no-cache-filters: certificates
           build-args: VERSION=${{env.TAG}}
 
       - name: Export digest
