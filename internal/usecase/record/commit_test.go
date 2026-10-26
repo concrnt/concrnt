@@ -545,9 +545,12 @@ func TestCommitDocumentReferenceInlineTargetOffline(t *testing.T) {
 	}
 }
 
-// stubKVS records SetAdd calls.
+// stubKVS records SetAdd / SetNX calls. SetNX reports setNXDenied's
+// inverse, so a test can simulate a throttle key that is already present.
 type stubKVS struct {
-	addedSets []string
+	addedSets   []string
+	setNXKeys   []string
+	setNXDenied bool
 }
 
 func (s *stubKVS) SetAdd(ctx context.Context, key string, value string, ttl time.Duration) error {
@@ -556,6 +559,10 @@ func (s *stubKVS) SetAdd(ctx context.Context, key string, value string, ttl time
 }
 func (s *stubKVS) SetMembers(ctx context.Context, key string) ([]string, error) {
 	return nil, nil
+}
+func (s *stubKVS) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	s.setNXKeys = append(s.setNXKeys, key)
+	return !s.setNXDenied, nil
 }
 
 // signedRecord builds a signed record commit by the given identity at createdAt.

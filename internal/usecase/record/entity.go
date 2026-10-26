@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
@@ -158,6 +159,9 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		ccid := parsed.Owner
 		entity, err := uc.entity.GetEntityByCCID(ctx, ccid)
 		if err == nil {
+			if parsed.Hint != nil && *parsed.Hint != entity.Domain && *parsed.Hint != uc.config.FQDN && uc.kvs != nil && uc.client != nil {
+				go uc.recheckEntityByHint(context.WithoutCancel(ctx), ccid, *parsed.Hint)
+			}
 			return entity, nil
 		}
 		if !errors.Is(err, domain.ErrNotFound) {
@@ -191,6 +195,67 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		}
 		return entity, nil
 	}
+}
+
+const entityRecheckTTL = time.Hour
+const entityRecheckTimeout = 30 * time.Second
+
+func entityRecheckKey(ccid, hint string) string {
+	return "entity-recheck:" + ccid + "@" + hint
+}
+
+func (uc *Usecase) recheckEntityByHint(ctx context.Context, ccid, hint string) (err error) {
+	ctx, cancel := context.WithTimeout(ctx, entityRecheckTimeout)
+	defer cancel()
+	ctx, span := tracer.Start(ctx, "Usecase.Record.RecheckEntityByHint")
+	defer span.End()
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			slog.Warn("failed to recheck entity by hint",
+				slog.String("ccid", ccid),
+				slog.String("hint", hint),
+				slog.String("error", err.Error()),
+			)
+		}
+	}()
+
+	acquired, err := uc.kvs.SetNX(ctx, entityRecheckKey(ccid, hint), "1", entityRecheckTTL)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return nil
+	}
+
+	uri := concrnt.CCURI{Scheme: "cckv", Owner: ccid, Hint: &hint}.String()
+
+	var sd concrnt.SignedDocument
+	err = uc.client.GetResource(ctx, uri, "application/json", &client.Options{
+		Resolver: hint,
+		NoCache:  true,
+	}, &sd)
+	if err != nil {
+		return err
+	}
+
+	var fetched concrnt.Document[schemas.Entity]
+	if err := json.Unmarshal([]byte(sd.Document), &fetched); err != nil {
+		return err
+	}
+	if fetched.Kind != "entity" || fetched.Author != ccid {
+		return fmt.Errorf("hint %s served a %q document by %s for %s", hint, fetched.Kind, fetched.Author, ccid)
+	}
+
+	if _, err := uc.Commit(ctx, hint, sd, domain.CommitModeExecute); err != nil {
+		return err
+	}
+	slog.Info("entity document rechecked by hint",
+		slog.String("ccid", ccid),
+		slog.String("hint", hint),
+		slog.String("domain", fetched.Value.Domain),
+	)
+	return nil
 }
 
 // getEntityWithReference resolves ccid's entity, first applying the entity

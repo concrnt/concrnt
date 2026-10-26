@@ -30,6 +30,12 @@ func (r *Redis) SetMembers(ctx context.Context, key string) ([]string, error) {
 	return r.rdb.SMembers(ctx, key).Result()
 }
 
+// SetNX stores value under key with ttl only when key is absent (one SET NX
+// PX command, so it is atomic) and reports whether it did.
+func (r *Redis) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	return r.rdb.SetNX(ctx, key, value, ttl).Result()
+}
+
 // Incr increments an integer counter and returns the new value. The key is
 // created at 1 when missing and never expires.
 func (r *Redis) Incr(ctx context.Context, key string) (int64, error) {

@@ -42,16 +42,12 @@ type Client struct {
 	cache      *cache.Cache
 	lastFailed map[string]time.Time
 	failCount  map[string]int
-	// plainHosts are hosts that answered /.well-known/concrnt with a 4xx:
-	// reachable web hosts that are not concrnt servers (e.g. static chunkline
-	// timelines). They are never marked offline and never health-checked;
-	// requests to them are always made directly. The value is when the
-	// verdict was reached, re-probed after plainHostTTL
 	plainHosts      map[string]time.Time
 	onlineMu        sync.RWMutex
 	userAgent       string
 	defaultResolver string
 	remappings      map[string]*url.URL
+	transport       http.RoundTripper
 }
 
 func New(defaultResolver string) *Client {
@@ -63,8 +59,7 @@ func New(defaultResolver string) *Client {
 	}
 
 	httpClient := http.Client{
-		Timeout:   defaultTimeout,
-		Transport: otelhttp.NewTransport(transport),
+		Timeout: defaultTimeout,
 	}
 
 	c := &Client{
@@ -75,8 +70,10 @@ func New(defaultResolver string) *Client {
 		plainHosts:      make(map[string]time.Time),
 		defaultResolver: defaultResolver,
 		remappings:      make(map[string]*url.URL),
+		transport:       transport,
 	}
 
+	httpClient.Transport = otelhttp.NewTransport(c)
 	_ = prometheus.Register(newPeerOfflineCollector(c))
 	go c.UpKeeper()
 	return c
@@ -310,7 +307,7 @@ func (c *Client) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
-	resp, err := http.DefaultTransport.RoundTrip(req)
+	resp, err := c.transport.RoundTrip(req)
 	code := 0
 	if resp != nil {
 		code = resp.StatusCode

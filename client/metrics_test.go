@@ -24,6 +24,7 @@ func TestRoundTripRecordsPeerRequests(t *testing.T) {
 		lastFailed: make(map[string]time.Time),
 		failCount:  make(map[string]int),
 		remappings: make(map[string]*url.URL),
+		transport:  http.DefaultTransport,
 	}
 	cl.client.Transport = cl
 	// the metric must carry the logical peer host, not where a remap sent it

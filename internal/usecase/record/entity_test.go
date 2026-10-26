@@ -302,3 +302,214 @@ func TestCommitEntityInvalidatesResourceCache(t *testing.T) {
 		t.Fatalf("resolve hits after commit = %d, want 2 (cache invalidated)", n)
 	}
 }
+
+// A resolver hint that disagrees with the stored domain is the one cue a
+// server gets that a remote user may have moved once the old server is gone
+// (the inlined-reference path above needs a commit by that user to arrive).
+// GetEntity answers from the stored row and rechecks the hint host in the
+// background, at most once per (ccid, hint) per entityRecheckTTL, the
+// throttle key being set before the fetch so a dead hint host is not probed
+// on every request. The fetched document goes through the full commit
+// verification: the hint is a cue, not a source of trust (CIP-0 §7.2).
+
+const staleEntityHost = "old.example.net"
+
+// hintRecheckFixture is a usecase whose stored entity for ccid names
+// staleEntityHost while remoteEntityHost (the hint) serves `served` for it.
+type hintRecheckFixture struct {
+	uc       *Usecase
+	repo     *recordingRecordRepo
+	kvs      *stubKVS
+	resolves *atomic.Int32
+	ccid     string
+	priv     string
+}
+
+func newHintRecheckFixture(t *testing.T, serve func(w http.ResponseWriter, ccid string) bool) hintRecheckFixture {
+	t.Helper()
+	cfg := &domain.Config{FQDN: "example.com"}
+	ccid, priv := newIdentity(t)
+
+	resolves := &atomic.Int32{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/.well-known/concrnt":
+			json.NewEncoder(w).Encode(concrnt.WellKnownConcrnt{
+				Domain:    remoteEntityHost,
+				Endpoints: map[string]string{"net.concrnt.core.resolve": "/resolve?uri={uri}"},
+			})
+		case "/resolve":
+			// the recheck asks with the hint-bearing URI, as the handler accepts
+			got, _ := url.QueryUnescape(r.URL.Query().Get("uri"))
+			if parsed, err := concrnt.ParseCCURI(got); err != nil || parsed.Owner != ccid || parsed.Key != "" {
+				http.NotFound(w, r)
+				return
+			}
+			resolves.Add(1)
+			if !serve(w, ccid) {
+				http.Error(w, "boom", http.StatusInternalServerError)
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	cl := client.New(cfg.FQDN)
+	cl.AddHostRemapping(remoteEntityHost, srv.URL)
+
+	stale := signTestDocument(t, concrnt.Document[schemas.Entity]{
+		Kind:      "entity",
+		Author:    ccid,
+		Schema:    schemas.EntityURL,
+		Value:     schemas.Entity{Domain: staleEntityHost},
+		CreatedAt: time.Now().Add(-2 * time.Hour),
+	}, priv)
+	stored := &domain.Entity{ID: ccid, Domain: staleEntityHost, SignedDocument: &stale}
+
+	repo := &recordingRecordRepo{storedCreatedAt: time.Now().Add(-2 * time.Hour)}
+	kvs := &stubKVS{}
+	uc := New(repo, fixedResidenceRepo{entity: stored}, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, kvs)
+	return hintRecheckFixture{uc: uc, repo: repo, kvs: kvs, resolves: resolves, ccid: ccid, priv: priv}
+}
+
+// serveSignedEntity serves a fresh entity document for ccid signed by priv.
+func serveSignedEntity(t *testing.T, priv *string) func(w http.ResponseWriter, ccid string) bool {
+	return func(w http.ResponseWriter, ccid string) bool {
+		json.NewEncoder(w).Encode(signedEntityDoc(t, ccid, *priv, time.Now()))
+		return true
+	}
+}
+
+func (f hintRecheckFixture) hintedURI() string {
+	hint := remoteEntityHost
+	return concrnt.CCURI{Scheme: "cckv", Owner: f.ccid, Hint: &hint}.String()
+}
+
+// waitResolves polls until the hint host has been asked n times, or fails.
+func (f hintRecheckFixture) waitResolves(t *testing.T, n int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for f.resolves.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("resolve hits = %d, want %d within 2s", f.resolves.Load(), n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRecheckEntityByHintAppliesNewerDocument(t *testing.T) {
+	var priv string
+	f := newHintRecheckFixture(t, serveSignedEntity(t, &priv))
+	priv = f.priv
+
+	if err := f.uc.recheckEntityByHint(context.Background(), f.ccid, remoteEntityHost); err != nil {
+		t.Fatalf("recheckEntityByHint returned error: %v", err)
+	}
+	if n := f.resolves.Load(); n != 1 {
+		t.Fatalf("resolve hits = %d, want 1", n)
+	}
+	if !f.repo.createEntityCalled {
+		t.Fatalf("fetched entity document was not committed")
+	}
+	if want := entityRecheckKey(f.ccid, remoteEntityHost); len(f.kvs.setNXKeys) != 1 || f.kvs.setNXKeys[0] != want {
+		t.Fatalf("throttle keys = %v, want [%s]", f.kvs.setNXKeys, want)
+	}
+}
+
+func TestRecheckEntityByHintThrottled(t *testing.T) {
+	var priv string
+	f := newHintRecheckFixture(t, serveSignedEntity(t, &priv))
+	priv = f.priv
+	f.kvs.setNXDenied = true
+
+	if err := f.uc.recheckEntityByHint(context.Background(), f.ccid, remoteEntityHost); err != nil {
+		t.Fatalf("recheckEntityByHint returned error: %v", err)
+	}
+	if n := f.resolves.Load(); n != 0 {
+		t.Fatalf("resolve hits = %d, want 0 (throttled)", n)
+	}
+	if f.repo.createEntityCalled {
+		t.Fatalf("entity committed although the recheck was throttled")
+	}
+}
+
+func TestRecheckEntityByHintRejectsForeignAuthor(t *testing.T) {
+	_, otherPriv := newIdentity(t)
+	f := newHintRecheckFixture(t, func(w http.ResponseWriter, ccid string) bool {
+		// a document for someone else, correctly signed by that someone else
+		other, _ := concrnt.PrivKeyToAddr(otherPriv, "con")
+		json.NewEncoder(w).Encode(signedEntityDoc(t, other, otherPriv, time.Now()))
+		return true
+	})
+
+	err := f.uc.recheckEntityByHint(context.Background(), f.ccid, remoteEntityHost)
+	if err == nil || !strings.Contains(err.Error(), "served a") {
+		t.Fatalf("error = %v, want a foreign-author rejection", err)
+	}
+	if f.repo.createEntityCalled {
+		t.Fatalf("a document by another author was committed")
+	}
+}
+
+func TestRecheckEntityByHintRemoteFailureStillThrottles(t *testing.T) {
+	f := newHintRecheckFixture(t, func(w http.ResponseWriter, ccid string) bool { return false })
+
+	if err := f.uc.recheckEntityByHint(context.Background(), f.ccid, remoteEntityHost); err == nil {
+		t.Fatalf("recheckEntityByHint returned nil for a failing hint host")
+	}
+	if f.repo.createEntityCalled {
+		t.Fatalf("entity committed although the fetch failed")
+	}
+	if len(f.kvs.setNXKeys) != 1 {
+		t.Fatalf("throttle key not set before the fetch: %v", f.kvs.setNXKeys)
+	}
+}
+
+func TestGetEntityWithMismatchedHintReturnsStoredAndRechecks(t *testing.T) {
+	var priv string
+	f := newHintRecheckFixture(t, serveSignedEntity(t, &priv))
+	priv = f.priv
+
+	entity, err := f.uc.GetEntity(context.Background(), f.hintedURI())
+	if err != nil {
+		t.Fatalf("GetEntity returned error: %v", err)
+	}
+	if entity.Domain != staleEntityHost {
+		t.Fatalf("GetEntity domain = %s, want the stored %s (recheck is background)", entity.Domain, staleEntityHost)
+	}
+	f.waitResolves(t, 1)
+}
+
+func TestGetEntityWithMatchingHintDoesNotRecheck(t *testing.T) {
+	var priv string
+	f := newHintRecheckFixture(t, serveSignedEntity(t, &priv))
+	priv = f.priv
+
+	hint := staleEntityHost
+	uri := concrnt.CCURI{Scheme: "cckv", Owner: f.ccid, Hint: &hint}.String()
+	if _, err := f.uc.GetEntity(context.Background(), uri); err != nil {
+		t.Fatalf("GetEntity returned error: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := f.resolves.Load(); n != 0 {
+		t.Fatalf("resolve hits = %d, want 0 (hint matches stored domain)", n)
+	}
+	if len(f.kvs.setNXKeys) != 0 {
+		t.Fatalf("throttle key set without a mismatch: %v", f.kvs.setNXKeys)
+	}
+}
+
+func TestGetEntityWithoutKVSDoesNotRecheck(t *testing.T) {
+	var priv string
+	f := newHintRecheckFixture(t, serveSignedEntity(t, &priv))
+	priv = f.priv
+	f.uc.kvs = nil
+
+	if _, err := f.uc.GetEntity(context.Background(), f.hintedURI()); err != nil {
+		t.Fatalf("GetEntity returned error: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := f.resolves.Load(); n != 0 {
+		t.Fatalf("resolve hits = %d, want 0 (no KVS, no throttle, no recheck)", n)
+	}
+}
