@@ -317,8 +317,8 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 	return counts, nil
 }
 
-func (r *Repository) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecordCounts")
+func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
 	if from != "" {

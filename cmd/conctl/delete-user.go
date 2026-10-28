@@ -107,6 +107,9 @@ var deleteUserCmd = &cobra.Command{
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d commit logs, %d entity metas, %d subscriptions\n",
 			verb, stats.Commits, stats.Metas, stats.Subscriptions)
+		if !deleteUserDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
+		}
 		return nil
 	}),
 }

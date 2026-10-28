@@ -49,6 +49,9 @@ var repairSingleOwnerCmd = &cobra.Command{
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d commit owners, %d entity timestamps, %d acked holdings, %d receiving-side raw acks\n",
 			verb, stats.Owners, stats.EntityTimestamps, stats.AckedHoldings, stats.DisownedRawAcks)
+		if !repairSingleOwnerDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
+		}
 		return nil
 	}),
 }

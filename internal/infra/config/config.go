@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/go-yaml/yaml"
 
@@ -90,11 +91,24 @@ type Cluster struct {
 }
 
 type Backends struct {
-	PostgresDsn   string `yaml:"postgresDsn"`
-	GatewayAddr   string `yaml:"gatewayAddr"`
-	RedisAddr     string `yaml:"redisAddr"`
-	RedisDB       int    `yaml:"redisDB"`
-	MemcachedAddr string `yaml:"memcachedAddr"`
+	PostgresDsn   string    `yaml:"postgresDsn"`
+	GatewayAddr   string    `yaml:"gatewayAddr"`
+	RedisAddr     string    `yaml:"redisAddr"`
+	RedisDB       int       `yaml:"redisDB"`
+	MemcachedAddr string    `yaml:"memcachedAddr"`
+	Aggregate     Aggregate `yaml:"aggregate"`
+}
+
+// Aggregate configures the count cache (internal/usecase/aggregate).
+type Aggregate struct {
+	// Store is "postgres" (a table in the record database) or "redis";
+	// empty means the store matching the record database.
+	Store string `yaml:"store"`
+	// TTL is how long a computed value is served before it is recomputed
+	// (default 24h); MaxDeltas how many writes an entry absorbs before it is
+	// recomputed (default 10000).
+	TTL       time.Duration `yaml:"ttl"`
+	MaxDeltas int           `yaml:"maxDeltas"`
 }
 
 type Observability struct {

@@ -120,6 +120,8 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 			return &commitApplyResult{result: &sd, noop: true}, nil
 		}
 
+		postProcesses = append(postProcesses, uc.associationCountsTouched(*parsed.Associate, parsed.Schema, parsed.AssociationVariant, parsed.CreatedAt, mode))
+
 		if mode == domain.CommitModeExecute {
 			actions, err := uc.createReferenceDistributionActions(ctx, ip, parsed.Author, ccfs, requester, sd, distributionsFromPtr(parsed.Distributes), mode)
 			if err != nil {

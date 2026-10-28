@@ -9,8 +9,10 @@ import (
 
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
+	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 )
 
 type operationContext struct {
@@ -18,6 +20,7 @@ type operationContext struct {
 	GlobalConfig domain.Config
 	DB           *gorm.DB
 	Client       *client.Client
+	Aggregate    *aggregate.Usecase
 }
 
 func loadConcrntConfig() (config.Config, error) {
@@ -52,11 +55,18 @@ func newOperationContext() (*operationContext, error) {
 		cl.AddHostRemapping(globalConfig.FQDN, conf.Backends.GatewayAddr)
 	}
 
+	rdb := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, db, rdb)
+	if err != nil {
+		return nil, err
+	}
+
 	return &operationContext{
 		Config:       conf,
 		GlobalConfig: globalConfig,
 		DB:           db,
 		Client:       cl,
+		Aggregate:    aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas),
 	}, nil
 }
 

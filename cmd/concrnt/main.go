@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -41,6 +42,7 @@ import (
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -225,6 +227,12 @@ func main() {
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
+	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, db, redis)
+	if err != nil {
+		panic("failed to open aggregate store: " + err.Error())
+	}
+	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
+
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
 	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
@@ -266,6 +274,7 @@ func main() {
 	serverUC := server.New(postgres.NewServerRepository(&domainConfig, db, cl), &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	recordUC.SetAggregates(aggregateUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := recordRepo

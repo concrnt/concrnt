@@ -7,6 +7,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/utils"
 )
 
@@ -53,7 +54,26 @@ func (uc *Usecase) GetAcknowledgeRecords(ctx context.Context, from, to, schema s
 }
 
 func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	return uc.repo.GetAcknowledgeRecordCounts(ctx, from, to, schema)
+	if uc.agg == nil {
+		return uc.repo.ComputeAcknowledgeCounts(ctx, from, to, schema)
+	}
+	if from == "" && to == "" {
+		return nil, errors.New("either 'from' or 'to' must be specified")
+	}
+	// one entry per side holds every schema; the schema filter is applied
+	// on the way out
+	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.acks, ackTarget(from, to))
+	if err != nil {
+		return nil, err
+	}
+	if schema == "" {
+		return counts, nil
+	}
+	filtered := map[string]int64{}
+	if n, ok := counts[schema]; ok {
+		filtered[schema] = n
+	}
+	return filtered, nil
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {
@@ -66,11 +86,21 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	return uc.repo.GetAssociatedRecordCountsBySchema(ctx, targetURI)
+	if uc.agg == nil {
+		return uc.repo.ComputeAssociationCountsBySchema(ctx, targetURI)
+	}
+	return aggregate.Get(ctx, uc.agg, uc.aggs.bySchema, targetURI)
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	return uc.repo.GetAssociatedRecordCountsByVariant(ctx, targetURI, schema)
+	if uc.agg == nil {
+		return uc.repo.ComputeAssociationCountsByVariant(ctx, targetURI, schema)
+	}
+	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.byVariant, variantTarget(targetURI, schema))
+	if err != nil {
+		return nil, err
+	}
+	return counts.ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a

@@ -32,6 +32,14 @@ backends:
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
+  # aggregate is the cache of counts (association counts, ack counts).
+  # store: postgres (a table in the record database, the default) or redis.
+  # the cache is never the source of truth: `conctl op aggregate-invalidate
+  # --all` drops it and every count is recomputed on its next read.
+  # aggregate:
+  #   store: postgres
+  #   ttl: 24h
+  #   maxDeltas: 10000
 
 observability:
   enableTrace: true

@@ -141,8 +141,8 @@ func (r *Repository) GetAssociatedRecords(
 	return rows, nil
 }
 
-func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsBySchema")
+func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
 	defer span.End()
 
 	var counts []struct {
@@ -171,14 +171,17 @@ func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targ
 	return result, nil
 }
 
-func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsByVariant")
+func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
 	defer span.End()
 
+	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
+	// to min_created_at); the earliest association of each variant decides
+	// the variant order
 	var counts []struct {
-		Variant  string
-		Count    int64
-		MinCDate time.Time
+		Variant      string
+		Count        int64
+		MinCreatedAt time.Time
 	}
 
 	err := r.db.WithContext(ctx).
@@ -199,7 +202,7 @@ func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, tar
 	for _, c := range counts {
 		result[c.Variant] = utils.OrderedKV[int64]{
 			Value: c.Count,
-			Order: c.MinCDate.UnixNano(),
+			Order: c.MinCreatedAt.UnixNano(),
 		}
 	}
 

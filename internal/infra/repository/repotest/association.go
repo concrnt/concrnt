@@ -2,6 +2,7 @@ package repotest
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -151,39 +152,50 @@ func testAssociationListFilters(t *testing.T, be Backend) {
 }
 
 // The counts are grouped by schema over a target, and by variant within one
-// schema (an association without a variant counts under ""). An absent
-// target yields empty counts.
+// schema (an association without a variant counts under ""), the variants
+// ordered by the createdAt of their earliest association. An absent target
+// yields empty counts.
 func testAssociationCounts(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
 
 	like, repost := "https://schema.example/like.json", "https://schema.example/repost.json"
 	t0 := time.Date(2026, 3, 1, 1, 0, 0, 0, time.UTC)
+	// inserted out of createdAt order so the variant order has to come from
+	// the data, not from insertion order
 	seedAssociations(t, ctx, repo, []associationFixture{
-		{"c-1", "con1alice", like, Ptr("👍"), t0},
-		{"c-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
 		{"c-3", "con1alice", like, Ptr("❤️"), t0.Add(2 * time.Minute)},
+		{"c-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
+		{"c-1", "con1alice", like, Ptr("👍"), t0},
+		{"c-6", "con1erin", like, Ptr("🎉"), t0.Add(5 * time.Minute)},
 		{"c-4", "con1carol", repost, nil, t0.Add(3 * time.Minute)},
 		{"c-5", "con1dave", repost, nil, t0.Add(4 * time.Minute)},
 	})
 
-	bySchema, err := repo.GetAssociatedRecordCountsBySchema(ctx, associationTargetKey)
+	bySchema, err := repo.ComputeAssociationCountsBySchema(ctx, associationTargetKey)
 	require.NoError(t, err)
-	require.Equal(t, map[string]int64{like: 3, repost: 2}, bySchema)
+	require.Equal(t, map[string]int64{like: 4, repost: 2}, bySchema)
 
-	byVariant, err := repo.GetAssociatedRecordCountsByVariant(ctx, associationTargetKey, like)
+	byVariant, err := repo.ComputeAssociationCountsByVariant(ctx, associationTargetKey, like)
 	require.NoError(t, err)
 	require.NotNil(t, byVariant)
-	require.Len(t, *byVariant, 2)
+	require.Len(t, *byVariant, 3)
 	require.EqualValues(t, 2, (*byVariant)["👍"].Value)
 	require.EqualValues(t, 1, (*byVariant)["❤️"].Value)
+	require.EqualValues(t, 1, (*byVariant)["🎉"].Value)
+	require.Equal(t, t0.UnixNano(), (*byVariant)["👍"].Order, "a variant is ordered by its earliest association")
+	require.Equal(t, t0.Add(2*time.Minute).UnixNano(), (*byVariant)["❤️"].Order)
+	require.Equal(t, t0.Add(5*time.Minute).UnixNano(), (*byVariant)["🎉"].Order)
+	encoded, err := json.Marshal(byVariant)
+	require.NoError(t, err)
+	require.Equal(t, `{"👍":2,"❤️":1,"🎉":1}`, string(encoded), "the JSON object lists variants in that order")
 
-	byVariant, err = repo.GetAssociatedRecordCountsByVariant(ctx, associationTargetKey, repost)
+	byVariant, err = repo.ComputeAssociationCountsByVariant(ctx, associationTargetKey, repost)
 	require.NoError(t, err)
 	require.Len(t, *byVariant, 1)
 	require.EqualValues(t, 2, (*byVariant)[""].Value, "a variant-less association counts under the empty variant")
 
-	bySchema, err = repo.GetAssociatedRecordCountsBySchema(ctx, "cckv://con1owner/timeline")
+	bySchema, err = repo.ComputeAssociationCountsBySchema(ctx, "cckv://con1owner/timeline")
 	require.NoError(t, err)
 	require.Empty(t, bySchema)
 }

@@ -6,6 +6,7 @@ import (
 
 	"gorm.io/gorm"
 
+	aggpg "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
@@ -25,6 +26,9 @@ var migrations = []migration{
 	// and is rebuilt by ensureIndexes with COLLATE "C"
 	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
 		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
+	}},
+	{3, "aggregate_entries", func(tx *gorm.DB) error {
+		return tx.Exec(aggpg.Schema).Error
 	}},
 }
 

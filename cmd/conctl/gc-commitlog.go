@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -129,7 +130,7 @@ var gcCommitlogCmd = &cobra.Command{
 				fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 			}
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
-			return nil
+			return dropAggregatesAfterGc(ctx, op, total)
 		}
 
 		s3client, err := objectstore.NewS3(ctx, gcCommitlogS3PathStyle)
@@ -194,8 +195,22 @@ var gcCommitlogCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 		}
 		fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
-		return nil
+		return dropAggregatesAfterGc(ctx, op, total)
 	}),
+}
+
+// dropAggregatesAfterGc empties the count caches once gc removed anything:
+// the cascade may have taken associations and acks with it, and a cascade
+// has no delta form (C2). They rebuild on demand.
+func dropAggregatesAfterGc(ctx context.Context, op *operationContext, deleted int) error {
+	if deleted == 0 {
+		return nil
+	}
+	if err := op.Aggregate.InvalidateAll(ctx, ""); err != nil {
+		return fmt.Errorf("failed to drop the aggregate caches: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "dropped the aggregate caches; counts rebuild on their next read\n")
+	return nil
 }
 
 func init() {
