@@ -28,13 +28,12 @@ import (
 
 // Set bundles the persistence adapters of one backend.
 type Set struct {
-	Record            record.Repository
-	RecordMaintenance record.MaintenanceRepository
-	Residence         residence.Repository
-	Chunkline         chunkline.Repository
-	Server            server.Repository
-	Notification      notification.Repository
-	Abuse             abuse.Repository
+	Record       record.Repository
+	Residence    residence.Repository
+	Chunkline    chunkline.Repository
+	Server       server.Repository
+	Notification notification.Repository
+	Abuse        abuse.Repository
 
 	// Name is the backend name ("postgres"), for logs.
 	Name string
@@ -86,13 +85,12 @@ func openPostgres(conf config.Backends, deps Deps) (*Set, error) {
 
 	domainConfig := deps.DomainConfig
 	return &Set{
-		Record:            postgres.NewRecordRepository(db),
-		RecordMaintenance: postgres.NewRecordMaintenanceRepository(db),
-		Residence:         postgres.NewResidenceRepository(db, deps.Client, domainConfig),
-		Chunkline:         postgres.NewChunklineRepository(db),
-		Server:            postgres.NewServerRepository(&domainConfig, db, deps.Client),
-		Notification:      postgres.NewNotificationRepository(db),
-		Abuse:             postgres.NewAbuseRepository(db),
+		Record:       postgres.NewRecordRepository(db),
+		Residence:    postgres.NewResidenceRepository(db, deps.Client, domainConfig),
+		Chunkline:    postgres.NewChunklineRepository(db),
+		Server:       postgres.NewServerRepository(&domainConfig, db, deps.Client),
+		Notification: postgres.NewNotificationRepository(db),
+		Abuse:        postgres.NewAbuseRepository(db),
 
 		Name: "postgres",
 		// connection pool usage (go_sql_*): the pool is small, so saturation

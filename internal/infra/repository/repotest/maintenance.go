@@ -12,9 +12,9 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// RunMaintenanceSuite runs the record.MaintenanceRepository contract tests
-// (conctl gc-commitlog / dump-commitlog). open must return a fresh, isolated
-// backend per call.
+// RunMaintenanceSuite runs the contract tests of the offline-tooling methods
+// of record.Repository (conctl gc-commitlog / dump-commitlog). open must
+// return a fresh, isolated backend per call.
 func RunMaintenanceSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("GcCandidates", func(t *testing.T) { testMaintenanceGcCandidates(t, open(t)) })
 	t.Run("ListCommitLogs", func(t *testing.T) { testMaintenanceListCommitLogs(t, open(t)) })
@@ -46,7 +46,7 @@ func seedMaintenanceCommit(t *testing.T, ctx context.Context, repo record.Reposi
 // dependent record along.
 func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo, maint := be.Record, be.Maintenance
+	repo := be.Record
 	owner := "con1gcowner"
 
 	base := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
@@ -61,11 +61,11 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	})
 	cutoff := cdid.New([10]byte{}, base.Add(2*time.Hour)).String()
 
-	count, err := maint.CountGcCandidates(ctx, cutoff)
+	count, err := repo.CountGcCandidates(ctx, cutoff)
 	require.NoError(t, err)
 	require.Equal(t, int64(2), count, "the recent flag and the unflagged old commit are not candidates")
 
-	page, err := maint.ListGcCandidates(ctx, cutoff, "", 1)
+	page, err := repo.ListGcCandidates(ctx, cutoff, "", 1)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	require.Equal(t, old1, page[0].ID)
@@ -75,16 +75,16 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	require.Contains(t, page[0].Document, old1)
 	require.Equal(t, concrnt.ProofTypeNone, page[0].Proof.Type)
 
-	page, err = maint.ListGcCandidates(ctx, cutoff, old1, 10)
+	page, err = repo.ListGcCandidates(ctx, cutoff, old1, 10)
 	require.NoError(t, err)
 	require.Len(t, page, 1)
 	require.Equal(t, old2, page[0].ID)
 
-	page, err = maint.ListGcCandidates(ctx, cutoff, old2, 10)
+	page, err = repo.ListGcCandidates(ctx, cutoff, old2, 10)
 	require.NoError(t, err)
 	require.Empty(t, page)
 
-	deleted, err := maint.DeleteCommitLogs(ctx, []string{old1, old2, "missing"})
+	deleted, err := repo.DeleteCommitLogs(ctx, []string{old1, old2, "missing"})
 	require.NoError(t, err)
 	require.Equal(t, 2, deleted)
 	require.False(t, commitExists(t, ctx, be.Inspect, old1))
@@ -92,11 +92,11 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	require.True(t, commitExists(t, ctx, be.Inspect, oldKept))
 	require.True(t, recordExists(t, ctx, be.Inspect, recent))
 
-	count, err = maint.CountGcCandidates(ctx, cutoff)
+	count, err = repo.CountGcCandidates(ctx, cutoff)
 	require.NoError(t, err)
 	require.Zero(t, count)
 
-	deleted, err = maint.DeleteCommitLogs(ctx, nil)
+	deleted, err = repo.DeleteCommitLogs(ctx, nil)
 	require.NoError(t, err)
 	require.Zero(t, deleted)
 }
@@ -105,7 +105,7 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 // an exclusive after cursor and an owner filter.
 func testMaintenanceListCommitLogs(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo, maint := be.Record, be.Maintenance
+	repo := be.Record
 
 	base := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
 	a1 := seedMaintenanceCommit(t, ctx, repo, "con1aaaa", 0, base)
@@ -120,25 +120,25 @@ func testMaintenanceListCommitLogs(t *testing.T, be Backend) {
 		return out
 	}
 
-	all, err := maint.ListCommitLogs(ctx, record.CommitLogPage{Limit: 10})
+	all, err := repo.ListCommitLogs(ctx, record.CommitLogPage{Limit: 10})
 	require.NoError(t, err)
 	require.Equal(t, []string{a1, b1, a2}, ids(all))
 	require.Equal(t, "con1aaaa", all[0].Owner)
 	require.Equal(t, concrnt.ProofTypeNone, all[0].Proof.Type)
 	require.False(t, all[0].CDate.IsZero())
 
-	page, err := maint.ListCommitLogs(ctx, record.CommitLogPage{Limit: 2})
+	page, err := repo.ListCommitLogs(ctx, record.CommitLogPage{Limit: 2})
 	require.NoError(t, err)
 	require.Equal(t, []string{a1, b1}, ids(page))
-	page, err = maint.ListCommitLogs(ctx, record.CommitLogPage{AfterID: page[1].ID, Limit: 2})
+	page, err = repo.ListCommitLogs(ctx, record.CommitLogPage{AfterID: page[1].ID, Limit: 2})
 	require.NoError(t, err)
 	require.Equal(t, []string{a2}, ids(page))
 
-	page, err = maint.ListCommitLogs(ctx, record.CommitLogPage{FromID: b1, UntilID: b1, Limit: 10})
+	page, err = repo.ListCommitLogs(ctx, record.CommitLogPage{FromID: b1, UntilID: b1, Limit: 10})
 	require.NoError(t, err)
 	require.Equal(t, []string{b1}, ids(page))
 
-	page, err = maint.ListCommitLogs(ctx, record.CommitLogPage{Owner: "con1aaaa", Limit: 10})
+	page, err = repo.ListCommitLogs(ctx, record.CommitLogPage{Owner: "con1aaaa", Limit: 10})
 	require.NoError(t, err)
 	require.Equal(t, []string{a1, a2}, ids(page))
 }

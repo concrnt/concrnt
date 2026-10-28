@@ -5,18 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"gorm.io/gorm"
-
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
-
-// NewRecordMaintenanceRepository exposes the offline-tooling slice of the
-// record store (conctl gc/dump) over the same connection.
-func NewRecordMaintenanceRepository(db *gorm.DB) record.MaintenanceRepository {
-	return &RecordRepository{db: db}
-}
 
 func (r *RecordRepository) CountGcCandidates(ctx context.Context, cutoffID string) (int64, error) {
 	var count int64

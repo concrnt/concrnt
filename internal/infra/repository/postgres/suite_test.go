@@ -15,11 +15,10 @@ func openBackend(t *testing.T) repotest.Backend {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 	return repotest.Backend{
-		Record:      NewRecordRepository(db),
-		Maintenance: NewRecordMaintenanceRepository(db),
-		Residence:   NewResidenceRepository(db, nil, domain.Config{}),
-		Chunkline:   NewChunklineRepository(db),
-		Inspect:     newInspector(db),
+		Record:    NewRecordRepository(db),
+		Residence: NewResidenceRepository(db, nil, domain.Config{}),
+		Chunkline: NewChunklineRepository(db),
+		Inspect:   newInspector(db),
 	}
 }
 

@@ -140,7 +140,7 @@ var dumpCommitlogCmd = &cobra.Command{
 			} else {
 				page.AfterID = cursor
 			}
-			logs, err := op.Repos.RecordMaintenance.ListCommitLogs(ctx, page)
+			logs, err := op.Repos.Record.ListCommitLogs(ctx, page)
 			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}

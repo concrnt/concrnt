@@ -23,11 +23,10 @@ import (
 
 // Backend is one backend under test.
 type Backend struct {
-	Record      record.Repository
-	Maintenance record.MaintenanceRepository
-	Residence   residence.Repository
-	Chunkline   chunkline.Repository
-	Inspect     Inspector
+	Record    record.Repository
+	Residence residence.Repository
+	Chunkline chunkline.Repository
+	Inspect   Inspector
 }
 
 // Inspector exposes the stored state behind the repository interfaces; each

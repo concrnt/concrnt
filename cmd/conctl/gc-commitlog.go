@@ -85,7 +85,7 @@ var gcCommitlogCmd = &cobra.Command{
 		// keeping the match strictly older-than. Hash-based ids ('x'-prefixed)
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
-		maint := op.Repos.RecordMaintenance
+		maint := op.Repos.Record
 
 		if gcCommitlogDryRun {
 			count, err := maint.CountGcCandidates(ctx, cutoff)
