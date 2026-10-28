@@ -15,7 +15,6 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/jwt"
 )
 
@@ -73,7 +72,7 @@ var importCommitlogCmd = &cobra.Command{
 		// 1. Restore entity metas first (directly against Postgres) so local
 		//    entity commits pass their registration check on the server.
 		if metasPath != "" {
-			residenceRepo := postgres.NewResidenceRepository(op.DB, op.Client, op.GlobalConfig)
+			residenceRepo := op.Repos.Residence
 			f, err := os.Open(metasPath)
 			if err != nil {
 				return fmt.Errorf("failed to open metas file: %w", err)

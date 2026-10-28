@@ -107,8 +107,12 @@ var dumpCommitlogCmd = &cobra.Command{
 		// Entity metas carry local-entity registration state (inviter/info) that
 		// is not part of the commit log, and import must restore them before
 		// replaying entity commits. Time filters don't apply to meta; --owner does.
+		db, err := op.RequirePostgres()
+		if err != nil {
+			return err
+		}
 		var metas []models.EntityMeta
-		mq := op.DB.WithContext(ctx)
+		mq := db.WithContext(ctx)
 		if dumpCommitlogOwner != "" {
 			mq = mq.Where("id = ?", dumpCommitlogOwner)
 		}
@@ -143,7 +147,7 @@ var dumpCommitlogCmd = &cobra.Command{
 		total := 0
 		for {
 			var logs []models.CommitLog
-			q := op.DB.WithContext(ctx).Order("commit_logs.id ASC").Limit(dumpCommitlogPageSize)
+			q := db.WithContext(ctx).Order("commit_logs.id ASC").Limit(dumpCommitlogPageSize)
 			if first {
 				q = q.Where("commit_logs.id >= ?", cursor)
 			} else {
