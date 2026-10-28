@@ -8,15 +8,15 @@
 
 ## 0. この文書の使い方
 
-- 本書は **フェーズ1** と **フェーズ2** の2段構成。フェーズ1が終わって `develop` にマージされるまでフェーズ2に着手しない。
+- 本書は **フェーズ1**（`support-firestore` のバックエンド中立部分の取り込み）、**フェーズ2**（契約の正式化と Postgres の書き直し、SQLite 追加）、**フェーズ3**（固まった契約に対する Firestore バックエンドの移植）の3段構成。前のフェーズが `develop` にマージされるまで次に着手しない。**フェーズ1・2には Firestore の実装コードは一切含めない**。契約がフェーズ2で変わるため、先に移植すると二度手間になる。
 - 各タスクには「成果物」「受け入れ条件」「検証コマンド」がある。受け入れ条件を満たさない状態で次のタスクに進まない。
-- **判断が必要な箇所は §7「未決事項」に集約**してある。それ以外は本書の決定に従い、作業者の判断で設計を変えない。§7 の項目はいずれも推奨案を書いてあるので、ユーザーから別の指示がなければ推奨案で進める。
+- **判断が必要な箇所は §8「未決事項」に集約**してある。それ以外は本書の決定に従い、作業者の判断で設計を変えない。§8 の項目はいずれも推奨案を書いてあるので、ユーザーから別の指示がなければ推奨案で進める。
 - 作業者が本書と現コードの矛盾を見つけたら、コードを正とし、本書の該当箇所を修正して PR に含める。
 
 ### 前提環境
 
 - Go `1.25.1`（`go.mod` の `go` ディレクティブ）。
-- リポジトリ層のテストは `github.com/ory/dockertest` で Postgres（と Firestore エミュレータ）コンテナを起動する。**Docker デーモンが必要**。Docker なしで動くのは `./policy/... ./chunkline/... ./client/...` などの純ロジックパッケージのみ。
+- リポジトリ層のテストは `github.com/ory/dockertest` で Postgres コンテナを起動する（フェーズ3以降は Firestore エミュレータも）。**Docker デーモンが必要**。Docker なしで動くのは `./policy/... ./chunkline/... ./client/...` などの純ロジックパッケージのみ。
 - 現在 CI（`.github/workflows/docker-publish.yml`, `release.yml`）は **テストを実行していない**。`go build` / `go vet` / `go test` を手元で回すこと。フェーズ1でテスト用ワークフローを追加する（T1.7）。
 - 既存の生成物に触らない: `schemas/*.go` は生成コード。
 - コミットは小さく。`develop` への PR は本書のタスク単位（T1.1, T1.2 …）を目安に分ける。force-push しない。
@@ -24,7 +24,7 @@
 ### 用語
 
 - **契約（contract）**: `internal/usecase/*` が宣言する `Repository` インターフェース群と、それに付随する不変条件（§2）。バックエンドはすべてこの契約だけを実装する。
-- **バックエンド**: 契約の実装。現状 `internal/infra/repository/postgres`。`origin/support-firestore` に `firestore` 実装がある。
+- **バックエンド**: 契約の実装。現状 `internal/infra/repository/postgres`。`origin/support-firestore` に `firestore` 実装があるが、取り込むのはフェーズ3。
 - **repotest**: バックエンド非依存の準拠テストスイート（`internal/infra/repository/repotest`、`support-firestore` ブランチにある）。
 
 ---
@@ -36,7 +36,7 @@
 - `develop` のリポジトリ層は GORM + Postgres 専用。`ON CONFLICT … DO UPDATE … WHERE`、`SELECT … FOR UPDATE`、セッションレベル `pg_advisory_lock`、部分インデックス、`bigserial` + `ON DELETE CASCADE`、起動時 `AutoMigrate` に依存している（`internal/infra/database/postgres.go`, `internal/infra/database/models/*.go`, `internal/infra/repository/postgres/record.go`）。
 - リクエスト1回で逐次 3〜5 往復の DB アクセスが発生する（`GetRecordKeyByURI` → メンバー取得 → `Preload("Record")` → `Preload("Record.Document")` など）。
 - リアクション数・フォロワー数は読み取り時に `GROUP BY` で集計する（`record.go` の `GetAssociatedRecordCountsBySchema` / `ByVariant` / `GetAcknowledgeRecordCounts`）。
-- `origin/support-firestore`（2026-09-10〜14、3コミット、`develop` から 22 コミット遅れ）に Firestore バックエンドの完全な実装がある。ビルドは通る（ベース時点）。ここに含まれる **バックエンド中立の改善**（`RunInTx`、`repository.Set`/`Open`、`MaintenanceRepository`、`repotest`、`Inspector`）がフェーズ1の取り込み対象。
+- `origin/support-firestore`（2026-09-10〜14、3コミット、`develop` から 22 コミット遅れ）に Firestore バックエンドの完全な実装がある。ビルドは通る（ベース時点）。ここに含まれる **バックエンド中立の改善**（`RunInTx`、`repository.Set`/`Open`、`MaintenanceRepository`、`repotest`、`Inspector`）がフェーズ1の取り込み対象。**Firestore 実装そのもの（`internal/infra/repository/firestore/*` など）はフェーズ1・2では取り込まない**。
 
 ### 目的
 
@@ -50,7 +50,7 @@
 - `activitypub` / `atproto` ブリッジ（別リポジトリ）の対応。
 - Redis の役割分離（ジョブキュー / pubsub / dedup / カウンタの抽象化）。別計画。
 - バッチ API（`handle-batch-request` ブランチ）。別計画。
-- Spanner / CockroachDB バックエンドの実装。契約が整った後。
+- Spanner / CockroachDB バックエンドの実装。契約が整った後（フェーズ3の Firestore と同じ手順で追加する）。
 
 ---
 
@@ -71,20 +71,13 @@
 
 ---
 
-## 3. フェーズ1 — `support-firestore` の中立部分を `develop` に取り込む
+## 3. フェーズ1 — `support-firestore` のバックエンド中立部分を `develop` に取り込む（Postgres のみ）
 
 ### 方針
 
 - **ブランチをそのままマージしない。** `develop` が 22 コミット進んでおり、両側で `cmd/concrnt/main.go`, `cmd/conctl/gc-commitlog.go`, `internal/infra/repository/postgres/record.go`, `internal/usecase/record/commit.go`, `internal/usecase/record/usecase.go`, `internal/infra/config/config.go`, `go.mod` が変更されている。`origin/support-firestore` を **参照実装**として、`develop` 起点の新ブランチに **スライス単位で移植**する。
 - 作業ブランチ: `feat/repository-contract-phase1`（PR は下記タスク単位で切ってよい。その場合はスタックせず、順番にマージ）。
 - 参照コマンド: `git show origin/support-firestore:<path>`、`git diff $(git merge-base origin/support-firestore origin/develop) origin/support-firestore -- <path>`。
-
-### `develop` 側で増えた契約メソッド（Firestore 実装が持っていない）
-
-- `record.Repository.QueryByParentOrderByKey`（CIP-5 `orderby=key`）
-- `record.Repository.QueryCommitLogs`（レプリケーション API、`c_date, id` 順）
-
-T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する。
 
 ### T1.1 `RunInTx` への移行（契約変更、Postgres のみ）
 
@@ -103,8 +96,8 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
 ### T1.2 `repository.Set` / `repository.Open` と配線
 
 成果物
-- `internal/infra/repository/repository.go`（`support-firestore` から移植）。`Set` は `Record, RecordMaintenance, Residence, Chunkline, Server, Notification, Abuse, Name, Collectors, Ready, Close, SQL` を持つ。`Open` は `conf.Database` が `""`/`"postgres"` のとき Postgres を開く。この時点では `firestore` ケースは `errors.New("not built")` でよい（T1.6 で差し替え）。
-- `internal/infra/config/config.go`: `Backends.Database string`、`Backends.Firestore{ProjectID, DatabaseID}` を追加。既存キーは不変。`config.example.yaml` にコメント付きで追記。
+- `internal/infra/repository/repository.go`（`support-firestore` から移植）。`Set` は `Record, RecordMaintenance, Residence, Chunkline, Server, Notification, Abuse, Name, Collectors, Ready, Close, SQL` を持つ。`Open` は `conf.Database` が `""`/`"postgres"` のとき Postgres を開き、それ以外は「未知のバックエンド」エラーを返す。`switch` を用意しておくだけで、他のケースは書かない。
+- `internal/infra/config/config.go`: `Backends.Database string` を追加（既定 `postgres`）。Firestore 固有の設定はフェーズ3。既存キーは不変。`config.example.yaml` にコメント付きで追記。
 - `cmd/concrnt/main.go`: `support-firestore` の差分どおり `repository.Open` 経由に。`client.New` の生成順が前に移動することに注意（Deps に渡すため）。`/ready` は `repos.Ready`、メトリクスは `repos.Collectors`。
 - `cmd/conctl/operation.go`: `repository.Open` を使い、SQL が必要な既存コマンド（`repair-*`, `migrate-*`, `local-entity`, `delete-user`, `create-account`）は `Set.SQL` を使う。`Set.SQL == nil` のときは「このコマンドは Postgres 専用」と明示的にエラーを返す。
 
@@ -139,37 +132,24 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
 ### T1.5 CI にテストを追加
 
 成果物
-- `.github/workflows/test.yml`: `push`（develop）と `pull_request` で `go vet ./...` と `go test ./... -count=1` を実行。GitHub ホステッドランナーは Docker が使えるので dockertest はそのまま動く。Firestore エミュレータイメージ（`gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`）の pull に時間がかかるため `timeout-minutes: 30`。Go モジュールキャッシュを有効化。
+- `.github/workflows/test.yml`: `push`（develop）と `pull_request` で `go vet ./...` と `go test ./... -count=1` を実行。GitHub ホステッドランナーは Docker が使えるので dockertest はそのまま動く。`timeout-minutes: 20`。Go モジュールキャッシュを有効化。
 - `README.md` のテスト節に CI の存在を追記。
 
 受け入れ条件
 - PR 上でワークフローが緑。
 
-### T1.6 Firestore バックエンドの移植
+### T1.6 ドキュメント
 
 成果物
-- `internal/infra/database/firestore.go`、`internal/infra/repository/firestore/*.go`、`internal/infra/repository/firestore_open.go`、`internal/testutil/firestore.go`、`deploy/firestore/*`（`support-firestore` から）。
-- 追加実装: `QueryByParentOrderByKey`、`QueryCommitLogs`。`shapes.go` に形状を追加し、`firestore.indexes.json` を再生成（`shapes_test.go` がドリフトを検出する）。`QueryCommitLogs` は `commits` を `cDate, __name__` で範囲走査する形状にする。
-- `deploy/firestore/README.md` が参照する `MIGRATION.md` を **書く**（ダンプ → 起動 → `import-commitlog --rejected-out` → `import-subscriptions` → 差分比較の手順）。書けない事情があれば参照を削除する。
-- `go.mod`: `cloud.google.com/go/firestore`、`golang.org/x/sync`、`google.golang.org/api` 等を追加。`go mod tidy` の結果だけをコミットし、無関係なメジャー更新を混ぜない。
-- `internal/infra/repository/firestore/suite_test.go` で 4 スイートすべてを実行。
-
-受け入れ条件
-- `go test ./internal/infra/repository/firestore/ -count=1` 成功（エミュレータ起動込み）。
-- `go test ./internal/infra/repository/firestore/ -run Shape` が、`shapes.go` に形状を1つ足して `indexes.json` を更新しない状態で **失敗する**ことを確認（検出能力の確認）。
-- `backends.database: firestore` + `FIRESTORE_EMULATOR_HOST` で `concrnt` が起動し、`/ready` が 200。
-
-### T1.7 ドキュメント
-
-成果物
-- `README.md`: バックエンド選択（`backends.database`）、テストの回し方、Firestore の節へのリンク。
+- `README.md`: バックエンド選択（`backends.database`、現時点では `postgres` のみ）、テストの回し方。
 - `internal/infra/repository/CONTRACT.md`: §2 の原則を転記し、「契約を変えるときの手順（repotest → 各バックエンド → shapes）」を書く。フェーズ2で肉付けする。
 
 ### フェーズ1 完了条件
 
 - 上記すべてが `develop` にマージ済み。
 - `develop` で `go test ./...` が CI で緑。
-- `backends.database` が `postgres`（既定）/ `firestore` の両方で起動し、repotest 4 スイートを両方が通す。
+- `backends.database: postgres`（既定）で起動し、repotest 4 スイートを Postgres が通す。
+- リポジトリに Firestore 実装コードが含まれていない（`ls internal/infra/repository/firestore` が存在しない）。
 
 ---
 
@@ -177,7 +157,7 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
 
 ### 方針
 
-- 契約の変更は **repotest → Postgres → Firestore** の順。両方が通るまで `develop` にマージしない。
+- 契約の変更は **repotest → Postgres →（T2.5 以降は）SQLite** の順。全バックエンドが通るまで `develop` にマージしない。`support-firestore` のコードは **設計の参照** としてのみ読む（`git show origin/support-firestore:<path>`）。
 - Postgres の内部スキーマは変えてよいが、**既存データの移行経路を必ず用意する**（起動時マイグレーション、または `conctl op` の backfill）。ariake のデータは失わない。
 - 各タスクは独立した PR にできる粒度にしてある。順序は T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 を推奨（T2.5, T2.6 は並行可）。
 
@@ -190,7 +170,7 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
   - 廃止 / 置換（理由と置換先）
 - 分類結果は以下を出発点にする（作業者は検証して修正する）:
   - `GetAssociatedRecordCountsBySchema`, `GetAssociatedRecordCountsByVariant`, `GetAcknowledgeRecordCounts` → **C2 違反**。T2.2 で `Compute*`（集計層専用の高コスト計算）に改名し、リクエスト経路は `aggregate` 層経由に。
-  - `QueryByPrefix`（`uri LIKE prefix%`）→ Firestore 実装は `ancestors` 配列 `array-contains` で代替済み。契約の意味を「指定キーの子孫のうち記録を持つもの」と定義し、Postgres も `ancestors` 相当（親チェーン）を持つか、`LIKE` を内部実装として残すかは **バックエンド内部の自由**。契約文書には意味論だけを書く。
+  - `QueryByPrefix`（`uri LIKE prefix%`）→ `support-firestore` の実装は `ancestors` 配列 `array-contains` で代替している（参照のみ）。契約の意味を「指定キーの子孫のうち記録を持つもの」と定義し、Postgres も `ancestors` 相当（親チェーン）を持つか、`LIKE` を内部実装として残すかは **バックエンド内部の自由**。契約文書には意味論だけを書く。
   - `QueryRecordSubtree`、`GetHierarchicalRecordPolicies` → 同上。
   - `GetSignedDocument` → T2.4 で複数取得版を追加。
   - `BeginTx` 系 → フェーズ1で完了。
@@ -207,7 +187,7 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
 ```
 usecase/aggregate          集計定義 + read-through ロジック（バックエンド非依存）
   ├─ AggregateStore        キャッシュの保存先インターフェース（差し替え可能）
-  │     postgres (table) / firestore (collection) / redis / memcached / inmemory
+  │     postgres (table) / redis / memcached / inmemory   （firestore はフェーズ3）
   └─ record.Repository     一次データからの高コスト計算（Compute* メソッド群）
 ```
 
@@ -227,12 +207,12 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
       InvalidateAll(ctx, namePrefix string) error
   }
   ```
-  実装は `internal/infra/aggregate/{postgres,firestore,redis,memcached,inmemory}`。**Redis / memcached 実装は揮発でよい**（消えたら再計算）。
+  実装は `internal/infra/aggregate/{postgres,redis,memcached,inmemory}`（Firestore 実装はフェーズ3）。**Redis / memcached 実装は揮発でよい**（消えたら再計算）。
 - `record.Repository` に **高コスト計算メソッド** を追加し、既存のカウント系メソッドはリポジトリから **削除** する:
   - `ComputeAssociationCountsBySchema(ctx, targetURI) (map[string]int64, error)`
   - `ComputeAssociationCountsByVariant(ctx, targetURI, schema) (*utils.OrderedKVMap[int64], error)`（既存の順序規則を維持: 最初の association の `createdAt` 順）
   - `ComputeAcknowledgeCounts(ctx, from, to, schema) (map[string]int64, error)`
-  これらは Postgres では `GROUP BY`、Firestore では走査で実装してよい（**集計層と検証ツール以外から呼ばない**。`CONTRACT.md` に明記し、ハンドラ層からの直接呼び出しを `go vet` 相当の簡易チェック（`grep` ベースのテスト）で禁止する）。
+  これらは Postgres では `GROUP BY` で実装してよい（将来の Firestore では走査。**集計層と検証ツール以外から呼ばない**。`CONTRACT.md` に明記し、ハンドラ層からの直接呼び出しを `go vet` 相当の簡易チェック（`grep` ベースのテスト）で禁止する）。
 - ハンドラ（`internal/present/rest/handler.go` の 866, 872, 1074 行付近）は `aggregate.Usecase.Get(ctx, def, target)` を呼ぶ。
 
 #### read-through の手順
@@ -255,7 +235,7 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
 - コールドキーへの書き込み集中（例: 新規投稿への最初のリアクション群）では複数の書き込みが同時に `Compute` を走らせ、1 つだけが `PutIfAbsent` に勝つ。計算は 1 ターゲット単位で有界なので許容する。問題になれば `Store.SetNX` 相当の短命ロック（「計算中」マーカー、数秒）で 1 回に絞る拡張を入れる（任意）。
 - 厳密性の扱い:
   - Postgres 実装: `Apply` と `PutIfAbsent` は同一トランザクションで `pg_advisory_xact_lock(hash(key))` を取るので、同一キーに対して直列化される。
-  - Firestore / Redis / memcached 実装: 手順 4 の `AsOf` 比較はサーバ時刻に依存するため、レプリカ間のクロック差程度の競合窓が残る。**これは TTL による再計算で収束する結果整合として許容する**。集計値はキャッシュであり正本ではない、が設計の前提。
+  - Redis / memcached（将来の Firestore も）実装: 手順 4 の `AsOf` 比較はサーバ時刻に依存するため、レプリカ間のクロック差程度の競合窓が残る。**これは TTL による再計算で収束する結果整合として許容する**。集計値はキャッシュであり正本ではない、が設計の前提。
 - `AsOf` は「この値はいつ時点の計算か」を保持し、`Apply` 時は更新しない（計算時点を表すため）。API レスポンスには出さない。
 
 #### 運用ツール
@@ -269,37 +249,36 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
 ```yaml
 backends:
   aggregate:
-    store: postgres | firestore | redis | memcached | inmemory   # 既定: database と同じバックエンド
+    store: postgres | redis | memcached | inmemory   # 既定: database と同じバックエンド（firestore はフェーズ3で追加）
     ttl: 24h
     maxDeltas: 10000
 ```
 
 受け入れ条件
 - `internal/usecase/aggregate` の単体テストが `inmemory` ストアで Docker なしに通り、以下を検証する: 読み取りミス → Compute → Put、ヒット時に Compute が呼ばれない、書き込み時にエントリが無ければ Compute → Put（結果に自分の項目が含まれる）、エントリがあれば Apply のみで Compute が呼ばれない、`PutIfAbsent` で負けたとき `AsOf` と受信時刻の比較で Apply の有無が決まる、`MaxDeltas` 超過で `Invalidate`、`InvalidateAll` 後の読み書きで再計算。
-- `AggregateStore` の **準拠テスト**（`internal/infra/aggregate/storetest`）を 5 実装すべてが通す。
+- `AggregateStore` の **準拠テスト**（`internal/infra/aggregate/storetest`）を 4 実装すべてが通す。
 - repotest に `Compute*` のケースを追加し、既存のカウント系メソッドの期待値（`ByVariant` の順序を含む）をそのまま引き継ぐ。
 - 既存 DB の集計データは **移行しない**（初回読み取りで生成される）。PR 本文にその旨と、ariake 規模での初回生成コストの見積りを書く。
 - `internal/present/rest` から `record.Repository` のカウント系メソッド呼び出しが消えている。
-- `aggregate-verify --sample 1000` を Postgres と Firestore で実行し、Postgres は差分ゼロ、Firestore は差分が TTL 内に収束することを確認（手順と結果を PR に添付）。
+- `aggregate-verify --sample 1000` を Postgres ストアと Redis ストアで実行し、Postgres は差分ゼロ、Redis は差分が TTL 内に収束することを確認（手順と結果を PR に添付）。
 
-### T2.3 クエリ形状レジストリをバックエンド中立化し、インデックス検証を両方に（C5）
+### T2.3 クエリ形状レジストリをバックエンド中立化し、インデックス検証を各バックエンドに（C5）
 
 設計
-- `internal/infra/repository/firestore/shapes.go` の `queryShape` 定義を `internal/infra/repository/shapes/shapes.go` に移し、**論理フィールド名**（`parent`, `recordCreatedAt`, `schema` …）で宣言する。各バックエンドは論理名 → 物理列/フィールド名のマップを持つ。
-- Firestore: 既存の `indexes.json` 生成・検証をそのまま新パッケージ参照に変更。
+- `support-firestore` の `internal/infra/repository/firestore/shapes.go` にある `queryShape` 定義を手本に、`internal/infra/repository/shapes/shapes.go` を新設し、**論理フィールド名**（`parent`, `recordCreatedAt`, `schema` …）で宣言する。各バックエンドは論理名 → 物理列/フィールド名のマップを持つ。
 - Postgres: 各形状に対し「等価列 + 範囲列（並び順）」を前置一致で含むインデックスが `pg_indexes` に存在することをテストで検証する（`postgres_test.go` にある手書き検査を一般化）。GORM タグのインデックス定義は **形状から導出できるものに限り削除し、`shapes` から DDL を生成**する（`postgres/indexes.go`: 起動時に `CREATE INDEX IF NOT EXISTS` を発行）。形状に表れない内部インデックス（PK、unique）はモデルタグに残す。
 - マイグレーションの直列化: セッションレベル `pg_advisory_lock` を廃し、トランザクション内 `pg_advisory_xact_lock` に変更（CockroachDB 互換、§2 の将来対応）。
 
 受け入れ条件
 - `go test ./internal/infra/repository/shapes/...` が Docker なしで通る。
-- 形状を1つ追加してインデックスを足さないと、Postgres・Firestore の両テストが失敗する。
+- 形状を1つ追加してインデックスを足さないと、Postgres（と SQLite）のテストが失敗する。
 - 既存 DB に対して起動し、`pg_indexes` の集合が移行前と同じかスーパーセット（削除は意図したもののみ。PR に差分一覧を添える）。
 
 ### T2.4 往復削減（C1）
 
 設計
 - 契約に複数取得を追加: `GetSignedDocuments(ctx, uris []string) (map[string]*concrnt.SignedDocument, error)`（見つからないものは欠落、エラーにしない）。`GetDistributions`, `GetHierarchicalRecordPolicies` のうち連鎖的に呼ばれているものを usecase 側で束ねる。
-- chunkline: `LoadLocalBody` が `Record` / `Document` を Preload している箇所を、`record_keys` への非正規化（`redirect`, `recordCreatedAt`）で置換。Firestore 実装（`firestore/chunkline.go`）が参照。Postgres は `record_keys` に `redirect text` 列を追加し、`CreateRecord` 時に書く。既存行は起動時マイグレーションで `records` から backfill（1回、冪等）。
+- chunkline: `LoadLocalBody` が `Record` / `Document` を Preload している箇所を、`record_keys` への非正規化（`redirect`, `recordCreatedAt`）で置換。設計は `support-firestore` の `firestore/chunkline.go` を参照。Postgres は `record_keys` に `redirect text` 列を追加し、`CreateRecord` 時に書く。既存行は起動時マイグレーションで `records` から backfill（1回、冪等）。
 - `GetRecordKeyByURI` → 本体クエリの 2 往復を 1 往復にできる箇所（`parent_id` を URI から直接引けないため Postgres では難しい）は無理に潰さない。**目標は「1リクエスト = 高々 2 往復 + 1 回の複数取得」**。
 - 計測: OpenTelemetry のスパン数で検証する。`internal/present/rest` のハンドラテスト（既存の httptest）に、代表リクエスト（document 取得、chunkline body、associations 一覧）あたりのリポジトリ呼び出し回数を数えるテストを追加（fake repository でカウント）。
 
@@ -323,7 +302,7 @@ backends:
 
 設計
 - `internal/infra/repository/postgres` から契約外のものを除く: `BeginTx` 残骸、使われない Preload。`GROUP BY` は `Compute*` の内部実装としてのみ残る（T2.2）。
-- GORM の扱いは **維持**（§7-D）。ただし `AutoMigrate` の対象からインデックス生成を外し（T2.3）、スキーマ変更は `postgres/migrations.go` に明示的な手順として積む（番号付き、冪等、`schema_migrations` テーブルで管理）。
+- GORM の扱いは **維持**（§8-D）。ただし `AutoMigrate` の対象からインデックス生成を外し（T2.3）、スキーマ変更は `postgres/migrations.go` に明示的な手順として積む（番号付き、冪等、`schema_migrations` テーブルで管理）。
 - `internal/infra/database/models/*.go` の各 struct コメント（インデックス一覧）を shapes への参照に置換。
 
 受け入れ条件
@@ -332,7 +311,7 @@ backends:
 ### フェーズ2 完了条件
 
 - `CONTRACT.md` の表に「違反」行が残っていない。
-- Postgres / Firestore / SQLite の 3 バックエンドが同じ repotest を通す。
+- Postgres / SQLite の 2 バックエンドが同じ repotest を通す。
 - カウント系 API が全バックエンドでキャッシュヒット時 O(1) 読み取り。ミス時の `Compute*` は集計層からしか呼ばれない。
 - `AggregateStore` の保存先を設定だけで切り替えられ（例: postgres → redis）、切り替え後や `aggregate-invalidate --all` 後に、ログ再生なしで読み書き双方から値が再生成される。
 - 代表 3 リクエストのリポジトリ呼び出し回数が目標以下。
@@ -340,7 +319,43 @@ backends:
 
 ---
 
-## 5. 作業ルール
+## 5. フェーズ3 — 固まった契約に対する Firestore バックエンドの移植
+
+フェーズ2完了後に着手。`origin/support-firestore` の `internal/infra/repository/firestore/*` を出発点にするが、契約はフェーズ2で変わっているので **コピーではなく書き直し** になる箇所が多い。独立した計画書を起こしてよいが、最低限の範囲を書いておく。
+
+### 取り込むもの
+
+- `internal/infra/database/firestore.go`、`internal/infra/repository/firestore/*.go`、`internal/infra/repository/firestore_open.go`、`internal/testutil/firestore.go`、`deploy/firestore/*`。
+- `internal/infra/config/config.go`: `Backends.Firestore{ProjectID, DatabaseID}`。`repository.Open` に `firestore` ケース。
+- `go.mod`: `cloud.google.com/go/firestore`、`golang.org/x/sync`、`google.golang.org/api` 等。`go mod tidy` の結果だけをコミットし、無関係なメジャー更新を混ぜない。
+
+### 契約差分の吸収
+
+- `develop` 側で増え、`support-firestore` が持たないメソッド: `QueryByParentOrderByKey`（CIP-5 `orderby=key`）、`QueryCommitLogs`（`c_date, id` 順のレプリケーション走査）。`shapes` に形状を追加し、`QueryCommitLogs` は `commits` を `cDate, __name__` で範囲走査する。
+- フェーズ2で変わった契約: カウント系は `Compute*`（走査実装）に、`GetSignedDocuments` 複数取得、`record_keys` への `redirect` 非正規化、`MaintenanceRepository`。
+- `AggregateStore` の Firestore 実装（`internal/infra/aggregate/firestore`）を追加し、`storetest` を通す。`Apply` は `FieldValue.Increment` 相当。
+- `shapes` の Firestore コンシューマ: `firestore.indexes.json` の生成と、`shapes_test.go` によるドリフト検出、起動時の `VerifyIndexes` プローブ。
+
+### テストと CI
+
+- `internal/infra/repository/firestore/suite_test.go` で repotest 4 スイートを実行（エミュレータは dockertest で起動、イメージ `gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators`）。
+- `.github/workflows/test.yml` にエミュレータ付きジョブを追加（`timeout-minutes: 30`、イメージキャッシュ）。
+
+### ドキュメント
+
+- `deploy/firestore/README.md` が参照する `MIGRATION.md` を書く（ダンプ → 起動 → `import-commitlog --rejected-out` → `import-subscriptions` → 差分比較）。
+- README にバックエンド選択の節を追加。
+
+### 完了条件
+
+- `go test ./internal/infra/repository/firestore/ -count=1` と `./internal/infra/aggregate/firestore/` が緑。
+- `shapes` に形状を1つ足して `indexes.json` を更新しない状態で `shapes_test.go` が **失敗する**。
+- `backends.database: firestore` + `FIRESTORE_EMULATOR_HOST` で `concrnt` が起動し `/ready` が 200。
+- Postgres → Firestore → Postgres のログ再生往復で `dump-commitlog` が一致。
+
+---
+
+## 6. 作業ルール
 
 - ブランチ名: `feat/repository-contract-phase1`, `feat/repository-contract-<タスク名>`。
 - 1 PR = 1 タスク（T1.1 など）を目安。巨大化するなら更に分ける。PR 本文には「成果物」「受け入れ条件の確認結果」「検証コマンドの出力要約」を書く。
@@ -355,47 +370,46 @@ backends:
   ```
 - `support-firestore` からの移植は `git show origin/support-firestore:<path>` で取り、**`develop` の変更を上書きしない**。両側変更ファイル（§3 方針に列挙）は手で 3-way マージし、PR 本文にそのファイル名を明記する。
 - 契約（`internal/usecase/*/Repository`）を変えるときは、同じ PR で repotest と **全バックエンド**を更新する。片方だけ通る状態をマージしない。
-- 生成物（`schemas/*.go`, `deploy/firestore/firestore.indexes.json`）は手で編集しない。生成コマンドを PR 本文に書く。
+- 生成物（`schemas/*.go`、フェーズ3以降は `deploy/firestore/firestore.indexes.json`）は手で編集しない。生成コマンドを PR 本文に書く。
 - 既存の挙動変更が避けられない場合は PR タイトルに `behavior:` を付け、本文に差分を書く。
-- 本書の §7 以外の設計判断を変えたいときは、変える前にユーザーに確認する。
+- 本書の §8 以外の設計判断を変えたいときは、変える前にユーザーに確認する。
 
 ---
 
-## 6. リスク
+## 7. リスク
 
 | リスク | 兆候 | 対処 |
 |---|---|---|
 | `support-firestore` と `develop` の 3-way マージで `develop` 側の修正を落とす | `commit_test.go` や replication のテストが失敗 / 期待値を書き換えたくなる | 期待値は変えない。`git log -p origin/develop -- <file>` で develop 側の意図を読んでから当てる。 |
 | 集計キャッシュと実データのドリフト | `aggregate-verify` に差分 | 設計上は TTL で収束する。差分が TTL 内に消えない場合は `Apply` 側の差分符号・キー生成の誤り。複雑経路（カスケード、GC、import）が `Invalidate` を呼んでいるか確認。 |
-| Firestore 単一エントリの書き込み上限 | 人気投稿へのリアクション集中で `Apply` が `Aborted` 連発 | `Apply` は最適化なので **失敗しても無視して `Invalidate`** に落とす。ホットキーはそれで自然に read-through に戻る。 |
+| （フェーズ3）Firestore 単一エントリの書き込み上限 | 人気投稿へのリアクション集中で `Apply` が `Aborted` 連発 | `Apply` は最適化なので **失敗しても無視して `Invalidate`** に落とす。ホットキーはそれで自然に read-through に戻る。 |
 | 初回アクセスの計算コスト（コールドスタート） | `aggregate-invalidate --all` 直後や保存先切り替え直後に `Compute*` が集中 | 計算は 1 ターゲット単位で有界。必要なら人気ターゲットの事前ウォーム（`conctl op aggregate-warm --top N`）を任意で用意。 |
-| エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
+| （フェーズ3）エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
 | Postgres 起動時マイグレーションの多重実行 | 複数レプリカ同時起動で DDL 競合 | `pg_advisory_xact_lock` + `IF NOT EXISTS` + `schema_migrations` で冪等に。 |
 | 既存 DB への列追加 backfill が長い | `record_keys.redirect` backfill で起動が遅延 | バッチ分割、起動をブロックしないバックグラウンド実行、未 backfill 行は `records` へフォールバック。 |
 
 ---
 
-## 7. 未決事項（推奨案つき。指示がなければ推奨案で進める）
+## 8. 未決事項（推奨案つき。指示がなければ推奨案で進める）
 
 - **A. 集計キャッシュの既定保存先と TTL** — 推奨: 保存先は `database` と同じバックエンド（追加ミドルウェアなしで動く）、TTL 24h、`maxDeltas` 10000。ariake では後から Redis に切り替えてよい（設定変更のみ）。
-- **A2. Firestore 等での結果整合を許容するか** — 推奨: 許容する。集計はキャッシュであり、TTL で収束する。厳密性が必要になった時点で Postgres 実装相当のロック付きストアを選ぶ。
+- **A2. Redis / memcached（将来 Firestore）ストアでの結果整合を許容するか** — 推奨: 許容する。集計はキャッシュであり、TTL で収束する。厳密性が必要になった時点で Postgres 実装相当のロック付きストアを選ぶ。
 - **B. Postgres の `record_keys.id`（bigserial）を gen 文字列に置換するか** — 推奨: **フェーズ2ではやらない**。契約に漏れていない限り内部実装の自由（C3）。Spanner/CRDB バックエンドを書く段で、その実装側が独自に gen を持てばよい。
 - **C. SQLite バックエンド（T2.5）をフェーズ2に含めるか** — 推奨: 含める。Docker なしで契約テストが回ることの価値が大きく、GORM 非依存バックエンドの雛形にもなる。
 - **D. Postgres 実装の GORM 継続** — 推奨: 継続。書き換えコストに対して得るものが少ない。新規バックエンドは `database/sql` 直で書く（T2.5 が手本）。
 - **E. `QueryByPrefix` の Postgres 実装を `ancestors` 方式に合わせるか** — 推奨: 合わせない。`LIKE` は Postgres では速く、契約は意味論のみを規定する。
-- **F. CI の Firestore エミュレータを必須にするか** — 推奨: 必須（PR ブロッカー）。不安定なら別ジョブに分離するが、落としたままマージはしない。
+- **F. （フェーズ3）CI の Firestore エミュレータを必須にするか** — 推奨: 必須（PR ブロッカー）。不安定なら別ジョブに分離するが、落としたままマージはしない。
 
 ---
 
-## 8. 完了チェックリスト（全体）
+## 9. 完了チェックリスト（全体）
 
 - [ ] T1.1 `RunInTx` 契約、usecase 全面移行、Postgres 実装（リトライ付き）
 - [ ] T1.2 `repository.Set/Open`、`main.go` / `conctl` 配線、`backends.database` 設定
 - [ ] T1.3 `MaintenanceRepository`、`Inspector`、`gc-commitlog`/`dump-commitlog` 移行
 - [ ] T1.4 repotest 導入、`QueryByParentOrderByKey` / `QueryCommitLogs` のテスト追加、Postgres で緑
 - [ ] T1.5 `.github/workflows/test.yml`
-- [ ] T1.6 Firestore バックエンド移植 + 不足メソッド + `MIGRATION.md`
-- [ ] T1.7 README / `CONTRACT.md` 初版
+- [ ] T1.6 README / `CONTRACT.md` 初版
 - [ ] T2.1 契約棚卸し表
 - [ ] T2.2 `AggregateStore` 層（5 実装 + storetest）、`Compute*` 契約、read-through と書き込み時再計算、ハンドラ移行、`aggregate-verify` / `aggregate-invalidate`
 - [ ] T2.3 shapes 中立化、両バックエンドのインデックス検証、`pg_advisory_xact_lock`
@@ -403,3 +417,4 @@ backends:
 - [ ] T2.5 SQLite バックエンド
 - [ ] T2.6 Postgres 整理、明示マイグレーション
 - [ ] ログ再生による Postgres → SQLite → Postgres 往復の一致確認
+- [ ] （フェーズ3）Firestore バックエンド移植、不足メソッド、`AggregateStore` Firestore 実装、`indexes.json`、エミュレータ CI、`MIGRATION.md`
