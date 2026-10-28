@@ -8,9 +8,9 @@
 
 ## 0. この文書の使い方
 
-- 本書は **フェーズ1**（`support-firestore` のバックエンド中立部分の取り込み）、**フェーズ2**（契約の正式化と Postgres の書き直し、SQLite 追加）、**フェーズ3**（固まった契約に対する Firestore バックエンドの移植）の3段構成。前のフェーズが `develop` にマージされるまで次に着手しない。**フェーズ1・2には Firestore の実装コードは一切含めない**。契約がフェーズ2で変わるため、先に移植すると二度手間になる。
+- 本書は **フェーズ1**（`support-firestore` のバックエンド中立部分の取り込み。PR #114）、**フェーズ2**（契約の正式化と Postgres の書き直し、SQLite 追加）、**フェーズ3**（固まった契約に対する **Spanner バックエンド**。契約が盤石であることの証明）、**フェーズ4**（Firestore バックエンドの移植）の4段構成。前のフェーズが `develop` にマージされるまで次に着手しない（フェーズ3と4は並行可）。**フェーズ1・2には Firestore / Spanner の実装コードは一切含めない**。契約がフェーズ2で変わるため、先に書くと二度手間になる。
 - 各タスクには「成果物」「受け入れ条件」「検証コマンド」がある。受け入れ条件を満たさない状態で次のタスクに進まない。
-- **判断が必要な箇所は §8「未決事項」に集約**してある。それ以外は本書の決定に従い、作業者の判断で設計を変えない。§8 の項目はいずれも推奨案を書いてあるので、ユーザーから別の指示がなければ推奨案で進める。
+- **判断が必要な箇所は §9「未決事項」に集約**してある。それ以外は本書の決定に従い、作業者の判断で設計を変えない。§9 の項目はいずれも推奨案を書いてあるので、ユーザーから別の指示がなければ推奨案で進める。
 - 作業者が本書と現コードの矛盾を見つけたら、コードを正とし、本書の該当箇所を修正して PR に含める。
 
 ### 前提環境
@@ -43,6 +43,7 @@
 1. **移植性**: 契約を「KV + 順序付き範囲走査 + 楽観的トランザクション + 事前集計」の形に固定し、Postgres / Firestore / 将来の Spanner・CockroachDB・SQLite が同じ契約と同じ準拠テストで動くようにする。
 2. **急上昇耐性と保守性**: 往復回数の削減と集計の事前計算により、どのバックエンドでも読み取り増幅を抑える。これは Postgres 単体でも効く。
 3. **データ移行の統一**: バックエンド間の移行は常に「コミットログのダンプ → 再生」。テーブルコピーは作らない。
+4. **契約の証明**: Postgres 以外で最初に実装するバックエンドは Spanner。Postgres と違う軸（自動採番なし、ABORTED リトライ、コミットあたりのミューテーション上限、インデックスの明示宣言、単調増加キーのホットスポット、トランザクション内で自分の書き込みが読めない）を一度に踏むが、関係モデルなので失敗の原因を契約に帰着させやすい。ariake の GCP 側の着地点でもあるので捨てる作業にならない。Spanner Omni（Docker 単体サーバ）で `compose` から動かせる。
 
 ### 非目的（本計画の範囲外）
 
@@ -50,7 +51,7 @@
 - `activitypub` / `atproto` ブリッジ（別リポジトリ）の対応。
 - Redis の役割分離（ジョブキュー / pubsub / dedup / カウンタの抽象化）。別計画。
 - バッチ API（`handle-batch-request` ブランチ）。別計画。
-- Spanner / CockroachDB バックエンドの実装。契約が整った後（フェーズ3の Firestore と同じ手順で追加する）。
+- CockroachDB バックエンドの実装。契約が整った後、フェーズ3の Spanner と同じ手順で追加する。
 
 ---
 
@@ -318,7 +319,7 @@ backends:
 
 設計
 - `internal/infra/repository/postgres` から契約外のものを除く: `BeginTx` 残骸、使われない Preload。`GROUP BY` は `Compute*` の内部実装としてのみ残る（T2.2）。
-- GORM の扱いは **維持**（§8-D）。ただし `AutoMigrate` の対象からインデックス生成を外し（T2.3）、スキーマ変更は `postgres/migrations.go` に明示的な手順として積む（番号付き、冪等、`schema_migrations` テーブルで管理）。
+- GORM の扱いは **維持**（§9-D）。ただし `AutoMigrate` の対象からインデックス生成を外し（T2.3）、スキーマ変更は `postgres/migrations.go` に明示的な手順として積む（番号付き、冪等、`schema_migrations` テーブルで管理）。
 - `internal/infra/database/models/*.go` の各 struct コメント（インデックス一覧）を shapes への参照に置換。
 
 受け入れ条件
@@ -335,9 +336,68 @@ backends:
 
 ---
 
-## 5. フェーズ3 — 固まった契約に対する Firestore バックエンドの移植
+## 5. フェーズ3 — Spanner バックエンド（契約の証明）
 
-フェーズ2完了後に着手。`origin/support-firestore` の `internal/infra/repository/firestore/*` を出発点にするが、契約はフェーズ2で変わっているので **コピーではなく書き直し** になる箇所が多い。独立した計画書を起こしてよいが、最低限の範囲を書いておく。
+フェーズ2完了後に着手。`support-firestore` のコードはトランザクション層の設計（`tx.go` の書き込みバッファ）を手本として読むだけで、Spanner 実装は契約から直接書く。**GORM は使わない**（新規バックエンドの書き方の手本は T2.5 の SQLite）。
+
+### 3.1 方針（決定事項）
+
+- **ダイアレクトとクライアント**: GoogleSQL を `cloud.google.com/go/spanner` のネイティブクライアントで使う。理由: `ReadWriteTransaction` が `RunInTx` に 1:1 で対応し ABORTED を自動再試行する、`Read(KeySet)` / `ReadRow` が複数取得（C1）に直接対応する、`INTERLEAVE IN PARENT` / `NULL_FILTERED` / `STORING` が一級で使える、GORM に依存しない。PostgreSQL ダイアレクトは PGAdapter のサイドカーが要り、しかも既存 ORM の drop-in にはならないので採らない。
+- **接続先は3種を同じコードで**: Cloud Spanner（既定の認証）、Spanner Omni（`spanner.ClientConfig{Type: spanner.OMNI, UsePlainText: true}` + `option.WithEndpoint("host:15000")`。古いクライアントでは `IsExperimentalHost: true` + `option.WithoutAuthentication()` + `insecure.NewCredentials()`）、Spanner エミュレータ（`SPANNER_EMULATOR_HOST`）。設定:
+  ```yaml
+  backends:
+    database: spanner
+    spanner:
+      mode: cloud | omni | emulator
+      endpoint: "spanner-omni:15000"     # omni / emulator のみ
+      project: local
+      instance: concrnt
+      database: concrnt
+  ```
+- **ローカルは Spanner Omni を一次ターゲット**にする（`compose.yaml` に `spanner-omni` サービス、profile `spanner`、イメージタグは `2026.r4-lts` 系を pin、データ用 volume、ポート 15000–15026）。エミュレータは「同時に走る読み書きトランザクションを1つしか許さず他を ABORTED にする」ため並行性の挙動が本物と異なる。CI でどちらを使うかは §9-G。
+- **ID**: 契約どおり CDID / URI / ランダム gen のみ（C3）。`record_keys` の主キーは `uri`（Postgres の `bigserial id` に相当するものは持たない）。親参照は `parent_uri`、キー再作成時の子孫切り離しは Firestore 設計と同じ `gen`（ランダム識別子）で表す。`abuse_reports` の主キーは UUID。
+- **ホットスポット対策**: 時刻順 CDID を主キーにする `commits` / `records` / `associations` は単調増加キー。ariake 規模では問題にならないので既定は **シャードなし**。`PRIMARY KEY (shard, id)`（`shard INT64 AS (MOD(ABS(FARM_FINGERPRINT(id)), 16)) STORED`）へ切り替えられるよう、キー組み立てを1箇所（`keys.go`）に閉じる（§9-H）。
+- **コミットのカスケード**: `records` / `acks` / `ackeds` / `associations` は `document_id` が主キーなので `INTERLEAVE IN PARENT commits ON DELETE CASCADE` にする（親キーと同一キーの 1:1 子テーブル）。`DeleteCommitLogs` は `commits` の行削除だけで済む。`entities`（ccid キー）と `record_keys.record_id` は interleave できないので **外部キー + `ON DELETE CASCADE`**。カスケードされた行も **コミットあたり 80,000 ミューテーション上限**に数えられるので、`DeleteCommitLogs` のバッチ、`DeleteRecordByKey` の子孫削除は上限を超えない粒度に分割し、大量削除はジョブキューへ（C4）。
+- **トランザクション内の読み書き**: Spanner の `BufferWrite` は同一トランザクション内の後続の読み取りに **見えない**。Postgres 実装は同一 tx 内で「読む → 書く → 読む」を自然に行っているので、契約に明文化する: **「`RunInTx` のクロージャ内で、自分がそのトランザクションで書いた内容を読めることを前提にしてはならない」**（C4 の追補）。実装は `support-firestore` の `tx.go` と同じく書き込みをバッファし、同一キーへの書き込みは合成（coalesce）し、クロージャ終了時に flush する。条件付き UPSERT（accept-if-newer）は「読む → 比較 → `InsertOrUpdate` をバッファ」で実現し、直列化可能性と ABORTED 再試行が競合を解決する。
+- **受信時刻**: `commits.c_date` は `allow_commit_timestamp=true` の列に `spanner.CommitTimestamp` を書く。DB 内で単調なので `QueryCommitLogs` の `(c_date, id)` 順が厳密になり、集計層（T2.2）の `AsOf` 比較の競合窓も Spanner では消える。`Inspector.SetCommitCDate` は過去時刻の明示書き込みで実現できる（未来時刻は拒否される）。
+- **配列・JSON**: `distributions` / `prefixes` / `schemas` は `ARRAY<STRING(MAX)>`、`well_known` / `info` は `JSON`。
+- **`QueryByPrefix`**: `STARTS_WITH(uri, @prefix)` は主キー `uri` の範囲走査になる。Firestore の `ancestors` 配列は不要。
+- **スキーマ適用**: `internal/infra/repository/spanner/schema/*.sql`（番号付き DDL バッチ）を `UpdateDatabaseDdl` で適用し、適用済み番号を `schema_migrations` に記録。起動時に未適用分だけ流す。DDL はトランザクショナルでないので各バッチは冪等に書く（`CREATE TABLE IF NOT EXISTS` 相当は `INFORMATION_SCHEMA` を見て判定）。
+- **インデックス**: T2.3 の形状レジストリから `CREATE INDEX` を生成する（`parent_uri, record_created_at DESC, record_id` は `NULL_FILTERED` でプレースホルダを除外 = Postgres の部分インデックス、`associations.unique` と acks の `(from,to,schema)` は `UNIQUE NULL_FILTERED`）。テストは `INFORMATION_SCHEMA.INDEXES` / `INDEX_COLUMNS` と比較する。
+
+### 3.2 成果物
+
+- `internal/infra/database/spanner.go`: クライアント生成（3モード）。
+- `internal/infra/repository/spanner/`:
+  - `repository.go`（`Repository` 構造体、`New`、`RunInTx`、`recordTx` の書き込みバッファ）
+  - `keys.go`（主キー組み立て、シャード切替の唯一の箇所）
+  - `commit.go` / `record.go` / `query.go` / `association.go` / `ack.go` / `entity.go` / `chunkline.go` / `maintenance.go`（`postgres/record` と同じファイル分割）
+  - `compute.go`（T2.2 の `Compute*`。`GROUP BY` で実装）
+  - `entitymeta.go` / `server.go` / `notification.go` / `abuse.go`（他ストア。`EntityMeta` は C9 により別実体でもよいが、Spanner 上では同じ DB の別テーブルで実装する）
+  - `schema/0001_core.sql` …、`migrate.go`
+  - `inspect_test.go`（C10）、`suite_test.go`（repotest 6 スイート）、`tx_abort_test.go`（同一キーへ競合する2つの `RunInTx` が両方完走し、片側だけ再試行されることを Omni で検証）、`mutation_limit_test.go`（子 2 万件のタイムラインに対する `DeleteRecordByKey` がジョブキュー経由で上限を超えずに完了）
+- `internal/infra/aggregate/spanner/`: `AggregateStore` 実装（テーブル `aggregates(key, value, as_of, deltas, expires_at)`、`Apply` は RW tx の read-modify-write なので Postgres 実装と同じく厳密、TTL は `ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`）。`storetest` を通す。
+- `internal/infra/repository/repository.go`: `spanner` ケース。
+- `internal/testutil/spanner.go`: dockertest で Omni（または §9-G によりエミュレータ）を起動し、`open(t)` ごとに新しいデータベースを作ってスキーマを適用する。Omni の起動が遅い場合はパッケージ単位で1コンテナを共有し、データベースだけテストごとに分ける。
+- `compose.yaml`: `spanner-omni` サービス（profile `spanner`）。README に起動手順。
+- `.github/workflows/test.yml`: Spanner ジョブを追加（§9-G）。
+- `internal/infra/repository/CONTRACT.md`: C4 追補（トランザクション内の read-after-write 禁止）、Spanner 固有の注意（ミューテーション上限、コミットタイムスタンプ）を「バックエンド別ノート」として追記。
+- `MIGRATION.md`: Postgres ↔ Spanner のログ再生手順。
+
+### 3.3 受け入れ条件
+
+- repotest 6 スイートと `storetest` が Spanner Omni 上で緑。
+- `tx_abort_test` と `mutation_limit_test` が緑。
+- 形状レジストリに形状を1つ足して DDL を更新しない状態で Spanner のインデックス検査が **失敗する**。
+- Postgres → Spanner → Postgres のログ再生往復で `dump-commitlog` の出力が一致（§4 の SQLite 往復と同じ手順）。
+- 本番バイナリに `repotest` / `testutil` / `dockertest` がリンクされていない（C10）。
+- **契約の修正が必要になった箇所を PR 本文に列挙する**。これがこのフェーズの主目的で、Spanner 側で回避策を書くのではなく、契約（repotest → Postgres → SQLite → Spanner）を直す。想定される発見: read-after-write 前提、カスケード削除の粒度、`Inspector` のタイムスタンプ操作、`QueryByPrefix` の意味論。
+
+---
+
+## 6. フェーズ4 — 固まった契約に対する Firestore バックエンドの移植
+
+フェーズ2完了後に着手（フェーズ3と並行可）。`origin/support-firestore` の `internal/infra/repository/firestore/*` を出発点にするが、契約はフェーズ2で変わっているので **コピーではなく書き直し** になる箇所が多い。独立した計画書を起こしてよいが、最低限の範囲を書いておく。
 
 ### 取り込むもの
 
@@ -349,7 +409,7 @@ backends:
 
 - `develop` 側で増え、`support-firestore` が持たないメソッド: `QueryByParentOrderByKey`（CIP-5 `orderby=key`）、`QueryCommitLogs`（`c_date, id` 順のレプリケーション走査）。`shapes` に形状を追加し、`QueryCommitLogs` は `commits` を `cDate, __name__` で範囲走査する。
 - フェーズ2で変わった契約: カウント系は `Compute*`（走査実装）に、`GetSignedDocuments` 複数取得、`record_keys` への `redirect` 非正規化、`MaintenanceRepository`。
-- Firestore の `Core` ストアは1オブジェクトで record / residence / chunkline を実装し（C9）、`Inspector` 実装は `firestore/inspect_test.go` に置く（C10）。
+- Firestore の `Record` ストアは1オブジェクトで record.Repository 全体（entity 参照、chunkline、保守メソッド含む）を実装し（C9）、`EntityMeta` は別実装、`Inspector` 実装は `firestore/inspect_test.go` に置く（C10）。
 - `AggregateStore` の Firestore 実装（`internal/infra/aggregate/firestore`）を追加し、`storetest` を通す。`Apply` は `FieldValue.Increment` 相当。
 - `shapes` の Firestore コンシューマ: `firestore.indexes.json` の生成と、`shapes_test.go` によるドリフト検出、起動時の `VerifyIndexes` プローブ。
 
@@ -372,7 +432,7 @@ backends:
 
 ---
 
-## 6. 作業ルール
+## 7. 作業ルール
 
 - ブランチ名: `feat/repository-contract-phase1`, `feat/repository-contract-<タスク名>`。
 - 1 PR = 1 タスク（T1.1 など）を目安。巨大化するなら更に分ける。PR 本文には「成果物」「受け入れ条件の確認結果」「検証コマンドの出力要約」を書く。
@@ -391,37 +451,43 @@ backends:
 - 新しいリポジトリインターフェースを切る前に C9 を適用する: 既存のテーブルを共有するなら既存のストアにメソッドを足す。
 - 生成物（`schemas/*.go`、フェーズ3以降は `deploy/firestore/firestore.indexes.json`）は手で編集しない。生成コマンドを PR 本文に書く。
 - 既存の挙動変更が避けられない場合は PR タイトルに `behavior:` を付け、本文に差分を書く。
-- 本書の §8 以外の設計判断を変えたいときは、変える前にユーザーに確認する。
+- 本書の §9 以外の設計判断を変えたいときは、変える前にユーザーに確認する。
 
 ---
 
-## 7. リスク
+## 8. リスク
 
 | リスク | 兆候 | 対処 |
 |---|---|---|
 | `support-firestore` と `develop` の 3-way マージで `develop` 側の修正を落とす | `commit_test.go` や replication のテストが失敗 / 期待値を書き換えたくなる | 期待値は変えない。`git log -p origin/develop -- <file>` で develop 側の意図を読んでから当てる。 |
 | 集計キャッシュと実データのドリフト | `aggregate-verify` に差分 | 設計上は TTL で収束する。差分が TTL 内に消えない場合は `Apply` 側の差分符号・キー生成の誤り。複雑経路（カスケード、GC、import）が `Invalidate` を呼んでいるか確認。 |
-| （フェーズ3）Firestore 単一エントリの書き込み上限 | 人気投稿へのリアクション集中で `Apply` が `Aborted` 連発 | `Apply` は最適化なので **失敗しても無視して `Invalidate`** に落とす。ホットキーはそれで自然に read-through に戻る。 |
+| （フェーズ4）Firestore 単一エントリの書き込み上限 | 人気投稿へのリアクション集中で `Apply` が `Aborted` 連発 | `Apply` は最適化なので **失敗しても無視して `Invalidate`** に落とす。ホットキーはそれで自然に read-through に戻る。 |
 | 初回アクセスの計算コスト（コールドスタート） | `aggregate-invalidate --all` 直後や保存先切り替え直後に `Compute*` が集中 | 計算は 1 ターゲット単位で有界。必要なら人気ターゲットの事前ウォーム（`conctl op aggregate-warm --top N`）を任意で用意。 |
-| （フェーズ3）エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
+| （フェーズ3）Spanner Omni が GitHub ランナーで動かない / 重い | 起動タイムアウト、メモリ不足 | §9-G のとおりエミュレータへ退避。`tx_abort_test` は Omni 限定で `-tags omni` にする。 |
+| （フェーズ3）80,000 ミューテーション上限 | 大きなタイムラインの削除や GC バッチが `InvalidArgument` | バッチ粒度を下げ、子孫削除はジョブキューへ。`mutation_limit_test` で固定。 |
+| （フェーズ3）同一 tx 内の read-after-write 前提が usecase に残っている | Spanner で repotest が落ちる | 契約（C4 追補）を直し、Postgres 側も同じ制約で動くことを repotest に足す。回避策を Spanner 側に書かない。 |
+| （フェーズ4）エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
 | Postgres 起動時マイグレーションの多重実行 | 複数レプリカ同時起動で DDL 競合 | `pg_advisory_xact_lock` + `IF NOT EXISTS` + `schema_migrations` で冪等に。 |
 | 既存 DB への列追加 backfill が長い | `record_keys.redirect` backfill で起動が遅延 | バッチ分割、起動をブロックしないバックグラウンド実行、未 backfill 行は `records` へフォールバック。 |
 
 ---
 
-## 8. 未決事項（推奨案つき。指示がなければ推奨案で進める）
+## 9. 未決事項（推奨案つき。指示がなければ推奨案で進める）
 
 - **A. 集計キャッシュの既定保存先と TTL** — 推奨: 保存先は `database` と同じバックエンド（追加ミドルウェアなしで動く）、TTL 24h、`maxDeltas` 10000。ariake では後から Redis に切り替えてよい（設定変更のみ）。
-- **A2. Redis / memcached（将来 Firestore）ストアでの結果整合を許容するか** — 推奨: 許容する。集計はキャッシュであり、TTL で収束する。厳密性が必要になった時点で Postgres 実装相当のロック付きストアを選ぶ。
+- **A2. Redis / memcached（将来 Firestore）ストアでの結果整合を許容するか（Spanner 実装は RW tx で厳密）** — 推奨: 許容する。集計はキャッシュであり、TTL で収束する。厳密性が必要になった時点で Postgres 実装相当のロック付きストアを選ぶ。
 - **B. Postgres の `record_keys.id`（bigserial）を gen 文字列に置換するか** — 推奨: **フェーズ2ではやらない**。契約に漏れていない限り内部実装の自由（C3）。Spanner/CRDB バックエンドを書く段で、その実装側が独自に gen を持てばよい。
 - **C. SQLite バックエンド（T2.5）をフェーズ2に含めるか** — 推奨: 含める。Docker なしで契約テストが回ることの価値が大きく、GORM 非依存バックエンドの雛形にもなる。
 - **D. Postgres 実装の GORM 継続** — 推奨: 継続。書き換えコストに対して得るものが少ない。新規バックエンドは `database/sql` 直で書く（T2.5 が手本）。
 - **E. `QueryByPrefix` の Postgres 実装を `ancestors` 方式に合わせるか** — 推奨: 合わせない。`LIKE` は Postgres では速く、契約は意味論のみを規定する。
-- **F. （フェーズ3）CI の Firestore エミュレータを必須にするか** — 推奨: 必須（PR ブロッカー）。不安定なら別ジョブに分離するが、落としたままマージはしない。
+- **G. （フェーズ3）CI で Spanner Omni を使うか、エミュレータにするか** — 推奨: ローカルは Omni、CI は **Omni を試して GitHub ランナーで安定しなければエミュレータ**。Omni はホストネットワーク前提の手順しか公式に出ておらず、ライセンス条件（CI での利用可否）と GA / Preview の扱いも情報が割れている（公式ドキュメントは本セッションから取得不可）。着手時に `docs.cloud.google.com/spanner-omni/` の overview / setup / license を確認し、結果を本書に追記する。エミュレータは RW トランザクションを1つしか許さないので、`tx_abort_test` は Omni でのみ意味を持つ。
+- **H. （フェーズ3）時刻順キーのシャード化** — 推奨: 既定オフ。`keys.go` に切替点だけ用意する。
+- **I. （フェーズ3）コミット配下の子テーブルを interleave にするか FK CASCADE にするか** — 推奨: `document_id` 主キーの4テーブルは interleave、キー形状が合わない `entities` と `record_keys.record_id` は FK CASCADE。
+- **F. （フェーズ4）CI の Firestore エミュレータを必須にするか** — 推奨: 必須（PR ブロッカー）。不安定なら別ジョブに分離するが、落としたままマージはしない。
 
 ---
 
-## 9. 完了チェックリスト（全体）
+## 10. 完了チェックリスト（全体）
 
 - [ ] T1.1 `RunInTx` 契約、usecase 全面移行、Postgres 実装（リトライ付き）
 - [ ] T1.2 `repository.Set/Open`、`main.go` / `conctl` 配線、`backends.database` 設定
@@ -436,4 +502,5 @@ backends:
 - [ ] T2.5 SQLite バックエンド
 - [ ] T2.6 Postgres 整理、明示マイグレーション
 - [ ] ログ再生による Postgres → SQLite → Postgres 往復の一致確認
-- [ ] （フェーズ3）Firestore バックエンド移植、不足メソッド、`AggregateStore` Firestore 実装、`indexes.json`、エミュレータ CI、`MIGRATION.md`
+- [ ] （フェーズ3）Spanner バックエンド: スキーマとマイグレーション、`RunInTx` 書き込みバッファ、interleave / FK カスケード、`Compute*`、`AggregateStore` Spanner 実装、形状レジストリからの DDL 生成とインデックス検査、Omni の compose / testutil / CI、`tx_abort_test` / `mutation_limit_test`、ログ再生往復、契約修正の列挙
+- [ ] （フェーズ4）Firestore バックエンド移植、不足メソッド、`AggregateStore` Firestore 実装、`indexes.json`、エミュレータ CI、`MIGRATION.md`
