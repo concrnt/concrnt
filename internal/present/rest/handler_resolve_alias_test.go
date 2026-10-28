@@ -20,7 +20,7 @@ import (
 
 // aliasResidenceRepo serves one entity by alias and nothing by CCID.
 type aliasResidenceRepo struct {
-	record.EntityRepository
+	record.Repository
 	alias  string
 	entity *domain.Entity
 }
@@ -45,7 +45,7 @@ func TestResolveAliasServesEntityDocument(t *testing.T) {
 	repo := aliasResidenceRepo{alias: "alice.example.net", entity: &domain.Entity{ID: "con1alice", Domain: "example.com", SignedDocument: sd}}
 	h := &Handler{
 		config: cfg,
-		record: record.New(nil, repo, nil, &cfg, nil, nil, nil, nil, nil),
+		record: record.New(repo, nil, &cfg, nil, nil, nil, nil, nil),
 	}
 
 	e := echo.New()
@@ -88,7 +88,7 @@ func (allowAllPolicy) Eval(ctx context.Context, req policy.RequestContext, stack
 
 // aliasKeyChunklineRepo serves one manifest under its canonical (CCID) key only.
 type aliasKeyChunklineRepo struct {
-	chunklineuc.Repository
+	record.Repository
 	key string
 	got []string
 }
@@ -111,7 +111,7 @@ func TestResolveAliasWithKeyLooksUpCanonicalOwner(t *testing.T) {
 	sd := &concrnt.SignedDocument{Document: `{"kind":"record","key":"cckv://con1alice/tipjar"}`}
 	repo := &aliasKeyRecordRepo{key: "cckv://con1alice/tipjar", sd: sd}
 	chunklineRepo := &aliasKeyChunklineRepo{key: "cckv://con1alice/tipjar"}
-	recordUC := record.New(repo, aliasResidenceRepo{alias: "alice.example.net", entity: entity}, nil, &cfg, nil, nil, allowAllPolicy{}, nil, nil)
+	recordUC := record.New(aliasResidenceRepo{Repository: repo, alias: "alice.example.net", entity: entity}, nil, &cfg, nil, nil, allowAllPolicy{}, nil, nil)
 	h := &Handler{
 		config:    cfg,
 		record:    recordUC,

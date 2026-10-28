@@ -113,9 +113,11 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `server`, `notification`, `subscription`, `chunkline`, `abuse`), each exposing
   `Usecase`/`New` plus the repository/gateway interfaces only it needs; infra packages
   satisfy these interfaces structurally. The parent package holds only the ports shared
-  across concerns (`JobQueue`, `KVS`). `record` is the hub: `residence` builds on it (its
-  `Repository` embeds `record.EntityRepository`), and `record` depends on `server` (remote
-  server resolution) and `chunkline` (removed-item advertisements). Inside `record`,
+  across concerns (`JobQueue`, `KVS`, the removed-item kvs keys). `record` is the hub:
+  `record.Repository` is the single store interface for commit log, records, entities and
+  the chunkline views (one set of tables, so one repository — `CONTRACT.md` C9);
+  `residence` and `chunkline` build on it, and `record` depends on `server` (remote
+  server resolution). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
   `delete.go`); `read.go`/`query.go` are the read paths, `replication.go` the paged

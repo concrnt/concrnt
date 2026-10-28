@@ -12,7 +12,7 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// RunResidenceSuite runs the residence.Repository contract tests. open must
+// RunResidenceSuite runs the entity / registration contract tests of record.Repository. open must
 // return a fresh, isolated backend per call; it is called once per top-level
 // test.
 func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
@@ -24,7 +24,7 @@ func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
 // clobber inviter) and report NotFound for unregistered ccids.
 func testResidenceUpdateMetaInfo(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo := be.Residence
+	repo := be.Record
 
 	ccid := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"
@@ -55,7 +55,7 @@ func testResidenceUpdateMetaInfo(t *testing.T, be Backend) {
 // touched; commits with no recorded owner are left alone.
 func testResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo := be.Residence
+	repo := be.Record
 	in := be.Inspect
 
 	userA := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"

@@ -14,28 +14,14 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-// Repository is residence persistence: entity meta plus the entity lookups
-// shared with the record usecase (record.EntityRepository).
-type Repository interface {
-	record.EntityRepository
-
-	SaveMeta(ctx context.Context, meta domain.EntityMeta) error
-	UpdateMetaInfo(ctx context.Context, ccid string, info string) error
-	DeleteMeta(ctx context.Context, ccid string) error
-	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
-	// ListMetas returns every entity meta, or only the one for owner when
-	// owner is non-empty (offline tooling).
-	ListMetas(ctx context.Context, owner string) ([]domain.EntityMeta, error)
-}
-
 type Usecase struct {
-	repo   Repository
+	repo   record.Repository
 	record *record.Usecase
 	config *domain.Config
 }
 
 func New(
-	repo Repository,
+	repo record.Repository,
 	record *record.Usecase,
 	config *domain.Config,
 ) *Usecase {

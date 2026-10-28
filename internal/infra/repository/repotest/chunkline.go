@@ -8,7 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// RunChunklineSuite runs the chunkline.Repository contract tests. open must
+// RunChunklineSuite runs the chunkline contract tests of record.Repository. open must
 // return a fresh, isolated backend per call; it is called once per top-level
 // test.
 func RunChunklineSuite(t *testing.T, open func(t *testing.T) Backend) {
@@ -20,7 +20,7 @@ func RunChunklineSuite(t *testing.T, open func(t *testing.T) Backend) {
 func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Chunkline
+	chunklineRepo := be.Record
 
 	parentURI := "cckv://con1owner/timeline"
 	createdAt10 := time.Unix(10*600+10, 0).UTC()
@@ -58,7 +58,7 @@ func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Chunkline
+	chunklineRepo := be.Record
 
 	parentURI := "cckv://con3owner/timeline"
 	chunkStart := time.Unix(30*600, 0).UTC()
@@ -83,7 +83,7 @@ func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 func testChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Chunkline
+	chunklineRepo := be.Record
 
 	feedURI := "cckv://con4owner/timeline"
 	CreateChunklineRecord(t, ctx, recordRepo, "empty-feed", feedURI, time.Unix(40*600, 0).UTC())

@@ -253,10 +253,10 @@ func main() {
 
 	serverUC := server.New(repos.Server, &domainConfig, softwareInfo, moduleManager, cl)
 
-	recordUC := record.New(repos.Record, repos.Residence, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(repos.Residence, recordUC, &domainConfig)
+	recordUC := record.New(repos.Record, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(repos.Record, recordUC, &domainConfig)
 
-	chunklineRepo := repos.Chunkline
+	chunklineRepo := repos.Record
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist

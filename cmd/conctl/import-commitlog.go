@@ -90,7 +90,7 @@ var importCommitlogCmd = &cobra.Command{
 		// 1. Restore entity metas first (directly against the database) so local
 		//    entity commits pass their registration check on the server.
 		if metasPath != "" {
-			residenceRepo := op.Repos.Residence
+			residenceRepo := op.Repos.Record
 			f, err := os.Open(metasPath)
 			if err != nil {
 				return fmt.Errorf("failed to open metas file: %w", err)

@@ -46,7 +46,7 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 
 	if entity.Value.Domain == uc.config.FQDN {
 		// if local, check if author is registered
-		_, err := uc.entity.GetMeta(ctx, entity.Author)
+		_, err := uc.repo.GetMeta(ctx, entity.Author)
 		if err != nil {
 			span.RecordError(err)
 			return nil, errors.New("user is not registered for this domain")
@@ -121,7 +121,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 
 	if parsed.Owner[0] == '@' { // alias
 		alias := parsed.Owner[1:]
-		sd, err := uc.entity.GetEntityByAlias(ctx, alias)
+		sd, err := uc.repo.GetEntityByAlias(ctx, alias)
 		if err == nil {
 			return sd, nil
 		}
@@ -157,7 +157,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		return uc.GetEntity(ctx, redirect)
 	} else {
 		ccid := parsed.Owner
-		entity, err := uc.entity.GetEntityByCCID(ctx, ccid)
+		entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
 		if err == nil {
 			if parsed.Hint != nil && *parsed.Hint != entity.Domain && *parsed.Hint != uc.config.FQDN && uc.kvs != nil && uc.client != nil {
 				go uc.recheckEntityByHint(context.WithoutCancel(ctx), ccid, *parsed.Hint)
@@ -189,7 +189,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		}
 
 		// commit済みなので今度は成功するはず
-		entity, err = uc.entity.GetEntityByCCID(ctx, ccid)
+		entity, err = uc.repo.GetEntityByCCID(ctx, ccid)
 		if err != nil {
 			return nil, err
 		}
@@ -291,7 +291,7 @@ func (uc *Usecase) getEntityWithReference(ctx context.Context, ip string, ccid s
 	uri.Hint = &referenced.Value.Domain
 
 	newer := true
-	stored, err := uc.entity.GetEntityByCCID(ctx, ccid)
+	stored, err := uc.repo.GetEntityByCCID(ctx, ccid)
 	if err == nil && stored.SignedDocument != nil {
 		var storedDoc concrnt.Document[schemas.Entity]
 		if err := json.Unmarshal([]byte(stored.SignedDocument.Document), &storedDoc); err == nil {

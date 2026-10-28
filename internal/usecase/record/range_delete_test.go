@@ -15,7 +15,6 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
-	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/policy"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -227,8 +226,7 @@ func signedDelete(t *testing.T, ccid, privKeyHex, target string) concrnt.SignedD
 // ResolveResourceHost resolves it locally without any network.
 func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery usecase.JobQueue, kvs usecase.KVS) *Usecase {
 	return New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
@@ -488,8 +486,7 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		dest + "/" + refSegment(base+"/a"): referenceRecord(t, dest+"/"+refSegment(base+"/a"), base+"/a"),
 	}}
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &requester},
+		withEntities{repo, fixedResidenceRepo{entity: &requester}},
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
@@ -618,8 +615,8 @@ func TestCommitDeleteSweepsLocalDistributeReference(t *testing.T) {
 	if !slices.Equal(pol.evaled, []string{targetURI, refKey}) {
 		t.Fatalf("policy evaluated on %v, want [%s %s]", pol.evaled, targetURI, refKey)
 	}
-	if !slices.Equal(kvs.addedSets, []string{chunkline.RemovedItemsKey(dest)}) {
-		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, chunkline.RemovedItemsKey(dest))
+	if !slices.Equal(kvs.addedSets, []string{usecase.RemovedItemsKey(dest)}) {
+		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, usecase.RemovedItemsKey(dest))
 	}
 	if len(repo.txs) != 1 || !repo.txs[0].committed {
 		t.Fatalf("unexpected tx state: %+v", repo.txs)
@@ -665,8 +662,8 @@ func TestCommitDeleteRemoteTargetSweepsLocalReference(t *testing.T) {
 	if !slices.Equal(pol.evaled, []string{refKey}) {
 		t.Fatalf("policy evaluated on %v, want [%s]", pol.evaled, refKey)
 	}
-	if !slices.Equal(kvs.addedSets, []string{chunkline.RemovedItemsKey(dest)}) {
-		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, chunkline.RemovedItemsKey(dest))
+	if !slices.Equal(kvs.addedSets, []string{usecase.RemovedItemsKey(dest)}) {
+		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, usecase.RemovedItemsKey(dest))
 	}
 	if len(repo.txs) != 1 || !repo.txs[0].committed {
 		t.Fatalf("commitlog must be kept for a delete that acted locally, got %+v", repo.txs)

@@ -57,7 +57,7 @@ func TestQueryOrderByValidation(t *testing.T) {
 			repo := &queryRecordRepo{}
 			h := &Handler{
 				config: cfg,
-				record: record.New(repo, nil, nil, &cfg, nil, nil, nil, nil, nil),
+				record: record.New(repo, nil, &cfg, nil, nil, nil, nil, nil),
 			}
 
 			e := echo.New()
@@ -77,7 +77,7 @@ func TestQueryOrderByKeyPassesKeyCursors(t *testing.T) {
 	repo := &queryRecordRepo{}
 	h := &Handler{
 		config: cfg,
-		record: record.New(repo, nil, nil, &cfg, nil, nil, nil, nil, nil),
+		record: record.New(repo, nil, &cfg, nil, nil, nil, nil, nil),
 	}
 
 	e := echo.New()

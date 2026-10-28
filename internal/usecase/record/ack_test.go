@@ -23,7 +23,7 @@ const followSchema = "https://example.com/follow.json"
 // mapResidenceRepo serves one entity per ccid, so an ack's author and target
 // can live on different domains.
 type mapResidenceRepo struct {
-	EntityRepository
+	entityLookups
 	entities map[string]*domain.Entity
 }
 
@@ -88,10 +88,9 @@ func derivedAcked(t *testing.T, ack concrnt.SignedDocument) concrnt.SignedDocume
 	return derived
 }
 
-func newAckUsecase(cfg *domain.Config, repo Repository, residence EntityRepository, delivery usecase.JobQueue) *Usecase {
+func newAckUsecase(cfg *domain.Config, repo Repository, residence entityLookups, delivery usecase.JobQueue) *Usecase {
 	return New(
-		repo,
-		residence,
+		withEntities{repo, residence},
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,

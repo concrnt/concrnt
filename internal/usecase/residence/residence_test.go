@@ -8,6 +8,7 @@ import (
 
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // encodeMetaInfo turns the client-supplied registration meta (any JSON value,
@@ -48,7 +49,7 @@ func TestEncodeMetaInfo(t *testing.T) {
 // registrationResidenceRepo serves a fixed meta (or an error) and records
 // UpdateMetaInfo calls without touching inviter.
 type registrationResidenceRepo struct {
-	Repository
+	record.Repository
 	meta    *domain.EntityMeta
 	metaErr error
 }
@@ -164,7 +165,7 @@ func TestRegistrationMeta(t *testing.T) {
 // unregisterResidenceRepo records the order of gc-flag and meta-delete calls
 // and can fail either one.
 type unregisterResidenceRepo struct {
-	Repository
+	record.Repository
 	calls     []string
 	markErr   error
 	deleteErr error

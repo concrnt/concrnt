@@ -8,6 +8,7 @@ import (
 	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -87,6 +88,23 @@ type Repository interface {
 	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
 	// ListCommitLogs returns one page of commit logs ordered by id ascending.
 	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
+
+	// Entities and their local registration state (entity_metas)
+	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
+	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+	SaveMeta(ctx context.Context, meta domain.EntityMeta) error
+	UpdateMetaInfo(ctx context.Context, ccid string, info string) error
+	DeleteMeta(ctx context.Context, ccid string) error
+	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
+	// ListMetas returns every entity meta, or only the one for owner when
+	// owner is non-empty (offline tooling).
+	ListMetas(ctx context.Context, owner string) ([]domain.EntityMeta, error)
+
+	// Chunkline views over record keys
+	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
+	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
+	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.
@@ -156,15 +174,6 @@ type PolicyService interface {
 	Eval(ctx context.Context, req policy.RequestContext, stack []concrnt.Policy, action string, key string) error
 }
 
-// EntityRepository is the slice of the residence repository this usecase
-// needs: residency checks on entity commits and entity lookups. The full
-// residence.Repository embeds it.
-type EntityRepository interface {
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
-	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
-	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
-}
-
 type commitApplyResult struct {
 	result        *concrnt.SignedDocument
 	postProcesses []PostProcessAction
@@ -173,7 +182,6 @@ type commitApplyResult struct {
 
 type Usecase struct {
 	repo   Repository
-	entity EntityRepository
 	server *server.Usecase
 	config *domain.Config
 	client *client.Client
@@ -186,7 +194,6 @@ type Usecase struct {
 
 func New(
 	repo Repository,
-	entity EntityRepository,
 	server *server.Usecase,
 	config *domain.Config,
 	client *client.Client,
@@ -197,7 +204,6 @@ func New(
 ) *Usecase {
 	uc := &Usecase{
 		repo:   repo,
-		entity: entity,
 		server: server,
 		config: config,
 		client: client,

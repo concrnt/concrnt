@@ -1,4 +1,4 @@
-package postgres
+package record
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -18,7 +19,7 @@ import (
 func TestRunInTxRetriesDeadlock(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	defer cleanup()
-	repo := NewRecordRepository(db)
+	repo := New(db, nil, domain.Config{})
 	ctx := context.Background()
 
 	for _, uri := range []string{"cckv://con1dead/a", "cckv://con1dead/b"} {

@@ -107,7 +107,7 @@ var dumpCommitlogCmd = &cobra.Command{
 		// Entity metas carry local-entity registration state (inviter/info) that
 		// is not part of the commit log, and import must restore them before
 		// replaying entity commits. Time filters don't apply to meta; --owner does.
-		metas, err := op.Repos.Residence.ListMetas(ctx, dumpCommitlogOwner)
+		metas, err := op.Repos.Record.ListMetas(ctx, dumpCommitlogOwner)
 		if err != nil {
 			return fmt.Errorf("failed to query entity meta: %w", err)
 		}
