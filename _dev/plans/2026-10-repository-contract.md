@@ -68,8 +68,8 @@
 | C6 | **一意制約は明示** | 契約上の一意性（association の `unique`、ack の `(from,to,schema)`）は、バックエンドが一意インデックスで実装してもよいが、契約の意味論は「同一キーの2件目は no-op / 拒否」として repotest で検証する。 | |
 | C7 | **準拠テストが契約の定義** | `repotest` を通らないバックエンドは契約を満たしていない。契約を変えるときは repotest を先に変える。 | |
 | C8 | **移行はログ再生** | `conctl op dump-commitlog` / `import-commitlog` が全バックエンドで動くこと。 | |
-| C9 | **リポジトリの分離境界 = 実体を別にできる境界** | 2つのリポジトリを別のインターフェースにしてよいのは、「一方を Postgres、他方を Firestore に載せても意味が成立する」場合だけ。同じテーブル／コレクションを前提に動くものは **1つのストア** にまとめる。現状の実体は `Core`（record + residence + chunkline + 旧 maintenance。`commit_logs` / `records` / `record_keys` / `entities` / `entity_metas` / acks / associations を共有）、`Server`（`servers`）、`Notification`（`subscriptions`）、`Abuse`（`abuse_reports`）の4つ。usecase 向けの **狭いインターフェース**（`chunkline.Repository` など）は残してよいが、`repository.Set` と `repotest.Backend` はストア単位で束ね、同じストアの各インターフェースは同じオブジェクトが実装する。 | 「record は Postgres、maintenance は Firestore」のような無意味な構成を型で排除する。 |
-| C10 | **テスト専用コードは本番パッケージに置かない** | テストからしか使わないコードは `_test.go` に閉じ込める。パッケージ間で共有が必要な場合だけ、名前が `test` で終わるパッケージ（`repotest`, `testutil`, `storetest`）に置く。これらのパッケージは非テストファイルから import しない（`go list -deps ./cmd/...` に現れないことをテストで検査）。インターフェース型は `_test.go` に置けないので `repotest` に置き、各バックエンドの実装は自パッケージの `inspect_test.go` に置く。 | 本番バイナリに testify 等のテスト依存をリンクしない。用途が置き場所と名前から読める。 |
+| C9 | **リポジトリの分離境界 = 実体を別にできる境界** | 2つのリポジトリを別のインターフェースにしてよいのは、「一方を Postgres、他方を Firestore に載せても意味が成立する」場合だけ。同じテーブル／コレクションを前提に動くものは **1つのストア** にまとめる。現状の実体は `Record`（record + residence の entity 参照 + chunkline + 旧 maintenance。`commit_logs` / `records` / `record_keys` / `entities` / acks / associations を共有）、`EntityMeta`（`entity_metas`。ccid キーのみで JOIN されず、登録状態の読み書きだけなので別実体に載せられる）、`Server`（`servers`）、`Notification`（`subscriptions`）、`Abuse`（`abuse_reports`）の5つ。PR #114 で確定。usecase 向けの **狭いインターフェース**（`chunkline.Repository` など）は残してよいが、`repository.Set` と `repotest.Backend` はストア単位で束ね、同じストアの各インターフェースは同じオブジェクトが実装する。 | 「record は Postgres、maintenance は Firestore」のような無意味な構成を型で排除する。 |
+| C10 | **テスト専用コードは本番パッケージに置かない** | テストからしか使わないコードは `_test.go` に閉じ込める。パッケージ間で共有が必要な場合だけ、名前が `test` で終わるパッケージ（`repotest`, `testutil`, `storetest`）に置く。これらのパッケージは非テストファイルから import しない（`go list -deps ./cmd/...` に `repotest` / `testutil` / `ory/dockertest` が現れないことをテストで検査。testify 自体は `cosmos-sdk` → `cometbft/types` 経由で既に本番バイナリにリンクされているので検査対象にしない）。インターフェース型は `_test.go` に置けないので `repotest` に置き、各バックエンドの実装は自パッケージの `inspect_test.go` に置く。 | 本番バイナリに testify 等のテスト依存をリンクしない。用途が置き場所と名前から読める。 |
 
 ---
 
@@ -118,7 +118,7 @@
 
 受け入れ条件
 - `go test ./cmd/conctl/...` 成功。
-- `go list -deps ./cmd/concrnt ./cmd/conctl | grep -E "repotest|testutil|testify"` が空。
+- `go list -deps ./cmd/concrnt ./cmd/conctl | grep -E "repotest|testutil|ory/dockertest"` が空（testify は cometbft 経由で既存のため対象外）。
 - `conctl op gc-commitlog --dry-run` 相当の出力が移植前後で一致（件数ベースで手動確認）。
 
 ### T1.4 `repotest` 準拠スイートの導入（Postgres で先に通す）
