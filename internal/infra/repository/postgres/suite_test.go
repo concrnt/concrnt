@@ -19,7 +19,7 @@ func openBackend(t *testing.T) repotest.Backend {
 		Maintenance: NewRecordMaintenanceRepository(db),
 		Residence:   NewResidenceRepository(db, nil, domain.Config{}),
 		Chunkline:   NewChunklineRepository(db),
-		Inspect:     NewInspector(db),
+		Inspect:     newInspector(db),
 	}
 }
 

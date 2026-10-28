@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/repository/inspect"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -50,7 +49,7 @@ func testAckedAcceptIfNewer(t *testing.T, be Backend) {
 			Associate: &associate,
 		})
 	}
-	state := func() inspect.AckState {
+	state := func() AckState {
 		t.Helper()
 		return mustAcked(t, ctx, in, from, to, schema)
 	}

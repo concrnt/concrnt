@@ -11,7 +11,6 @@ import (
 	"github.com/zeebo/xxh3"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/repository/inspect"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -365,7 +364,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 				Associate: &key,
 			})
 		}
-		ackState := func() inspect.AckState {
+		ackState := func() AckState {
 			t.Helper()
 			return mustAck(t, ctx, in, "con1author", "con1owner", ackSchema)
 		}
