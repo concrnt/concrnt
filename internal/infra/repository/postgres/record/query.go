@@ -20,8 +20,10 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
+	// the prefix is a literal (CONTRACT.md): its LIKE metacharacters are
+	// escaped so "it_em" cannot match "items"
 	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false).
-		Where("uri LIKE ?", prefix+"%")
+		Where(`uri LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)

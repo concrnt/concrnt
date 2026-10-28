@@ -794,6 +794,30 @@ func testRecordQueryAuthorFilter(t *testing.T, be Backend) {
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/e2"}, urisOfRows(rows))
 	})
+
+	// the prefix is a literal: "_" in it matches itself only (a raw "%" cannot
+	// appear in a key, so only "_" is observable)
+	t.Run("prefix metacharacters are literal", func(t *testing.T) {
+		for i, key := range []string{parent + "/t_1", parent + "/tx1"} {
+			id := fmt.Sprintf("prefixmeta-%d", i)
+			sd := SignedDocument(t, concrnt.Document[map[string]string]{
+				Kind:      "record",
+				Key:       key,
+				Value:     map[string]string{"body": key},
+				Author:    "con1alice",
+				Schema:    "https://schema.example/item.json",
+				CreatedAt: createdAt.Add(time.Duration(10+i) * time.Second),
+			})
+			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+				_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1alice", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(10+i)*time.Second))
+				return err
+			})
+		}
+
+		rows, err := repo.QueryByPrefix(ctx, parent+"/t_", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/t_1"}, urisOfRows(rows), "underscore must not match any character")
+	})
 }
 
 // CIP-12 §5.3: the hierarchical policy stack is emitted root-first with the
