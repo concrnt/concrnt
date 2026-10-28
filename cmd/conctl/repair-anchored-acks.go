@@ -50,11 +50,7 @@ var repairAnchoredAcksCmd = &cobra.Command{
 		"is a no-op. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
-		db, err := op.RequirePostgres()
-		if err != nil {
-			return err
-		}
-		stats, err := repairAnchoredAcks(cmd.Context(), db, op.GlobalConfig.FQDN, repairAnchoredAcksDryRun)
+		stats, err := repairAnchoredAcks(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairAnchoredAcksDryRun)
 		if err != nil {
 			return err
 		}

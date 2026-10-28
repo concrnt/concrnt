@@ -125,8 +125,8 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   commit-log feed for external followers, `deliver.go` the federation delivery job,
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM), opened through `repository.Open` from `backends.database`, with
-  `repository/repotest` holding the contract suites every backend must pass (see
+  (GORM; `postgres/record` is the record store, the other repositories sit beside it),
+  with `repository/repotest` holding the contract suites every backend must pass (see
   `internal/infra/repository/CONTRACT.md`); `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
@@ -163,8 +163,7 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
 ### Config
 
 `internal/infra/config` loads YAML; see `config.example.yaml` for the full shape
-(`concrnt` domain identity and registration mode, `backends` for the database
-(`database: postgres`, currently the only backend) plus Redis/Memcached,
+(`concrnt` domain identity and registration mode, `backends` for Postgres/Redis/Memcached,
 `observability` tracing, `integrations` for captcha/VAPID keys, `meta` for
 instance branding served via well-known, `additionalWellKnown` for extra static
 `/.well-known/<name>` documents, `services` for pluggable modules).

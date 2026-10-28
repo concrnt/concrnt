@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 
@@ -11,27 +10,14 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/config"
-	"github.com/concrnt/concrnt/internal/infra/repository"
+	"github.com/concrnt/concrnt/internal/infra/database"
 )
 
 type operationContext struct {
 	Config       config.Config
 	GlobalConfig domain.Config
-	// Repos is the persistence backend selected by backends.database.
-	Repos *repository.Set
-	// DB is the raw Postgres handle; nil when the backend is not Postgres.
-	// Operations that still speak SQL must go through RequirePostgres.
-	DB     *gorm.DB
-	Client *client.Client
-}
-
-// RequirePostgres returns the raw SQL handle for operations that are only
-// implemented against Postgres.
-func (o *operationContext) RequirePostgres() (*gorm.DB, error) {
-	if o.DB == nil {
-		return nil, fmt.Errorf("this operation requires backends.database=postgres (current backend: %s)", o.Repos.Name)
-	}
-	return o.DB, nil
+	DB           *gorm.DB
+	Client       *client.Client
 }
 
 func loadConcrntConfig() (config.Config, error) {
@@ -56,30 +42,33 @@ func newOperationContext() (*operationContext, error) {
 
 	globalConfig := conf.DomainConfig()
 
+	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect database: %w", err)
+	}
+
 	cl := client.New(globalConfig.FQDN)
 	if conf.Backends.GatewayAddr != "" {
 		cl.AddHostRemapping(globalConfig.FQDN, conf.Backends.GatewayAddr)
 	}
 
-	repos, err := repository.Open(context.Background(), conf.Backends, repository.Deps{Client: cl, DomainConfig: globalConfig})
-	if err != nil {
-		return nil, err
-	}
-
 	return &operationContext{
 		Config:       conf,
 		GlobalConfig: globalConfig,
-		Repos:        repos,
-		DB:           repos.SQL,
+		DB:           db,
 		Client:       cl,
 	}, nil
 }
 
 func (o *operationContext) Close() error {
-	if o == nil || o.Repos == nil || o.Repos.Close == nil {
+	if o == nil || o.DB == nil {
 		return nil
 	}
-	return o.Repos.Close()
+	sqlDB, err := o.DB.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }
 
 func withOperationContext(run func(cmd *cobra.Command, args []string, op *operationContext) error) func(cmd *cobra.Command, args []string) error {

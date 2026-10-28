@@ -13,6 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
@@ -33,7 +37,6 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
-	"github.com/concrnt/concrnt/internal/infra/repository"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -201,12 +204,21 @@ func main() {
 	}
 	cl.SetUserAgent("concrnt", version)
 
-	repos, err := repository.Open(ctx, conf.Backends, repository.Deps{Client: cl, DomainConfig: domainConfig, Migrate: true})
+	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
 	if err != nil {
-		panic(err.Error())
+		panic("failed to connect database: " + err.Error())
 	}
-	defer repos.Close()
-	slog.Info("database backend ready", slog.String("backend", repos.Name))
+	if err := database.MigratePostgres(db); err != nil {
+		panic("failed to migrate database: " + err.Error())
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		panic("failed to get sql.DB: " + err.Error())
+	}
+	defer sqlDB.Close()
+
+	recordRepo := pgrecord.New(db, cl, domainConfig)
+	entityMetaRepo := postgres.NewEntityMetaRepository(db)
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
@@ -251,12 +263,12 @@ func main() {
 		cl,
 	)
 
-	serverUC := server.New(repos.Server, &domainConfig, softwareInfo, moduleManager, cl)
+	serverUC := server.New(postgres.NewServerRepository(&domainConfig, db, cl), &domainConfig, softwareInfo, moduleManager, cl)
 
-	recordUC := record.New(repos.Record, repos.EntityMeta, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(repos.Record, repos.EntityMeta, recordUC, &domainConfig)
+	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
-	chunklineRepo := repos.Record
+	chunklineRepo := recordRepo
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
@@ -282,7 +294,7 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationUC := notification.New(repos.Notification, redisKVS, notificationPusher)
+	notificationUC := notification.New(postgres.NewNotificationRepository(db), redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
 	workerSub := worker.NewWorkerSubscriber(elector)
@@ -326,7 +338,7 @@ func main() {
 		}
 	}()
 
-	abuseUC := abuse.New(repos.Abuse)
+	abuseUC := abuse.New(postgres.NewAbuseRepository(db))
 
 	var notificationReactor *worker.NotificationReactor
 	if webpushOpts != nil {
@@ -407,17 +419,17 @@ func main() {
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
-	for _, collector := range repos.Collectors {
-		prometheus.MustRegister(collector)
-	}
+	// connection pool usage (go_sql_*): the pool is small, so saturation
+	// and wait time are the first thing to check when everything gets slow
+	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-	// every backend the public API needs gates readiness: the database holds
+	// every backend the public API needs gates readiness: postgres holds
 	// the data, redis carries delivery jobs and realtime events, memcached
 	// serves the timeline chunks. the sweep stays under the kubelet's probe
 	// timeout so a hung backend reads as "down" rather than as a timed-out
 	// probe with no body
 	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add(repos.Name, repos.Ready)
+	readiness.Add("postgres", sqlDB.PingContext)
 	readiness.Add("redis", func(ctx context.Context) error {
 		return redis.Ping(ctx).Err()
 	})

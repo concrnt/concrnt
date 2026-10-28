@@ -90,9 +90,6 @@ type Cluster struct {
 }
 
 type Backends struct {
-	// Database selects the persistence backend; "postgres" is the default
-	// when empty and the only one built in.
-	Database      string `yaml:"database"`
 	PostgresDsn   string `yaml:"postgresDsn"`
 	GatewayAddr   string `yaml:"gatewayAddr"`
 	RedisAddr     string `yaml:"redisAddr"`

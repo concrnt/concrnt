@@ -39,11 +39,7 @@ var repairSingleOwnerCmd = &cobra.Command{
 		"in place for the operator to drop. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
-		db, err := op.RequirePostgres()
-		if err != nil {
-			return err
-		}
-		stats, err := repairSingleOwner(cmd.Context(), db, op.GlobalConfig.FQDN, repairSingleOwnerDryRun)
+		stats, err := repairSingleOwner(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairSingleOwnerDryRun)
 		if err != nil {
 			return err
 		}

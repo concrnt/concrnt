@@ -2,8 +2,8 @@
 
 The usecase packages (`internal/usecase/*`) declare the `Repository`
 interfaces; every backend under `internal/infra/repository/<name>`
-implements exactly those, and `repository.Open` picks one from
-`backends.database`. The contract is the interfaces plus the invariants
+implements exactly those; `main.go` wires the implementations by hand (backend
+selection is a later step). The contract is the interfaces plus the invariants
 below. What a backend does internally (SQL joins, cascades, serial ids) is
 its own business as long as the contract's meaning never depends on it.
 
@@ -30,9 +30,8 @@ its own business as long as the contract's meaning never depends on it.
    where only one backend passes.
 3. If a backend issues a new query shape, add it to the shape registry and
    update the backend's index definitions; the shape test fails on drift.
-4. Offline tooling (`conctl`) talks to the repositories in `repository.Set`;
-   a command that needs SQL goes through `op.RequirePostgres()` and is
-   documented as Postgres-only.
+4. Offline tooling (`conctl`) builds the repositories it needs over `op.DB`;
+   a command that speaks SQL directly is documented as Postgres-only.
 
 ## Running the suites
 
