@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,7 +191,7 @@ func TestRedisJobQueue_ScanDLQPagesAndKeepsRaw(t *testing.T) {
 		t.Fatalf("ScanDLQ returned %d entries, want %d", len(dead), total)
 	}
 	for i, dl := range dead {
-		if i > 0 && dl.StreamID <= dead[i-1].StreamID {
+		if i > 0 && !streamIDAfter(t, dl.StreamID, dead[i-1].StreamID) {
 			t.Fatalf("entry %d (%s) is not after entry %d (%s)", i, dl.StreamID, i-1, dead[i-1].StreamID)
 		}
 		if i == 7 {
@@ -335,4 +336,28 @@ func TestRedisJobQueue_ReportsLoopHeartbeats(t *testing.T) {
 	if stalled := watchdog.Stalled(time.Now().Add(time.Hour)); len(stalled) != 0 {
 		t.Fatalf("stopped loops must release their heartbeat: %v", stalled)
 	}
+}
+
+// streamIDAfter orders two Redis stream ids ("<ms>-<seq>") numerically; the
+// string order breaks once ten entries share a millisecond ("-10" < "-9").
+func streamIDAfter(t *testing.T, a, b string) bool {
+	t.Helper()
+	parse := func(id string) (int64, int64) {
+		ms, seq, ok := strings.Cut(id, "-")
+		if !ok {
+			t.Fatalf("malformed stream id %q", id)
+		}
+		m, err := strconv.ParseInt(ms, 10, 64)
+		if err != nil {
+			t.Fatalf("malformed stream id %q: %v", id, err)
+		}
+		n, err := strconv.ParseInt(seq, 10, 64)
+		if err != nil {
+			t.Fatalf("malformed stream id %q: %v", id, err)
+		}
+		return m, n
+	}
+	am, as := parse(a)
+	bm, bs := parse(b)
+	return am > bm || (am == bm && as > bs)
 }
