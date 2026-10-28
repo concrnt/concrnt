@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/zeebo/xxh3"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -29,6 +31,10 @@ func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("CreateRecordFreshKeyConditionalUpsert", func(t *testing.T) { testCreateRecordFreshKeyConditionalUpsert(t, open(t)) })
 	t.Run("GetAllCommitLogsByOwner", func(t *testing.T) { testGetAllCommitLogsByOwner(t, open(t)) })
 	t.Run("QueryByParentOrderByKey", func(t *testing.T) { testRecordQueryByParentOrderByKey(t, open(t)) })
+	t.Run("HasCommitLog", func(t *testing.T) { testHasCommitLog(t, open(t)) })
+	t.Run("GetSignedDocumentByCCFS", func(t *testing.T) { testGetSignedDocumentByCCFS(t, open(t)) })
+	t.Run("GetDistributions", func(t *testing.T) { testGetDistributions(t, open(t)) })
+	t.Run("GetEntityByCCIDAndAlias", func(t *testing.T) { testGetEntityByCCIDAndAlias(t, open(t)) })
 }
 
 func testRecordWrites(t *testing.T, be Backend) {
@@ -607,6 +613,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		base + "/a/b",                    // grandchild
 		base + "2",                       // sibling sharing the string prefix — never in the subtree
 		"cckv://con1owner/lists/it_em/x", // LIKE-metacharacter decoy: '_' matches any char unescaped
+		"cckv://con1owner/lists/ITEM/y",  // case decoy: keys are case-sensitive
 	}
 	createdAt := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
 	for i, key := range keys {
@@ -670,6 +677,12 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		require.Equal(t, []string{"cckv://con1owner/lists/it_em/x"}, urisOf(sds))
 	})
 
+	t.Run("case differs, subtree differs", func(t *testing.T) {
+		sds, err := repo.QueryRecordSubtree(ctx, "cckv://con1owner/lists/ITEM", true)
+		require.NoError(t, err)
+		require.Equal(t, []string{"cckv://con1owner/lists/ITEM/y"}, urisOf(sds))
+	})
+
 	t.Run("subtree delete removes exactly the enumerated keys", func(t *testing.T) {
 		sds, err := repo.QueryRecordSubtree(ctx, base, true)
 		require.NoError(t, err)
@@ -701,7 +714,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		require.False(t, associationExists(t, ctx, in, "subtree-association"))
 
 		// siblings and decoys survive
-		for i := 3; i < 5; i++ {
+		for i := 3; i < 6; i++ {
 			require.True(t, recordExists(t, ctx, in, fmt.Sprintf("subtree-%d", i)), "record %d must survive", i)
 		}
 
@@ -1126,4 +1139,187 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows), "placeholders stay out of the createdAt listing")
 	})
+}
+
+func testHasCommitLog(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	has, err := repo.HasCommitLog(ctx, "has-1")
+	require.NoError(t, err)
+	require.False(t, has)
+
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+		// a duplicate id is a silent no-op
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	has, err = repo.HasCommitLog(ctx, "has-1")
+	require.NoError(t, err)
+	require.True(t, has)
+	require.Equal(t, "{}", mustCommit(t, ctx, be.Inspect, "has-1").Document, "the first write wins")
+
+	// a rolled-back write leaves nothing behind
+	InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-2", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+	has, err = repo.HasCommitLog(ctx, "has-2")
+	require.NoError(t, err)
+	require.False(t, has)
+}
+
+// A ccfs URI resolves through the commit log: the document comes back with
+// its CCKV filled in when a key currently points at it, and without one
+// otherwise (a commit that never was or no longer is a record). A cckv
+// placeholder key and an unknown id are not found; a non-concrnt ccfs type
+// is not found either.
+func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	key := "cckv://con1owner/notes/n1"
+	createdAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	sd := SignedDocument(t, concrnt.Document[map[string]string]{
+		Kind:      "record",
+		Key:       key,
+		Value:     map[string]string{"body": "n1"},
+		Author:    "con1owner",
+		Schema:    "https://schema.example/note.json",
+		CreatedAt: createdAt,
+	})
+	WithCommit(t, ctx, repo, "ccfs-record", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		_, err := repo.CreateRecord(ctx, tx, "ccfs-record", key, "con1owner", "con1owner", "https://schema.example/note.json", nil, nil, []string{}, nil, createdAt)
+		return err
+	})
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "ccfs-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	ccfs := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-record")
+	got, err := repo.GetSignedDocument(ctx, ccfs)
+	require.NoError(t, err)
+	require.Equal(t, sd.Document, got.Document)
+	require.Equal(t, sd.Proof, got.Proof)
+	require.NotNil(t, got.CCFS)
+	require.Equal(t, ccfs, *got.CCFS)
+	require.NotNil(t, got.CCKV)
+	require.Equal(t, key, *got.CCKV)
+
+	// the cckv side fills in the ccfs too
+	got, err = repo.GetSignedDocument(ctx, key)
+	require.NoError(t, err)
+	require.NotNil(t, got.CCFS)
+	require.Equal(t, ccfs, *got.CCFS)
+
+	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-keyless")
+	got, err = repo.GetSignedDocument(ctx, keyless)
+	require.NoError(t, err)
+	require.Equal(t, "{}", got.Document)
+	require.Nil(t, got.CCKV, "a commit no key points at has no cckv")
+
+	_, err = repo.GetSignedDocument(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-unknown"))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown id must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "cckv://con1owner/notes")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "a placeholder key must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "cckv://con1owner/notes/none")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "an unknown key must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "ccfs://con1owner/"+concrnt.CCFSTypeBlob+"/"+strings.Repeat("0", 64))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "a non-concrnt ccfs type must be not found, got %v", err)
+}
+
+// GetDistributions reads the record's distribution list by key or by id;
+// an unknown uri is not found and a record without distributions yields an
+// empty list.
+func testGetDistributions(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	seed := func(id, key string, distributions []string) {
+		t.Helper()
+		sd := SignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:        "record",
+			Key:         key,
+			Value:       map[string]string{"id": id},
+			Author:      "con1owner",
+			Schema:      "https://schema.example/post.json",
+			CreatedAt:   createdAt,
+			Distributes: &distributions,
+		})
+		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, distributions, nil, createdAt)
+			return err
+		})
+	}
+	seed("dist-1", "cckv://con1owner/posts/p1", []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"})
+	seed("dist-2", "cckv://con1owner/posts/p2", []string{})
+
+	got, err := repo.GetDistributions(ctx, "cckv://con1owner/posts/p1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"}, got)
+
+	got, err = repo.GetDistributions(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "dist-1"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"}, got)
+
+	got, err = repo.GetDistributions(ctx, "cckv://con1owner/posts/p2")
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	_, err = repo.GetDistributions(ctx, "cckv://con1owner/posts/none")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown key must be not found, got %v", err)
+	_, err = repo.GetDistributions(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "dist-none"))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown id must be not found, got %v", err)
+}
+
+// An entity is read back by ccid or by alias together with the signed
+// document that registered it; unknown lookups are not found.
+func testGetEntityByCCIDAndAlias(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	ccid := "con1entityentityentityentityentityentityen"
+	alias := "alice.example.com"
+	createdAt := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	sd := SignedDocument(t, concrnt.Document[schemas.Entity]{
+		Kind:      "entity",
+		Value:     schemas.Entity{Domain: "example.com"},
+		Author:    ccid,
+		Schema:    schemas.EntityURL,
+		CreatedAt: createdAt,
+	})
+	WithCommit(t, ctx, repo, "entity-lookup", "127.0.0.1", sd, ccid, func(tx record.RepositoryTx) error {
+		applied, err := repo.CreateEntity(ctx, tx, ccid, &alias, "example.com", "entity-lookup", createdAt)
+		require.True(t, applied)
+		return err
+	})
+
+	for _, lookup := range []struct {
+		name string
+		get  func() (*domain.Entity, error)
+	}{
+		{"ccid", func() (*domain.Entity, error) { return repo.GetEntityByCCID(ctx, ccid) }},
+		{"alias", func() (*domain.Entity, error) { return repo.GetEntityByAlias(ctx, alias) }},
+	} {
+		t.Run("by "+lookup.name, func(t *testing.T) {
+			entity, err := lookup.get()
+			require.NoError(t, err)
+			require.Equal(t, ccid, entity.ID)
+			require.Equal(t, "example.com", entity.Domain)
+			require.NotNil(t, entity.Alias)
+			require.Equal(t, alias, *entity.Alias)
+			require.NotNil(t, entity.SignedDocument)
+			require.Equal(t, sd.Document, entity.SignedDocument.Document)
+			require.Equal(t, sd.Proof, entity.SignedDocument.Proof)
+		})
+	}
+
+	_, err := repo.GetEntityByCCID(ctx, "con1nobodynobodynobodynobodynobodynobodyno")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown ccid must be not found, got %v", err)
+	_, err = repo.GetEntityByAlias(ctx, "nobody.example.com")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown alias must be not found, got %v", err)
 }

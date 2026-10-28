@@ -145,3 +145,9 @@ func (i *inspector) AckCount(ctx context.Context) (int64, error) {
 	err := i.db.WithContext(ctx).Model(&models.Ack{}).Count(&count).Error
 	return count, err
 }
+
+func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
+	var count int64
+	err := i.db.WithContext(ctx).Model(&models.AbuseReport{}).Count(&count).Error
+	return count, err
+}

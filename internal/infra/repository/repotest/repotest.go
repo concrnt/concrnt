@@ -17,14 +17,22 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/abuse"
+	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
+	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
-// Backend is one backend under test.
+// Backend is one backend under test. Server, Notification and Abuse are
+// only needed by RunWorldSuite; Server must be built over the client
+// PeerClient returns.
 type Backend struct {
-	Record     record.Repository
-	EntityMeta usecase.EntityMetaRepository
-	Inspect    Inspector
+	Record       record.Repository
+	EntityMeta   usecase.EntityMetaRepository
+	Server       server.Repository
+	Notification notification.Repository
+	Abuse        abuse.Repository
+	Inspect      Inspector
 }
 
 // Inspector exposes the stored state behind the repository interfaces; each
@@ -54,6 +62,8 @@ type Inspector interface {
 	Acked(ctx context.Context, from, to, schema string) (*AckState, error)
 	// AckCount counts every acker-side ack state held, valid or not.
 	AckCount(ctx context.Context) (int64, error)
+	// AbuseReportCount counts the abuse reports stored.
+	AbuseReportCount(ctx context.Context) (int64, error)
 }
 
 // CommitState is one commit log entry.
