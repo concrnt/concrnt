@@ -72,7 +72,11 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 	attempt := func(id, kind string, createdAt time.Time) bool {
 		t.Helper()
 		sd := mirror(kind, createdAt)
-		tx, err := repo.BeginTx(ctx)
+		mtx, err := beginTx(ctx, repo)
+		var tx record.RepositoryTx
+		if mtx != nil {
+			tx = mtx.tx
+		}
 		require.NoError(t, err)
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, to))
 		transition := repo.Acknowledged
@@ -81,7 +85,7 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 		}
 		applied, err := transition(ctx, tx, id, from, to, schema, createdAt)
 		require.NoError(t, err)
-		require.NoError(t, tx.Rollback(ctx))
+		require.NoError(t, mtx.Rollback(ctx))
 		return applied
 	}
 

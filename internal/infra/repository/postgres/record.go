@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lib/pq"
 	"go.opentelemetry.io/otel/trace"
 	"gorm.io/gorm"
@@ -33,20 +34,39 @@ func NewRecordRepository(db *gorm.DB) record.Repository {
 	return &RecordRepository{db: db}
 }
 
-func (r *RecordRepository) BeginTx(ctx context.Context) (record.RepositoryTx, error) {
-	tx := r.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		return nil, tx.Error
+func (*recordTx) IsRepositoryTx() {}
+
+const (
+	txMaxAttempts  = 8
+	txBackoffStart = 10 * time.Millisecond
+	txBackoffMax   = 500 * time.Millisecond
+)
+
+// isRetryableTxError reports serialization_failure / deadlock_detected, the
+// two outcomes Postgres asks the client to retry from scratch.
+func isRetryableTxError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
+func (r *RecordRepository) RunInTx(ctx context.Context, fn func(tx record.RepositoryTx) error) error {
+	backoff := txBackoffStart
+	for attempt := 1; ; attempt++ {
+		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			return fn(&recordTx{tx: tx})
+		})
+		if err == nil || !isRetryableTxError(err) || attempt >= txMaxAttempts {
+			return err
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(ctx.Err(), err)
+		case <-timer.C:
+		}
+		backoff = min(backoff*2, txBackoffMax)
 	}
-	return &recordTx{tx: tx}, nil
-}
-
-func (tx *recordTx) Commit(ctx context.Context) error {
-	return tx.tx.WithContext(ctx).Commit().Error
-}
-
-func (tx *recordTx) Rollback(ctx context.Context) error {
-	return tx.tx.WithContext(ctx).Rollback().Error
 }
 
 func getRecordTx(ctx context.Context, tx record.RepositoryTx) (*gorm.DB, error) {

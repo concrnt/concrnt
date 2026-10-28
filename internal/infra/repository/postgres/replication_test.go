@@ -36,10 +36,14 @@ func TestQueryCommitLogs(t *testing.T) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: time.Now(),
 		})
-		tx, err := repo.BeginTx(ctx)
+		mtx, err := beginTx(ctx, repo)
+		var tx record.RepositoryTx
+		if mtx != nil {
+			tx = mtx.tx
+		}
 		require.NoError(t, err)
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, owner))
-		require.NoError(t, tx.Commit(ctx))
+		require.NoError(t, mtx.Commit(ctx))
 	}
 	seed("a-1", userA)
 	seed("b-1", userB)

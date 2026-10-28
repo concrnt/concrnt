@@ -16,6 +16,10 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
+// errCommitNoop rolls the commit transaction back when the applied document
+// lost accept-if-newer; the stored document is reported instead.
+var errCommitNoop = errors.New("commit no-op")
+
 func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Commit")
 	defer span.End()
@@ -231,23 +235,22 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	//  ** start transatction **
-
-	tx, err := uc.repo.BeginTx(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
+	// applyCommit may be re-run on contention, so external side effects stay
+	// in postProcesses, which run after the transaction.
+	var applyResult *commitApplyResult
+	err = uc.repo.RunInTx(ctx, func(tx RepositoryTx) error {
+		res, err := applyCommit(tx)
+		if err != nil {
+			return err
 		}
-	}()
-
-	applyResult, err := applyCommit(tx)
-	if err != nil {
+		applyResult = res
+		if res.noop {
+			// the losing commit's log entry must not persist
+			return errCommitNoop
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errCommitNoop) {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -257,12 +260,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
 		return applyResult.result, nil
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	committed = true
 
 	// A same-key overwrite or delete must be visible to this server's own
 	// verification paths immediately, not after the resource cache's TTL:
