@@ -72,7 +72,7 @@ func TestQueryOrderByKey(t *testing.T) {
 	}
 
 	newUsecase := func(repo *queryRepo, pol PolicyService) *Usecase {
-		return New(repo, stubResidenceRepo{}, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
+		return New(withEntities{repo, stubResidenceRepo{}}, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
 	}
 
 	t.Run("key-only entries are evaluated as record:read on the key", func(t *testing.T) {

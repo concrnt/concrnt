@@ -13,12 +13,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
 	echomiddleware "github.com/labstack/echo/v4/middleware"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/xinguang/go-recaptcha"
 	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 	"go.opentelemetry.io/otel/trace"
@@ -34,7 +37,6 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -196,15 +198,27 @@ func main() {
 	buildInfo.Set(1)
 	prometheus.MustRegister(buildInfo)
 
+	cl := client.New(domainConfig.FQDN)
+	if conf.Backends.GatewayAddr != "" {
+		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
+	}
+	cl.SetUserAgent("concrnt", version)
+
 	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
 	if err != nil {
-		panic("failed to connect database")
+		panic("failed to connect database: " + err.Error())
 	}
-
-	err = database.MigratePostgres(db)
+	if err := database.MigratePostgres(db); err != nil {
+		panic("failed to migrate database: " + err.Error())
+	}
+	sqlDB, err := db.DB()
 	if err != nil {
-		panic("failed to migrate database")
+		panic("failed to get sql.DB: " + err.Error())
 	}
+	defer sqlDB.Close()
+
+	recordRepo := pgrecord.New(db, cl, domainConfig)
+	entityMetaRepo := postgres.NewEntityMetaRepository(db)
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
@@ -236,12 +250,6 @@ func main() {
 		elector = cluster.AlwaysLeader{}
 	}
 
-	cl := client.New(domainConfig.FQDN)
-	if conf.Backends.GatewayAddr != "" {
-		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
-	}
-	cl.SetUserAgent("concrnt", version)
-
 	moduleManager := service.NewModuleManager(rest.Endpoints, conf.Services)
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
@@ -255,15 +263,12 @@ func main() {
 		cl,
 	)
 
-	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
-	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
+	serverUC := server.New(postgres.NewServerRepository(&domainConfig, db, cl), &domainConfig, softwareInfo, moduleManager, cl)
 
-	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
-	recordRepo := postgres.NewRecordRepository(db)
-	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
+	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
-	chunklineRepo := postgres.NewChunklineRepository(db)
+	chunklineRepo := recordRepo
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
@@ -289,8 +294,7 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := postgres.NewNotificationRepository(db)
-	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
+	notificationUC := notification.New(postgres.NewNotificationRepository(db), redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
 	workerSub := worker.NewWorkerSubscriber(elector)
@@ -334,8 +338,7 @@ func main() {
 		}
 	}()
 
-	abuseRepo := postgres.NewAbuseRepository(db)
-	abuseUC := abuse.New(abuseRepo)
+	abuseUC := abuse.New(postgres.NewAbuseRepository(db))
 
 	var notificationReactor *worker.NotificationReactor
 	if webpushOpts != nil {
@@ -415,11 +418,6 @@ func main() {
 	internal.HidePort = true
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
-	}
 
 	// connection pool usage (go_sql_*): the pool is small, so saturation
 	// and wait time are the first thing to check when everything gets slow

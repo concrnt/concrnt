@@ -81,7 +81,9 @@ go test ./... -run TestName -v                   # a single test
 ```
 
 `go build` / `go vet` / `go test` are the tools of record; there is no Makefile or lint
-config. `cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
+config. `.github/workflows/test.yml` runs `go vet ./...` and `go test ./... -count=1`
+(dockertest included) on every pull request and on pushes to `develop`.
+`cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
 (`.github/workflows/docker-publish.yml`), which publishes multi-arch images on `v*.*.*`
 tags and pushes to `main`.
 
@@ -111,16 +113,21 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `server`, `notification`, `subscription`, `chunkline`, `abuse`), each exposing
   `Usecase`/`New` plus the repository/gateway interfaces only it needs; infra packages
   satisfy these interfaces structurally. The parent package holds only the ports shared
-  across concerns (`JobQueue`, `KVS`). `record` is the hub: `residence` builds on it (its
-  `Repository` embeds `record.EntityRepository`), and `record` depends on `server` (remote
-  server resolution) and `chunkline` (removed-item advertisements). Inside `record`,
+  across concerns (`JobQueue`, `KVS`, the removed-item kvs keys). `record` is the hub:
+  `record.Repository` is the single store interface for commit log, records, entities and
+  the chunkline views (one set of tables, so one repository — `CONTRACT.md` C9), while
+  the registration state (`entity_metas`, keyed by ccid and never joined) is its own
+  `usecase.EntityMetaRepository`; `residence` and `chunkline` build on `record`, and
+  `record` depends on `server` (remote server resolution). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
   `delete.go`); `read.go`/`query.go` are the read paths, `replication.go` the paged
   commit-log feed for external followers, `deliver.go` the federation delivery job,
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  (GORM; `postgres/record` is the record store, the other repositories sit beside it),
+  with `repository/repotest` holding the contract suites every backend must pass (see
+  `internal/infra/repository/CONTRACT.md`); `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).

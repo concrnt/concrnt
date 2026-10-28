@@ -13,7 +13,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/chunkline"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/policy"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -360,7 +360,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					span.RecordError(err) // non-fatal: the deleted item just lingers in caches
 				} else if tl != "" {
 					postProcesses = append(postProcesses, func(ctx context.Context) error {
-						return uc.kvs.SetAdd(ctx, chunkline.RemovedItemsKey(tl), id, chunkline.RemovedItemsTTL)
+						return uc.kvs.SetAdd(ctx, usecase.RemovedItemsKey(tl), id, usecase.RemovedItemsTTL)
 					})
 				}
 			}
@@ -384,7 +384,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		if uc.kvs != nil && removedTimeline != "" {
 			tl, id := removedTimeline, removedItemID
 			postProcesses = append(postProcesses, func(ctx context.Context) error {
-				return uc.kvs.SetAdd(ctx, chunkline.RemovedItemsKey(tl), id, chunkline.RemovedItemsTTL)
+				return uc.kvs.SetAdd(ctx, usecase.RemovedItemsKey(tl), id, usecase.RemovedItemsTTL)
 			})
 		}
 

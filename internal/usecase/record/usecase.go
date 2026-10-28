@@ -8,6 +8,7 @@ import (
 	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -17,8 +18,11 @@ import (
 )
 
 type Repository interface {
-	// Utilities
-	BeginTx(ctx context.Context) (RepositoryTx, error)
+	// RunInTx runs fn atomically. fn may be invoked more than once (a backend
+	// may retry on contention), so it must reach the store only through tx and
+	// must not have side effects of its own. A non-nil error from fn rolls the
+	// transaction back and is returned unchanged.
+	RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error
 
 	// Create / Update
 	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
@@ -68,6 +72,56 @@ type Repository interface {
 	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
+
+	// Offline tooling (conctl gc-commitlog / dump-commitlog)
+
+	// CountGcCandidates counts gc-flagged commit logs whose id sorts below
+	// cutoffID (i.e. whose document is older than the cutoff).
+	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
+	// ListGcCandidates returns up to limit gc-flagged commit logs below
+	// cutoffID in id order, starting after afterID ("" starts from the first).
+	ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]CommitLogEntry, error)
+	// DeleteCommitLogs removes the given commit logs together with every row
+	// that hangs off them (record, record key, ack, acked, association,
+	// entity). Missing ids are ignored; the count of commit logs actually
+	// removed is returned.
+	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
+	// ListCommitLogs returns one page of commit logs ordered by id ascending.
+	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
+
+	// Entities
+	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
+
+	// Chunkline views over record keys
+	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
+	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
+	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
+}
+
+// CommitLogEntry is one commit log row as offline tooling sees it.
+type CommitLogEntry struct {
+	ID       string
+	IP       string
+	Document string
+	Proof    concrnt.Proof
+	Owner    string
+	CDate    time.Time
+}
+
+// CommitLogPage selects a page of commit logs ordered by id ascending. Commit
+// log ids are time-prefixed CDIDs, so id bounds are time bounds.
+type CommitLogPage struct {
+	// FromID is an inclusive lower bound; "" means none. Ignored when AfterID is set.
+	FromID string
+	// AfterID is an exclusive lower bound (the last id of the previous page).
+	AfterID string
+	// UntilID is an inclusive upper bound; "" means none.
+	UntilID string
+	// Owner restricts to commits owned by this ccid; "" means all.
+	Owner string
+	Limit int
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
@@ -96,9 +150,11 @@ type QueryParams struct {
 	Order    string
 }
 
+// RepositoryTx is the opaque per-backend transaction handle passed back into
+// the repository's transactional methods; the usecase never commits or rolls
+// back itself.
 type RepositoryTx interface {
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
+	IsRepositoryTx()
 }
 
 type PostProcessAction func(ctx context.Context) error
@@ -111,15 +167,6 @@ type PolicyService interface {
 	Eval(ctx context.Context, req policy.RequestContext, stack []concrnt.Policy, action string, key string) error
 }
 
-// EntityRepository is the slice of the residence repository this usecase
-// needs: residency checks on entity commits and entity lookups. The full
-// residence.Repository embeds it.
-type EntityRepository interface {
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
-	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
-	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
-}
-
 type commitApplyResult struct {
 	result        *concrnt.SignedDocument
 	postProcesses []PostProcessAction
@@ -128,7 +175,7 @@ type commitApplyResult struct {
 
 type Usecase struct {
 	repo   Repository
-	entity EntityRepository
+	meta   usecase.EntityMetaRepository
 	server *server.Usecase
 	config *domain.Config
 	client *client.Client
@@ -141,7 +188,7 @@ type Usecase struct {
 
 func New(
 	repo Repository,
-	entity EntityRepository,
+	meta usecase.EntityMetaRepository,
 	server *server.Usecase,
 	config *domain.Config,
 	client *client.Client,
@@ -152,7 +199,7 @@ func New(
 ) *Usecase {
 	uc := &Usecase{
 		repo:   repo,
-		entity: entity,
+		meta:   meta,
 		server: server,
 		config: config,
 		client: client,

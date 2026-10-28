@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/usecase/residence"
@@ -81,12 +83,11 @@ var createAccountCmd = &cobra.Command{
 		// 登録制限は適用しない
 		op.GlobalConfig.Registration = "open"
 
-		residenceRepo := postgres.NewResidenceRepository(op.DB, op.Client, op.GlobalConfig)
-		recordRepo := postgres.NewRecordRepository(op.DB)
-		serverRepo := postgres.NewServerRepository(&op.GlobalConfig, op.DB, op.Client)
-		serverUC := server.New(serverRepo, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
-		recordUC := record.New(recordRepo, residenceRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
-		residenceUC := residence.New(residenceRepo, recordUC, &op.GlobalConfig)
+		recordRepo := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
+		metaRepo := postgres.NewEntityMetaRepository(op.DB)
+		serverUC := server.New(postgres.NewServerRepository(&op.GlobalConfig, op.DB, op.Client), &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
+		recordUC := record.New(recordRepo, metaRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
+		residenceUC := residence.New(recordRepo, metaRepo, recordUC, &op.GlobalConfig)
 
 		if err := residenceUC.Register(cmd.Context(), "", req); err != nil {
 			return fmt.Errorf("failed to create account: %w", err)
@@ -95,7 +96,7 @@ var createAccountCmd = &cobra.Command{
 		// Registerはinviterをinviteトークンからのみ導出するため、管理者が
 		// 明示した--inviterはここで直接metaへ反映する(conctlはDB直結の信頼経路)
 		if inviter != nil {
-			if err := residenceRepo.SaveMeta(cmd.Context(), domain.EntityMeta{
+			if err := metaRepo.SaveMeta(cmd.Context(), domain.EntityMeta{
 				ID:      identity.CCID,
 				Inviter: inviter,
 				Info:    info,

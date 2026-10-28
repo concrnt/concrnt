@@ -27,7 +27,26 @@ func (stubRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error)
 	return false, nil
 }
 
-type stubResidenceRepo struct{ EntityRepository }
+// entityLookups is the entity slice of Repository the residence fakes serve.
+type entityLookups interface {
+	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+}
+
+// withEntities serves records from Repository and entity lookups from entities.
+type withEntities struct {
+	Repository
+	entities entityLookups
+}
+
+func (w withEntities) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+	return w.entities.GetEntityByCCID(ctx, ccid)
+}
+func (w withEntities) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
+	return w.entities.GetEntityByAlias(ctx, alias)
+}
+
+type stubResidenceRepo struct{ entityLookups }
 
 func (stubResidenceRepo) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
 	return nil, domain.ErrNotFound
@@ -81,10 +100,15 @@ type ackCall struct {
 	createdAt  time.Time
 }
 
-func (r *recordingRecordRepo) BeginTx(ctx context.Context) (RepositoryTx, error) {
+func (r *recordingRecordRepo) RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error {
 	tx := &recordingTx{}
 	r.txs = append(r.txs, tx)
-	return tx, nil
+	if err := fn(tx); err != nil {
+		tx.rolledBack = true
+		return err
+	}
+	tx.committed = true
+	return nil
 }
 func (r *recordingRecordRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
 	r.createdCommitLogs = append(r.createdCommitLogs, id)
@@ -151,7 +175,7 @@ func (r *recordingRecordRepo) QueryByParent(ctx context.Context, parent, schema,
 
 // fixedResidenceRepo serves one pre-existing entity for every lookup.
 type fixedResidenceRepo struct {
-	EntityRepository
+	entityLookups
 	entity *domain.Entity
 }
 
@@ -264,8 +288,8 @@ func signedCommitDocument(t *testing.T, kind string) concrnt.SignedDocument {
 func TestCommitUnresolvableRequesterReturnsError(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	uc := New(
-		stubRecordRepo{},
-		stubResidenceRepo{},
+		withEntities{stubRecordRepo{}, stubResidenceRepo{}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -341,12 +365,12 @@ func TestCommitEntityAcceptIfNewer(t *testing.T) {
 			repo := &recordingRecordRepo{storedCreatedAt: tc.storedAt}
 			cfg := &domain.Config{FQDN: "example.com"}
 			uc := New(
-				repo,
-				fixedResidenceRepo{entity: &domain.Entity{
+				withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{
 					ID:             ccid,
 					Domain:         "remote.example.net",
 					SignedDocument: &stored,
-				}},
+				}}},
+				nil,
 				newTestServerUsecase(cfg),
 				cfg,
 				nil,
@@ -526,8 +550,8 @@ func TestCommitDocumentReferenceInlineTargetOffline(t *testing.T) {
 	repo := &recordingRecordRepo{}
 	cfg := &domain.Config{FQDN: "example.com"}
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil, // no client: verification must not need the network
@@ -581,8 +605,8 @@ func signedRecord(t *testing.T, ccid, privKeyHex string, createdAt time.Time) co
 // resolvable, so a plain record commit reaches the repository.
 func newRecordCommitUsecase(ccid string, cfg *domain.Config, repo Repository, store usecase.KVS) *Usecase {
 	return New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -675,8 +699,8 @@ func TestCommitEntityBackdateExemptRequiresDirectProof(t *testing.T) {
 	}
 	newEntityUsecase := func(repo Repository) *Usecase {
 		return New(
-			repo,
-			fixedResidenceRepo{},
+			withEntities{repo, fixedResidenceRepo{}},
+			nil,
 			newTestServerUsecase(cfg),
 			cfg,
 			nil,
@@ -1024,8 +1048,8 @@ func TestCommitUpdateEvaluatesStoredSelf(t *testing.T) {
 	repo := &recordingRecordRepo{storedSD: &stored}
 	pol := &capturingPolicyService{}
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1093,8 +1117,8 @@ func TestCreatedEventMarkedForAnonymous(t *testing.T) {
 		t.Helper()
 		signal := &recordingSignalService{}
 		uc := New(
-			&recordingRecordRepo{},
-			fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+			withEntities{&recordingRecordRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+			nil,
 			newTestServerUsecase(cfg),
 			cfg,
 			nil,
@@ -1183,8 +1207,8 @@ func TestEventNestedReferencesMarkedForAnonymous(t *testing.T) {
 	}
 
 	uc := New(
-		&recordingRecordRepo{},
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities{&recordingRecordRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1261,8 +1285,8 @@ func TestAssociatedEventMarkedForAnonymous(t *testing.T) {
 	pol := &anonymousDenyPolicyService{}
 	delivery := &recordingDeliveryQueue{}
 	uc := New(
-		&associationRecordingRepo{},
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN, SignedDocument: &concrnt.SignedDocument{Document: "{}"}}},
+		withEntities{&associationRecordingRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN, SignedDocument: &concrnt.SignedDocument{Document: "{}"}}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1445,8 +1469,8 @@ func TestCommitEntityRequiresGreenServer(t *testing.T) {
 			cfg := &domain.Config{FQDN: "example.com", Layer: "mainnet"}
 			serverUC := server.New(testServerRepo{server: tc.server}, cfg, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), nil)
 			uc := New(
-				repo,
-				fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}},
+				withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+				nil,
 				serverUC,
 				cfg,
 				nil,
@@ -1485,8 +1509,8 @@ func TestCommitEntityNoneProofSkipsGreenServerCheck(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com", Layer: "mainnet"}
 	unresolvable := server.New(testServerRepo{server: nil}, cfg, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), nil)
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+		nil,
 		unresolvable,
 		cfg,
 		nil,
