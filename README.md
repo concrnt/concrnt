@@ -81,7 +81,9 @@ go test ./... -run TestName -v                   # a single test
 ```
 
 `go build` / `go vet` / `go test` are the tools of record; there is no Makefile or lint
-config. `cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
+config. `.github/workflows/test.yml` runs `go vet ./...` and `go test ./... -count=1`
+(dockertest included) on every pull request and on pushes to `develop`.
+`cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
 (`.github/workflows/docker-publish.yml`), which publishes multi-arch images on `v*.*.*`
 tags and pushes to `main`.
 
