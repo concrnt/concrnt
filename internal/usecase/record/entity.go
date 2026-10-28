@@ -46,7 +46,7 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 
 	if entity.Value.Domain == uc.config.FQDN {
 		// if local, check if author is registered
-		_, err := uc.repo.GetMeta(ctx, entity.Author)
+		_, err := uc.meta.GetMeta(ctx, entity.Author)
 		if err != nil {
 			span.RecordError(err)
 			return nil, errors.New("user is not registered for this domain")

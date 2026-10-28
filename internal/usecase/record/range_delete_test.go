@@ -227,6 +227,7 @@ func signedDelete(t *testing.T, ccid, privKeyHex, target string) concrnt.SignedD
 func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery usecase.JobQueue, kvs usecase.KVS) *Usecase {
 	return New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
@@ -487,6 +488,7 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 	}}
 	uc := New(
 		withEntities{repo, fixedResidenceRepo{entity: &requester}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),

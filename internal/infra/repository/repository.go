@@ -19,6 +19,7 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -28,6 +29,7 @@ import (
 // Set bundles the persistence adapters of one backend.
 type Set struct {
 	Record       record.Repository
+	EntityMeta   usecase.EntityMetaRepository
 	Server       server.Repository
 	Notification notification.Repository
 	Abuse        abuse.Repository
@@ -83,6 +85,7 @@ func openPostgres(conf config.Backends, deps Deps) (*Set, error) {
 	domainConfig := deps.DomainConfig
 	return &Set{
 		Record:       pgrecord.New(db, deps.Client, domainConfig),
+		EntityMeta:   postgres.NewEntityMetaRepository(db),
 		Server:       postgres.NewServerRepository(&domainConfig, db, deps.Client),
 		Notification: postgres.NewNotificationRepository(db),
 		Abuse:        postgres.NewAbuseRepository(db),

@@ -81,8 +81,8 @@ var createAccountCmd = &cobra.Command{
 		op.GlobalConfig.Registration = "open"
 
 		serverUC := server.New(op.Repos.Server, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
-		recordUC := record.New(op.Repos.Record, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
-		residenceUC := residence.New(op.Repos.Record, recordUC, &op.GlobalConfig)
+		recordUC := record.New(op.Repos.Record, op.Repos.EntityMeta, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
+		residenceUC := residence.New(op.Repos.Record, op.Repos.EntityMeta, recordUC, &op.GlobalConfig)
 
 		if err := residenceUC.Register(cmd.Context(), "", req); err != nil {
 			return fmt.Errorf("failed to create account: %w", err)
@@ -91,7 +91,7 @@ var createAccountCmd = &cobra.Command{
 		// Registerはinviterをinviteトークンからのみ導出するため、管理者が
 		// 明示した--inviterはここで直接metaへ反映する(conctlはDB直結の信頼経路)
 		if inviter != nil {
-			if err := op.Repos.Record.SaveMeta(cmd.Context(), domain.EntityMeta{
+			if err := op.Repos.EntityMeta.SaveMeta(cmd.Context(), domain.EntityMeta{
 				ID:      identity.CCID,
 				Inviter: inviter,
 				Info:    info,

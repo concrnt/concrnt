@@ -91,6 +91,7 @@ func derivedAcked(t *testing.T, ack concrnt.SignedDocument) concrnt.SignedDocume
 func newAckUsecase(cfg *domain.Config, repo Repository, residence entityLookups, delivery usecase.JobQueue) *Usecase {
 	return New(
 		withEntities{repo, residence},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,

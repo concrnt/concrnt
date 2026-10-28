@@ -102,7 +102,7 @@ func TestReplicateReadAccess(t *testing.T) {
 	}
 
 	newUsecase := func(repo *replicationRepo, pol PolicyService) *Usecase {
-		return New(withEntities{repo, stubResidenceRepo{}}, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
+		return New(withEntities{repo, stubResidenceRepo{}}, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
 	}
 
 	t.Run("anonymous requester loses the protected record only", func(t *testing.T) {

@@ -253,8 +253,8 @@ func main() {
 
 	serverUC := server.New(repos.Server, &domainConfig, softwareInfo, moduleManager, cl)
 
-	recordUC := record.New(repos.Record, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(repos.Record, recordUC, &domainConfig)
+	recordUC := record.New(repos.Record, repos.EntityMeta, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(repos.Record, repos.EntityMeta, recordUC, &domainConfig)
 
 	chunklineRepo := repos.Record
 

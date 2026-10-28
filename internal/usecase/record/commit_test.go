@@ -29,7 +29,6 @@ func (stubRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error)
 
 // entityLookups is the entity slice of Repository the residence fakes serve.
 type entityLookups interface {
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
 	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
 }
@@ -40,9 +39,6 @@ type withEntities struct {
 	entities entityLookups
 }
 
-func (w withEntities) GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
-	return w.entities.GetMeta(ctx, ccid)
-}
 func (w withEntities) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
 	return w.entities.GetEntityByCCID(ctx, ccid)
 }
@@ -293,6 +289,7 @@ func TestCommitUnresolvableRequesterReturnsError(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	uc := New(
 		withEntities{stubRecordRepo{}, stubResidenceRepo{}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -373,6 +370,7 @@ func TestCommitEntityAcceptIfNewer(t *testing.T) {
 					Domain:         "remote.example.net",
 					SignedDocument: &stored,
 				}}},
+				nil,
 				newTestServerUsecase(cfg),
 				cfg,
 				nil,
@@ -553,6 +551,7 @@ func TestCommitDocumentReferenceInlineTargetOffline(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	uc := New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil, // no client: verification must not need the network
@@ -607,6 +606,7 @@ func signedRecord(t *testing.T, ccid, privKeyHex string, createdAt time.Time) co
 func newRecordCommitUsecase(ccid string, cfg *domain.Config, repo Repository, store usecase.KVS) *Usecase {
 	return New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -700,6 +700,7 @@ func TestCommitEntityBackdateExemptRequiresDirectProof(t *testing.T) {
 	newEntityUsecase := func(repo Repository) *Usecase {
 		return New(
 			withEntities{repo, fixedResidenceRepo{}},
+			nil,
 			newTestServerUsecase(cfg),
 			cfg,
 			nil,
@@ -1048,6 +1049,7 @@ func TestCommitUpdateEvaluatesStoredSelf(t *testing.T) {
 	pol := &capturingPolicyService{}
 	uc := New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1116,6 +1118,7 @@ func TestCreatedEventMarkedForAnonymous(t *testing.T) {
 		signal := &recordingSignalService{}
 		uc := New(
 			withEntities{&recordingRecordRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+			nil,
 			newTestServerUsecase(cfg),
 			cfg,
 			nil,
@@ -1205,6 +1208,7 @@ func TestEventNestedReferencesMarkedForAnonymous(t *testing.T) {
 
 	uc := New(
 		withEntities{&recordingRecordRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1282,6 +1286,7 @@ func TestAssociatedEventMarkedForAnonymous(t *testing.T) {
 	delivery := &recordingDeliveryQueue{}
 	uc := New(
 		withEntities{&associationRecordingRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN, SignedDocument: &concrnt.SignedDocument{Document: "{}"}}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -1465,6 +1470,7 @@ func TestCommitEntityRequiresGreenServer(t *testing.T) {
 			serverUC := server.New(testServerRepo{server: tc.server}, cfg, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), nil)
 			uc := New(
 				withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+				nil,
 				serverUC,
 				cfg,
 				nil,
@@ -1504,6 +1510,7 @@ func TestCommitEntityNoneProofSkipsGreenServerCheck(t *testing.T) {
 	unresolvable := server.New(testServerRepo{server: nil}, cfg, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), nil)
 	uc := New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: "remote.example.net"}}},
+		nil,
 		unresolvable,
 		cfg,
 		nil,

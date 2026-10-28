@@ -9,6 +9,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/jwt"
 	"github.com/concrnt/concrnt/schemas"
@@ -16,17 +17,20 @@ import (
 
 type Usecase struct {
 	repo   record.Repository
+	meta   usecase.EntityMetaRepository
 	record *record.Usecase
 	config *domain.Config
 }
 
 func New(
 	repo record.Repository,
+	meta usecase.EntityMetaRepository,
 	record *record.Usecase,
 	config *domain.Config,
 ) *Usecase {
 	return &Usecase{
 		repo:   repo,
+		meta:   meta,
 		record: record,
 		config: config,
 	}
@@ -58,7 +62,7 @@ func (uc *Usecase) Unregister(ctx context.Context) error {
 	}
 
 	// DeleteMetaはmetaが存在しなくてもエラーにしない(冪等)
-	if err := uc.repo.DeleteMeta(ctx, requester.ID); err != nil {
+	if err := uc.meta.DeleteMeta(ctx, requester.ID); err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -80,7 +84,7 @@ func (uc *Usecase) GetRegistration(ctx context.Context) (*domain.EntityMeta, err
 		return nil, err
 	}
 
-	meta, err := uc.repo.GetMeta(ctx, requester.ID)
+	meta, err := uc.meta.GetMeta(ctx, requester.ID)
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			err = errRegistrationNotFound
@@ -121,7 +125,7 @@ func (uc *Usecase) UpdateRegistration(ctx context.Context, meta any) error {
 		return err
 	}
 
-	if err := uc.repo.UpdateMetaInfo(ctx, requester.ID, info); err != nil {
+	if err := uc.meta.UpdateMetaInfo(ctx, requester.ID, info); err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
 			err = errRegistrationNotFound
 		}
@@ -240,7 +244,7 @@ func (uc *Usecase) Register(ctx context.Context, ip string, req concrnt.Register
 		return err
 	}
 
-	err = uc.repo.SaveMeta(ctx, domain.EntityMeta{
+	err = uc.meta.SaveMeta(ctx, domain.EntityMeta{
 		ID:      ccid,
 		Inviter: inviter,
 		Info:    info,

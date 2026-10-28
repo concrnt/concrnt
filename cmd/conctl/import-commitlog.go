@@ -90,7 +90,7 @@ var importCommitlogCmd = &cobra.Command{
 		// 1. Restore entity metas first (directly against the database) so local
 		//    entity commits pass their registration check on the server.
 		if metasPath != "" {
-			residenceRepo := op.Repos.Record
+			metaRepo := op.Repos.EntityMeta
 			f, err := os.Open(metasPath)
 			if err != nil {
 				return fmt.Errorf("failed to open metas file: %w", err)
@@ -114,7 +114,7 @@ var importCommitlogCmd = &cobra.Command{
 					metaOK++
 					continue
 				}
-				if err := residenceRepo.SaveMeta(ctx, meta); err != nil {
+				if err := metaRepo.SaveMeta(ctx, meta); err != nil {
 					failed++
 					fmt.Fprintf(os.Stderr, "metas line %d (%s): failed to save: %v\n", lineNo, meta.ID, err)
 					continue

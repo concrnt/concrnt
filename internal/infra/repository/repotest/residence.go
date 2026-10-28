@@ -12,7 +12,8 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// RunResidenceSuite runs the entity / registration contract tests of record.Repository. open must
+// RunResidenceSuite runs the registration-state (EntityMetaRepository) and
+// unregister contract tests. open must
 // return a fresh, isolated backend per call; it is called once per top-level
 // test.
 func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
@@ -24,7 +25,7 @@ func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
 // clobber inviter) and report NotFound for unregistered ccids.
 func testResidenceUpdateMetaInfo(t *testing.T, be Backend) {
 	ctx := context.Background()
-	repo := be.Record
+	repo := be.EntityMeta
 
 	ccid := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"

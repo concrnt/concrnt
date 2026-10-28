@@ -16,13 +16,15 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // Backend is one backend under test.
 type Backend struct {
-	Record  record.Repository
-	Inspect Inspector
+	Record     record.Repository
+	EntityMeta usecase.EntityMetaRepository
+	Inspect    Inspector
 }
 
 // Inspector exposes the stored state behind the repository interfaces; each

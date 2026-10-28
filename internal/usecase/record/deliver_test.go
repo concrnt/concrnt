@@ -74,6 +74,7 @@ func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, reside
 	queue := &recordingDeliveryQueue{}
 	uc := New(
 		withEntities{repo, residence},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		cl,

@@ -89,17 +89,10 @@ type Repository interface {
 	// ListCommitLogs returns one page of commit logs ordered by id ascending.
 	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
 
-	// Entities and their local registration state (entity_metas)
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
+	// Entities
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
 	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
-	SaveMeta(ctx context.Context, meta domain.EntityMeta) error
-	UpdateMetaInfo(ctx context.Context, ccid string, info string) error
-	DeleteMeta(ctx context.Context, ccid string) error
 	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
-	// ListMetas returns every entity meta, or only the one for owner when
-	// owner is non-empty (offline tooling).
-	ListMetas(ctx context.Context, owner string) ([]domain.EntityMeta, error)
 
 	// Chunkline views over record keys
 	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
@@ -182,6 +175,7 @@ type commitApplyResult struct {
 
 type Usecase struct {
 	repo   Repository
+	meta   usecase.EntityMetaRepository
 	server *server.Usecase
 	config *domain.Config
 	client *client.Client
@@ -194,6 +188,7 @@ type Usecase struct {
 
 func New(
 	repo Repository,
+	meta usecase.EntityMetaRepository,
 	server *server.Usecase,
 	config *domain.Config,
 	client *client.Client,
@@ -204,6 +199,7 @@ func New(
 ) *Usecase {
 	uc := &Usecase{
 		repo:   repo,
+		meta:   meta,
 		server: server,
 		config: config,
 		client: client,
