@@ -91,12 +91,30 @@ type Cluster struct {
 }
 
 type Backends struct {
+	// Database selects the record store: "postgres" (default) or "sqlite".
+	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
+	SQLite        SQLite    `yaml:"sqlite"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
 	RedisAddr     string    `yaml:"redisAddr"`
 	RedisDB       int       `yaml:"redisDB"`
 	MemcachedAddr string    `yaml:"memcachedAddr"`
 	Aggregate     Aggregate `yaml:"aggregate"`
+}
+
+// SQLite configures the sqlite record store.
+type SQLite struct {
+	// Path is the database file (default concrnt.db in the working
+	// directory); ":memory:" is an ephemeral file removed on exit.
+	Path string `yaml:"path"`
+}
+
+// SQLitePath is the configured database file or its default.
+func (b Backends) SQLitePath() string {
+	if b.SQLite.Path == "" {
+		return "concrnt.db"
+	}
+	return b.SQLite.Path
 }
 
 // Aggregate configures the count cache (internal/usecase/aggregate).

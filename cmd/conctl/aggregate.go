@@ -13,7 +13,6 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
-	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -87,7 +86,7 @@ page each; --scan reads the whole commit log for an exact uniform sample.`,
 		if aggregateVerifySample <= 0 {
 			return fmt.Errorf("--sample must be positive")
 		}
-		recordRepo := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
+		recordRepo := op.Record
 		recordUC := record.New(recordRepo, nil, nil, &op.GlobalConfig, op.Client, nil, nil, nil, nil)
 		recordUC.SetAggregates(op.Aggregate)
 

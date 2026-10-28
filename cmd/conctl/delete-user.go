@@ -97,6 +97,9 @@ var deleteUserCmd = &cobra.Command{
 			backup.s3 = s3client
 		}
 
+		if err := op.RequirePostgres(); err != nil {
+			return err
+		}
 		stats, err := deleteUser(ctx, op.DB, ccid, backup, deleteUserDryRun)
 		if err != nil {
 			return err

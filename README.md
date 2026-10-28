@@ -163,11 +163,49 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
 ### Config
 
 `internal/infra/config` loads YAML; see `config.example.yaml` for the full shape
-(`concrnt` domain identity and registration mode, `backends` for Postgres/Redis/Memcached,
-`observability` tracing, `integrations` for captcha/VAPID keys, `meta` for
-instance branding served via well-known, `additionalWellKnown` for extra static
-`/.well-known/<name>` documents, `services` for pluggable modules).
-`domain.Config` is the resulting in-process representation.
+(`concrnt` domain identity and registration mode, `backends` for the record
+store, Redis and Memcached, `observability` tracing, `integrations` for
+captcha/VAPID keys, `meta` for instance branding served via well-known,
+`additionalWellKnown` for extra static `/.well-known/<name>` documents,
+`services` for pluggable modules). `domain.Config` is the resulting in-process
+representation.
+
+### Backends
+
+`backends.database` selects the record store; every repository of the chosen
+backend is wired in `cmd/concrnt/main.go` (and `cmd/conctl`) from that
+backend's package, and every backend passes the same contract suites
+(`internal/infra/repository/repotest`, see `internal/infra/repository/CONTRACT.md`).
+
+- `postgres` (default): `internal/infra/repository/postgres`, GORM over
+  `backends.postgresDsn`. Schema changes are numbered steps in
+  `postgres/migrations.go`, applied at server start.
+- `sqlite`: `internal/infra/repository/sqlite`, `database/sql` over the pure-Go
+  `modernc.org/sqlite`, one file at `backends.sqlite.path` (default
+  `./concrnt.db`). No database server to run, so a single-binary server is
+
+  ```sh
+  # redis and memcached are still required (delivery jobs, realtime events,
+  # timeline chunk cache); their abstraction is out of scope for now
+  docker run -d -p 6379:6379 redis:8
+  docker run -d -p 11211:11211 memcached:1.6-alpine
+  cat > config.yaml <<'EOF'
+  concrnt: { fqdn: localhost, registration: open, layer: concrnt-mainnet, privatekey: "<hex>" }
+  backends: { database: sqlite, sqlite: { path: ./concrnt.db }, redisAddr: "127.0.0.1:6379", memcachedAddr: "127.0.0.1:11211" }
+  EOF
+  CONCRNT_CONFIG=config.yaml go run ./cmd/concrnt
+  ```
+
+  The SQLite contract suites run without Docker:
+  `go test ./internal/infra/repository/sqlite/... -count=1`.
+
+`backends.aggregate` selects where the count caches live (`postgres` table or
+`redis`); see `MIGRATION.md` for the operational notes.
+
+`conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
+`migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,
+`import-commitlog`, `gc-commitlog`, `dump-/import-subscriptions`,
+`aggregate-*`) work on every backend.
 
 ### Migration
 

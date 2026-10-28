@@ -12,15 +12,39 @@ import (
 	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
+	"github.com/concrnt/concrnt/internal/usecase/notification"
+	"github.com/concrnt/concrnt/internal/usecase/record"
+	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
 type operationContext struct {
 	Config       config.Config
 	GlobalConfig domain.Config
+	// DB is the Postgres connection; nil on any other backend. Commands
+	// that speak SQL directly check RequirePostgres first.
 	DB           *gorm.DB
 	Client       *client.Client
 	Aggregate    *aggregate.Usecase
+	Record       record.Repository
+	EntityMeta   usecase.EntityMetaRepository
+	Server       server.Repository
+	Notification notification.Repository
+	close        func() error
+}
+
+// RequirePostgres fails a command that works on the Postgres tables
+// directly when another backend is configured.
+func (o *operationContext) RequirePostgres() error {
+	if o.DB == nil {
+		return fmt.Errorf("this command speaks SQL directly and only runs on the postgres backend (backends.database is %q)", o.Config.Backends.Database)
+	}
+	return nil
 }
 
 func loadConcrntConfig() (config.Config, error) {
@@ -45,40 +69,61 @@ func newOperationContext() (*operationContext, error) {
 
 	globalConfig := conf.DomainConfig()
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect database: %w", err)
-	}
-
 	cl := client.New(globalConfig.FQDN)
 	if conf.Backends.GatewayAddr != "" {
 		cl.AddHostRemapping(globalConfig.FQDN, conf.Backends.GatewayAddr)
 	}
 
-	rdb := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
-	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, db, rdb)
-	if err != nil {
-		return nil, err
+	op := &operationContext{Config: conf, GlobalConfig: globalConfig, Client: cl}
+	// the same backend selection as cmd/concrnt/main.go; conctl never
+	// migrates, the server does that at start
+	switch conf.Backends.Database {
+	case "", "postgres":
+		db, err := database.NewPostgres(conf.Backends.PostgresDsn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect database: %w", err)
+		}
+		op.DB = db
+		op.Record = pgrecord.New(db, cl, globalConfig)
+		op.EntityMeta = postgres.NewEntityMetaRepository(db)
+		op.Server = postgres.NewServerRepository(&globalConfig, db, cl)
+		op.Notification = postgres.NewNotificationRepository(db)
+		op.close = func() error {
+			sqlDB, err := db.DB()
+			if err != nil {
+				return err
+			}
+			return sqlDB.Close()
+		}
+	case "sqlite":
+		lite, err := sqlite.Open(conf.Backends.SQLitePath())
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database: %w", err)
+		}
+		op.Record = sqliterecord.New(lite, cl, globalConfig)
+		op.EntityMeta = sqlite.NewEntityMetaRepository(lite)
+		op.Server = sqlite.NewServerRepository(&globalConfig, lite, cl)
+		op.Notification = sqlite.NewNotificationRepository(lite)
+		op.close = lite.Close
+	default:
+		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite)", conf.Backends.Database)
 	}
 
-	return &operationContext{
-		Config:       conf,
-		GlobalConfig: globalConfig,
-		DB:           db,
-		Client:       cl,
-		Aggregate:    aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas),
-	}, nil
+	rdb := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, op.DB, rdb)
+	if err != nil {
+		op.Close()
+		return nil, err
+	}
+	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
+	return op, nil
 }
 
 func (o *operationContext) Close() error {
-	if o == nil || o.DB == nil {
+	if o == nil || o.close == nil {
 		return nil
 	}
-	sqlDB, err := o.DB.DB()
-	if err != nil {
-		return err
-	}
-	return sqlDB.Close()
+	return o.close()
 }
 
 func withOperationContext(run func(cmd *cobra.Command, args []string, op *operationContext) error) func(cmd *cobra.Command, args []string) error {

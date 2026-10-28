@@ -7,8 +7,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
-
 	"github.com/spf13/cobra"
 )
 
@@ -35,7 +33,7 @@ var dumpSubscriptionsCmd = &cobra.Command{
 			path = "subscriptions-" + time.Now().UTC().Format("20060102T150405Z") + ".jsonl"
 		}
 
-		subscriptions, err := postgres.NewNotificationRepository(op.DB).List(ctx)
+		subscriptions, err := op.Notification.List(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to list subscriptions: %w", err)
 		}

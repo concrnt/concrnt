@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"time"
 
-	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
-
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt/cdid"
@@ -88,7 +86,7 @@ var gcCommitlogCmd = &cobra.Command{
 		// keeping the match strictly older-than. Hash-based ids ('x'-prefixed)
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
-		maint := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
+		maint := op.Record
 
 		if gcCommitlogDryRun {
 			count, err := maint.CountGcCandidates(ctx, cutoff)
