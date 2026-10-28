@@ -65,7 +65,7 @@ func Open(ctx context.Context, conf config.Backends, deps Deps) (*Set, error) {
 	case "", "postgres":
 		return openPostgres(conf, deps)
 	case "firestore":
-		return nil, fmt.Errorf("backends.database %q is not built into this binary yet", conf.Database)
+		return openFirestore(ctx, conf, deps)
 	default:
 		return nil, fmt.Errorf("unknown backends.database %q (expected postgres or firestore)", conf.Database)
 	}
