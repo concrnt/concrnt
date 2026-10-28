@@ -311,20 +311,27 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 			}.String()
 		}
 		refSegment := cdid.MakeHash([]byte(href)).String()
+		refKeys := []string{}
 		for _, dest := range distributionsFromPtr(targetDoc.Distributes) {
 			refKey, err := url.JoinPath(dest, refSegment)
 			if err != nil {
 				slog.Error("failed to join path for distribution sweep", slog.String("destination", dest), slog.String("href", href), slog.String("error", err.Error()))
 				continue
 			}
-
-			refSD, err := uc.repo.GetSignedDocument(ctx, refKey)
-			if errors.Is(err, domain.ErrNotFound) {
-				continue
-			}
+			refKeys = append(refKeys, refKey)
+		}
+		refSDs := map[string]*concrnt.SignedDocument{}
+		if len(refKeys) > 0 {
+			refSDs, err = uc.repo.GetSignedDocuments(ctx, refKeys)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err
+			}
+		}
+		for _, refKey := range refKeys {
+			refSD, ok := refSDs[refKey]
+			if !ok {
+				continue
 			}
 
 			var refDoc concrnt.Document[any]

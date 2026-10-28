@@ -27,7 +27,10 @@ type RecordKey struct {
 	RecordID        *string    `json:"recordID" gorm:"type:text;uniqueIndex"`
 	Record          Record     `json:"record" gorm:"foreignKey:RecordID;references:DocumentID;constraint:OnDelete:CASCADE;"`
 	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone"`
-	CleanOnUpdate   bool       `json:"cleanOnUpdate" gorm:"type:boolean;not null;default:false"`
+	// Redirect is the record's redirect, denormalised so chunkline bodies and
+	// removal lookups never join records
+	Redirect      *string `json:"redirect,omitempty" gorm:"type:text"`
+	CleanOnUpdate bool    `json:"cleanOnUpdate" gorm:"type:boolean;not null;default:false"`
 }
 
 // Indexes: see shapes.All (internal/infra/repository/shapes); unique

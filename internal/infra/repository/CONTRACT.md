@@ -77,9 +77,10 @@ phase 2 (`behavior:` in the PR).
 |---|---|---|
 | `CreateRecord(tx, documentID, key, owner, author, schema, onUpdate, policies, distributions, redirect, createdAt)` | tx; accept-if-newer on `createdAt` per key (equal/older → `false`); creates placeholder parent keys up the chain; `onUpdate != "retain"` forgets the previous generation (record deleted, its commit flagged). The key row carries everything list queries and chunkline need (`recordCreatedAt`, `redirect`, …) so no read has to join the record (C1, T2.4). | keep |
 | `GetSignedDocument(uri)` | get(cckv key) or get(ccfs id); fills both `CCKV` and `CCFS` when known; placeholder key → not found. | keep |
-| `GetSignedDocuments(uris)` | multi-get; missing uris are absent from the map, not an error. Replaces per-item loops in delete / association paths (C1 round-trip budget). | add (T2.4) |
+| `GetSignedDocuments(uris)` | multi-get over a mixed batch of cckv / ccfs URIs; a URI that resolves to nothing is absent from the map, not an error. Replaces the per-destination loop of the delete sweep (C1 round-trip budget). | add (T2.4) |
 | `GetHierarchicalRecordPolicies(uri)` | get(every ancestor key of uri, root first); emits a layer for each level that has a policy or distributes; ccfs input is mapped to its key first. The ancestor set is computed from the URI, not discovered by a join. | keep |
-| `GetDistributions(uri)` | get(key or id) → `distributions`. | keep |
+| `GetHierarchicalRecordPoliciesMulti(uris)` | the same for several cckv URIs with one fetch of the union of their ancestor chains; every input has an entry. A listing checks a whole page with one call (C1 round-trip budget). | add (T2.4) |
+| `GetDistributions(uri)` | — | removed (T2.4): the stored distributions are the document's own `distributes`, which the caller already holds. |
 | `GetTimelineRemoval(keyURI)` | get(key) + get(parent key) → `(parent uri, chunkline item id)`; empty for keys that never appear in a chunkline body. | keep |
 | `DeleteRecordByKey(tx, uri)` | tx; delete the record the key points at (associations targeting the key go with it). | keep |
 | `DeleteRecordByDocumentID(tx, id)` | tx; delete by id. | keep |
@@ -126,7 +127,7 @@ phase 2 (`behavior:` in the PR).
 |---|---|---|
 | `GetChunklineManifest(uri)` | get(key) + eq(parent) order(recordCreatedAt asc) limit 1 → first chunk. | keep |
 | `LookupLocalItrs(uris, chunkID)` | per uri: eq(parent) ∧ range(recordCreatedAt < cutoff), order desc, limit 1 → chunk id. One statement on SQL backends, N bounded point queries elsewhere. | keep |
-| `LoadLocalBody(uri, chunkID)` | eq(parent) ∧ range(recordCreatedAt), order desc; reads only key-side fields (`recordCreatedAt`, `redirect`) — T2.4 removes the record join. | keep |
+| `LoadLocalBody(uri, chunkID)` | eq(parent) ∧ range(recordCreatedAt), order desc; reads only key-side fields (`recordCreatedAt`, `redirect`), never the record. | keep |
 
 ### `usecase.EntityMetaRepository` (`internal/usecase/entitymeta.go`)
 

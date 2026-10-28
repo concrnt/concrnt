@@ -93,6 +93,9 @@ type KeyState struct {
 	RecordID *string
 	// RecordCreatedAt is the createdAt of that document; nil for a placeholder.
 	RecordCreatedAt *time.Time
+	// Redirect is the document's redirect, carried on the key (nil when the
+	// document has none or the key is a placeholder).
+	Redirect *string
 }
 
 // EntityState is one registered entity.

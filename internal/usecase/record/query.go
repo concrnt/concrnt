@@ -3,9 +3,11 @@ package record
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/utils"
@@ -143,20 +145,39 @@ func (uc *Usecase) Query(ctx context.Context, p QueryParams) (concrnt.QueryResul
 
 	items, prev, next := paginateWindow(rows, p.Limit, orderBy)
 
-	filtered := make([]concrnt.SignedDocument, 0, len(items))
-	for _, sd := range items {
+	// one policy fetch for the whole page: the rows' stacks are assembled
+	// from the union of their ancestor chains
+	docs := make([]concrnt.Document[any], len(items))
+	roots := make([]string, len(items))
+	for i, sd := range items {
 		if sd.CCKV == nil {
 			return concrnt.QueryResult{}, errors.New("queried record has no cckv")
 		}
+		doc, root, err := readAccessSubject(*sd.CCKV, sd)
+		if err != nil {
+			return concrnt.QueryResult{}, err
+		}
+		docs[i], roots[i] = doc, root
+	}
+	stacks := map[string][]concrnt.Policy{}
+	if len(roots) > 0 {
+		stacks, err = uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, roots)
+		if err != nil {
+			slog.Warn("query: policy stacks unavailable, evaluating without them", slog.String("error", err.Error()))
+			stacks = map[string][]concrnt.Policy{}
+		}
+	}
 
-		err := uc.checkReadAccess(ctx, *sd.CCKV, sd)
+	requester, _ := ctx.Value(interop.RequesterCtxKey).(domain.Entity)
+	filtered := make([]concrnt.SignedDocument, 0, len(items))
+	for i, sd := range items {
+		err := uc.evalReadAccess(ctx, *sd.CCKV, docs[i], stacks[roots[i]], requester)
 		if err != nil {
 			if errors.Is(err, domain.ErrPermissionDenied) {
 				continue
 			}
 			return concrnt.QueryResult{}, err
 		}
-
 		filtered = append(filtered, sd)
 	}
 

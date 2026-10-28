@@ -33,7 +33,8 @@ func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("QueryByParentOrderByKey", func(t *testing.T) { testRecordQueryByParentOrderByKey(t, open(t)) })
 	t.Run("HasCommitLog", func(t *testing.T) { testHasCommitLog(t, open(t)) })
 	t.Run("GetSignedDocumentByCCFS", func(t *testing.T) { testGetSignedDocumentByCCFS(t, open(t)) })
-	t.Run("GetDistributions", func(t *testing.T) { testGetDistributions(t, open(t)) })
+	t.Run("GetSignedDocuments", func(t *testing.T) { testGetSignedDocuments(t, open(t)) })
+	t.Run("HierarchicalRecordPoliciesMulti", func(t *testing.T) { testHierarchicalRecordPoliciesMulti(t, open(t)) })
 	t.Run("GetEntityByCCIDAndAlias", func(t *testing.T) { testGetEntityByCCIDAndAlias(t, open(t)) })
 }
 
@@ -261,6 +262,12 @@ func testRecordWrites(t *testing.T, be Backend) {
 		require.Equal(t, targetURI, *stored.Redirect)
 		require.Equal(t, "https://schema.example/target.json", stored.Schema)
 		require.True(t, stored.CreatedAt.Equal(targetCreatedAt))
+
+		// the key carries the redirect too (chunkline reads it from the key)
+		refKey := mustRecordKey(t, ctx, in, "cckv://con1owner/timeline/ref-1")
+		require.NotNil(t, refKey.Redirect)
+		require.Equal(t, targetURI, *refKey.Redirect)
+		require.Nil(t, mustRecordKey(t, ctx, in, key).Redirect, "a plain record's key has no redirect")
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
@@ -1269,49 +1276,133 @@ func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
 	require.True(t, errors.Is(err, domain.ErrNotFound), "a non-concrnt ccfs type must be not found, got %v", err)
 }
 
-// GetDistributions reads the record's distribution list by key or by id;
-// an unknown uri is not found and a record without distributions yields an
-// empty list.
-func testGetDistributions(t *testing.T, be Backend) {
+// GetSignedDocuments resolves a mixed batch of cckv and ccfs URIs in one go:
+// each hit carries the same CCKV / CCFS as the single lookup would, misses
+// (unknown keys and ids, placeholder keys, non-concrnt ccfs types) are
+// simply absent, and an empty batch is an empty map.
+func testGetSignedDocuments(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
 
 	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
-	seed := func(id, key string, distributions []string) {
+	seed := func(id, key string) concrnt.SignedDocument {
 		t.Helper()
 		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:        "record",
-			Key:         key,
-			Value:       map[string]string{"id": id},
-			Author:      "con1owner",
-			Schema:      "https://schema.example/post.json",
-			CreatedAt:   createdAt,
-			Distributes: &distributions,
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"id": id},
+			Author:    "con1owner",
+			Schema:    "https://schema.example/post.json",
+			CreatedAt: createdAt,
 		})
 		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, distributions, nil, createdAt)
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
+			return err
+		})
+		return sd
+	}
+	sd1 := seed("multi-1", "cckv://con1owner/posts/p1")
+	sd2 := seed("multi-2", "cckv://con1owner/posts/p2")
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "multi-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	ccfs2 := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-2")
+	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-keyless")
+	uris := []string{
+		"cckv://con1owner/posts/p1",
+		ccfs2,
+		keyless,
+		"cckv://con1owner/posts/none",
+		"cckv://con1owner/posts", // placeholder
+		concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-none"),
+		"ccfs://con1owner/" + concrnt.CCFSTypeBlob + "/" + strings.Repeat("0", 64),
+	}
+	got, err := repo.GetSignedDocuments(ctx, uris)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	p1 := got["cckv://con1owner/posts/p1"]
+	require.NotNil(t, p1)
+	require.Equal(t, sd1.Document, p1.Document)
+	require.Equal(t, sd1.Proof, p1.Proof)
+	require.Equal(t, "cckv://con1owner/posts/p1", *p1.CCKV)
+	require.Equal(t, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-1"), *p1.CCFS)
+
+	p2 := got[ccfs2]
+	require.NotNil(t, p2)
+	require.Equal(t, sd2.Document, p2.Document)
+	require.Equal(t, ccfs2, *p2.CCFS)
+	require.Equal(t, "cckv://con1owner/posts/p2", *p2.CCKV)
+
+	kl := got[keyless]
+	require.NotNil(t, kl)
+	require.Equal(t, "{}", kl.Document)
+	require.Nil(t, kl.CCKV)
+
+	single, err := repo.GetSignedDocument(ctx, ccfs2)
+	require.NoError(t, err)
+	require.Equal(t, single, p2, "the batch result equals the single lookup")
+
+	got, err = repo.GetSignedDocuments(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// The multi variant assembles the same stacks the single lookup does, one
+// per input URI, including URIs with no policies at all.
+func testHierarchicalRecordPoliciesMulti(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	policyJSON := `{"entries":[{"url":"https://example.com/p.json"}]}`
+	dist := []string{"cckv://con1elsewhere/tl"}
+	for i, key := range []string{"cckv://con1multi/l1", "cckv://con1multi/l1/l2", "cckv://con1multi/other"} {
+		id := fmt.Sprintf("multi-policy-%d", i)
+		createdAt := time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC)
+		sd := SignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"body": "x"},
+			Author:    "con1multi",
+			Schema:    "https://schema.example/post.json",
+			CreatedAt: createdAt,
+		})
+		var policies *string
+		var distributions []string
+		switch i {
+		case 0:
+			policies = Ptr(policyJSON)
+		case 1:
+			distributions = dist
+		}
+		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1multi", func(tx record.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1multi", "con1multi", "https://schema.example/post.json", nil, policies, distributions, nil, createdAt)
 			return err
 		})
 	}
-	seed("dist-1", "cckv://con1owner/posts/p1", []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"})
-	seed("dist-2", "cckv://con1owner/posts/p2", []string{})
 
-	got, err := repo.GetDistributions(ctx, "cckv://con1owner/posts/p1")
+	uris := []string{"cckv://con1multi/l1/l2", "cckv://con1multi/l1/l2/l3", "cckv://con1multi/other", "cckv://con1multi/l1/l2"}
+	stacks, err := repo.GetHierarchicalRecordPoliciesMulti(ctx, uris)
 	require.NoError(t, err)
-	require.Equal(t, []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"}, got)
+	require.Len(t, stacks, 3)
+	for _, uri := range uris {
+		single, err := repo.GetHierarchicalRecordPolicies(ctx, uri)
+		require.NoError(t, err)
+		require.Equal(t, single, stacks[uri], "stack of %s", uri)
+	}
+	require.Len(t, stacks["cckv://con1multi/l1/l2"], 2, "l1's policy layer, then l2's distributing layer")
+	require.Equal(t, "cckv://con1multi/l1", stacks["cckv://con1multi/l1/l2"][0].Source)
+	require.Equal(t, "cckv://con1multi/l1/l2", stacks["cckv://con1multi/l1/l2"][1].Source)
+	require.Equal(t, dist, *stacks["cckv://con1multi/l1/l2"][1].VirtualParents)
+	require.Empty(t, stacks["cckv://con1multi/other"])
 
-	got, err = repo.GetDistributions(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "dist-1"))
+	_, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{concrnt.ComposeCCFSURI("con1multi", concrnt.CCFSTypeConcrnt, "multi-policy-0")})
+	require.Error(t, err, "the multi lookup is keyed by cckv")
+
+	stacks, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, nil)
 	require.NoError(t, err)
-	require.Equal(t, []string{"cckv://con1home/timeline", "cckv://con1channel/timeline"}, got)
-
-	got, err = repo.GetDistributions(ctx, "cckv://con1owner/posts/p2")
-	require.NoError(t, err)
-	require.Empty(t, got)
-
-	_, err = repo.GetDistributions(ctx, "cckv://con1owner/posts/none")
-	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown key must be not found, got %v", err)
-	_, err = repo.GetDistributions(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "dist-none"))
-	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown id must be not found, got %v", err)
+	require.Empty(t, stacks)
 }
 
 // An entity is read back by ccid or by alias together with the signed

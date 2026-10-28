@@ -78,6 +78,7 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 	return &repotest.KeyState{
 		RecordID:        key.RecordID,
 		RecordCreatedAt: key.RecordCreatedAt,
+		Redirect:        key.Redirect,
 	}, nil
 }
 

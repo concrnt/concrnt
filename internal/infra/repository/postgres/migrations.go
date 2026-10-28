@@ -30,6 +30,20 @@ var migrations = []migration{
 	{3, "aggregate_entries", func(tx *gorm.DB) error {
 		return tx.Exec(aggpg.Schema).Error
 	}},
+	// chunkline reads come off the key row alone (C1): redirect moves onto
+	// record_keys and record_created_at is filled where it was never set
+	{4, "record_keys_redirect", func(tx *gorm.DB) error {
+		for _, stmt := range []string{
+			`ALTER TABLE record_keys ADD COLUMN IF NOT EXISTS redirect text`,
+			`UPDATE record_keys rk SET redirect = r.redirect FROM records r WHERE rk.record_id = r.document_id AND r.redirect IS NOT NULL AND rk.redirect IS NULL`,
+			`UPDATE record_keys rk SET record_created_at = r.created_at FROM records r WHERE rk.record_id = r.document_id AND rk.record_created_at IS NULL`,
+		} {
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // AutoMigrateTables creates or extends every table from its model (tables,

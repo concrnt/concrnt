@@ -39,6 +39,9 @@ type Repository interface {
 	// Read
 	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
+	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
+	// that resolves to nothing is absent from the map, not an error.
+	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -64,13 +67,15 @@ type Repository interface {
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
+	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
+	// for several cckv URIs at once (one fetch of the union of their
+	// ancestor chains); every input URI has an entry.
+	GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error)
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
 	// QueryCommitLogs pages the commit log by server receipt time (c_date,
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
 	// that c_date. owner "" means no owner filter.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-
-	GetDistributions(ctx context.Context, uri string) ([]string, error)
 
 	// Delete
 	// MarkCommitLogGcCandidate flags a commit log for `conctl op gc-commitlog`

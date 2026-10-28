@@ -2,11 +2,8 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"time"
-
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
@@ -23,11 +20,7 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
-	var rks []models.RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false).
 		Where("uri LIKE ?", prefix+"%")
 
 	if schema != "" {
@@ -53,47 +46,12 @@ func (r *Repository) QueryByPrefix(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
-}
-
-// recordKeysToQueryRows converts preloaded record keys into query rows
-// carrying the created_at sort key the query ordered by. A placeholder key
-// (record_id NULL, reachable only through QueryByParentOrderByKey's LEFT
-// JOIN) becomes a key-only row holding just its cckv (CIP-5 §3.2.1).
-func recordKeysToQueryRows(rks []models.RecordKey, span trace.Span) ([]ucrecord.QueryRow, error) {
-	rows := make([]ucrecord.QueryRow, 0, len(rks))
-	for _, rk := range rks {
-		if rk.RecordID == nil {
-			rows = append(rows, ucrecord.QueryRow{Row: concrnt.SignedDocument{CCKV: &rk.URI}})
-			continue
-		}
-
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
-
-		rows = append(rows, ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCKV:     &rk.URI,
-				CCFS:     &ccfs,
-				Document: rk.Record.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: rk.Record.CreatedAt,
-		})
-	}
-
-	return rows, nil
+	return queryRows(rows)
 }
 
 // likeEscaper escapes LIKE metacharacters so a key containing '%' or '_'
@@ -109,9 +67,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false)
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
@@ -120,29 +76,20 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
 	}
 
-	var rks []models.RecordKey
-	if err := query.Order(`uri COLLATE "C" ASC`).Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query.Order(`uri COLLATE "C" ASC`))
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	sds := make([]concrnt.SignedDocument, 0, len(rks))
-	for _, rk := range rks {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
+	sds := make([]concrnt.SignedDocument, 0, len(rows))
+	for _, row := range rows {
+		sd, err := row.signedDocument()
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
-
-		sds = append(sds, concrnt.SignedDocument{
-			CCKV:     &rk.URI,
-			CCFS:     &ccfs,
-			Document: rk.Record.Document.Document,
-			Proof:    proof,
-		})
+		sds = append(sds, sd)
 	}
 
 	return sds, nil
@@ -158,11 +105,7 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	var rks []models.RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false)
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -201,12 +144,12 @@ func (r *Repository) QueryByParent(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
+	return queryRows(rows)
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
@@ -224,11 +167,7 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	var rks []models.RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), true)
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -267,10 +206,10 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
+	return queryRows(rows)
 }

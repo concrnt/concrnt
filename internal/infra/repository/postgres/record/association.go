@@ -79,12 +79,10 @@ func (r *Repository) GetAssociatedRecords(
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecords")
 	defer span.End()
 
-	var associations []models.Association
-
 	query := r.db.WithContext(ctx).
 		Model(&models.Association{}).
-		Preload("Document").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Joins("JOIN commit_logs c ON c.id = associations.document_id").
 		Where("rk.uri = ?", targetURI)
 
 	if schema != "" {
@@ -113,32 +111,38 @@ func (r *Repository) GetAssociatedRecords(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&associations).Error; err != nil {
+	var associations []commitRow
+	if err := query.Select("associations.document_id AS document_id, associations.owner AS owner, associations.created_at AS created_at, c.document AS document, c.proof AS proof").Scan(&associations).Error; err != nil {
 		return nil, err
 	}
 
-	rows := make([]ucrecord.QueryRow, len(associations))
-	for i, assoc := range associations {
+	return commitRows(associations)
+}
+
+// commitRow is a state row (association, ack, acked) joined with its commit
+// log; Owner is the namespace its ccfs URI is composed in.
+type commitRow struct {
+	DocumentID string
+	Owner      string
+	CreatedAt  time.Time
+	Document   string
+	Proof      string
+}
+
+func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
+	out := make([]ucrecord.QueryRow, len(rows))
+	for i, row := range rows {
 		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(assoc.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
+		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
 			return nil, err
 		}
-
-		ccfs := concrnt.ComposeCCFSURI(assoc.Owner, concrnt.CCFSTypeConcrnt, assoc.DocumentID)
-
-		rows[i] = ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCFS:     &ccfs,
-				Document: assoc.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: assoc.CreatedAt,
+		ccfs := concrnt.ComposeCCFSURI(row.Owner, concrnt.CCFSTypeConcrnt, row.DocumentID)
+		out[i] = ucrecord.QueryRow{
+			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: row.Document, Proof: proof},
+			CreatedAt: row.CreatedAt,
 		}
 	}
-
-	return rows, nil
+	return out, nil
 }
 
 func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
