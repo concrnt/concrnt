@@ -68,6 +68,8 @@
 | C6 | **一意制約は明示** | 契約上の一意性（association の `unique`、ack の `(from,to,schema)`）は、バックエンドが一意インデックスで実装してもよいが、契約の意味論は「同一キーの2件目は no-op / 拒否」として repotest で検証する。 | |
 | C7 | **準拠テストが契約の定義** | `repotest` を通らないバックエンドは契約を満たしていない。契約を変えるときは repotest を先に変える。 | |
 | C8 | **移行はログ再生** | `conctl op dump-commitlog` / `import-commitlog` が全バックエンドで動くこと。 | |
+| C9 | **リポジトリの分離境界 = 実体を別にできる境界** | 2つのリポジトリを別のインターフェースにしてよいのは、「一方を Postgres、他方を Firestore に載せても意味が成立する」場合だけ。同じテーブル／コレクションを前提に動くものは **1つのストア** にまとめる。現状の実体は `Core`（record + residence + chunkline + 旧 maintenance。`commit_logs` / `records` / `record_keys` / `entities` / `entity_metas` / acks / associations を共有）、`Server`（`servers`）、`Notification`（`subscriptions`）、`Abuse`（`abuse_reports`）の4つ。usecase 向けの **狭いインターフェース**（`chunkline.Repository` など）は残してよいが、`repository.Set` と `repotest.Backend` はストア単位で束ね、同じストアの各インターフェースは同じオブジェクトが実装する。 | 「record は Postgres、maintenance は Firestore」のような無意味な構成を型で排除する。 |
+| C10 | **テスト専用コードは本番パッケージに置かない** | テストからしか使わないコードは `_test.go` に閉じ込める。パッケージ間で共有が必要な場合だけ、名前が `test` で終わるパッケージ（`repotest`, `testutil`, `storetest`）に置く。これらのパッケージは非テストファイルから import しない（`go list -deps ./cmd/...` に現れないことをテストで検査）。インターフェース型は `_test.go` に置けないので `repotest` に置き、各バックエンドの実装は自パッケージの `inspect_test.go` に置く。 | 本番バイナリに testify 等のテスト依存をリンクしない。用途が置き場所と名前から読める。 |
 
 ---
 
@@ -96,7 +98,7 @@
 ### T1.2 `repository.Set` / `repository.Open` と配線
 
 成果物
-- `internal/infra/repository/repository.go`（`support-firestore` から移植）。`Set` は `Record, RecordMaintenance, Residence, Chunkline, Server, Notification, Abuse, Name, Collectors, Ready, Close, SQL` を持つ。`Open` は `conf.Database` が `""`/`"postgres"` のとき Postgres を開き、それ以外は「未知のバックエンド」エラーを返す。`switch` を用意しておくだけで、他のケースは書かない。
+- `internal/infra/repository/repository.go`（`support-firestore` から移植）。`Set` はストア単位（C9）: `Core`（`record.Repository` / `residence.Repository` / `chunkline.Repository` を同じオブジェクトが実装する。フィールドは `Record`, `Residence`, `Chunkline` のまま置いてよいが、同じ実体を指すことをコメントと生成コードで保証する）、`Server`, `Notification`, `Abuse`、および `Name, Collectors, Ready, Close, SQL`。`Open` は `conf.Database` が `""`/`"postgres"` のとき Postgres を開き、それ以外は「未知のバックエンド」エラーを返す。`switch` を用意しておくだけで、他のケースは書かない。
 - `internal/infra/config/config.go`: `Backends.Database string` を追加（既定 `postgres`）。Firestore 固有の設定はフェーズ3。既存キーは不変。`config.example.yaml` にコメント付きで追記。
 - `cmd/concrnt/main.go`: `support-firestore` の差分どおり `repository.Open` 経由に。`client.New` の生成順が前に移動することに注意（Deps に渡すため）。`/ready` は `repos.Ready`、メトリクスは `repos.Collectors`。
 - `cmd/conctl/operation.go`: `repository.Open` を使い、SQL が必要な既存コマンド（`repair-*`, `migrate-*`, `local-entity`, `delete-user`, `create-account`）は `Set.SQL` を使う。`Set.SQL == nil` のときは「このコマンドは Postgres 専用」と明示的にエラーを返す。
@@ -105,23 +107,25 @@
 - `go build ./...` 成功。`docker compose up`（`compose.yaml`）で起動し、`/health` `/ready` が 200。
 - `conctl` の各サブコマンドが `--help` と、Postgres 接続下での既存動作を維持（手動確認でよい。確認したコマンドを PR 本文に列挙）。
 
-### T1.3 `MaintenanceRepository` と `Inspector`
+### T1.3 保守用メソッドの `record.Repository` への統合と `Inspector`
 
 成果物
-- `internal/usecase/record/maintenance.go`（`support-firestore` から）: `CommitLogEntry`, `CommitLogPage`, `MaintenanceRepository{CountGcCandidates, ListGcCandidateIDs, DeleteCommitLogs, ListCommitLogs}`。
-- `internal/infra/repository/postgres/record_maintenance.go`（同）。
-- `internal/infra/repository/postgres/inspect.go`（同）: repotest 用 `Inspector`。テスト専用コードだが `_test.go` にはしない（他パッケージの repotest から使うため）。
-- `cmd/conctl/gc-commitlog.go`, `dump-commitlog.go`: `MaintenanceRepository` 経由に書き換え。**`develop` 側の `add gc backup`（a8a7c68）の挙動を保持**。
+- `internal/usecase/record/usecase.go`: `CommitLogEntry`, `CommitLogPage` と、保守用メソッド `CountGcCandidates`, `ListGcCandidates(ctx, cutoffID, afterID, limit)`, `DeleteCommitLogs`, `ListCommitLogs` を **`record.Repository` に直接追加**する（C9: 同じ `commit_logs` を前提にするので別インターフェースにしない）。`support-firestore` にある別立ての `MaintenanceRepository` は採用しない。usecase の fake は `record.Repository` を埋め込んで未使用メソッドの実装を省く。
+- `internal/infra/repository/postgres/record_maintenance.go`: 上記メソッドの Postgres 実装（ファイルは分けてよいが、レシーバは `RecordRepository`）。
+- `internal/infra/repository/repotest/inspect.go`: `Inspector` インターフェースと `CommitState` 等の状態構造体（C10: 共有が必要な型なので `repotest` に置く）。
+- `internal/infra/repository/postgres/inspect_test.go`: Postgres の `Inspector` 実装。**`_test.go` に置く**。本番の `postgres` パッケージには inspector のコードもテスト依存も入らない。
+- `cmd/conctl/gc-commitlog.go`, `dump-commitlog.go`: `op.Repos.Record` の保守用メソッド経由に書き換え。**`develop` 側の `add gc backup`（a8a7c68）の挙動を保持**（`CommitLogEntry` に `IP` / `CDate` を含める）。
 
 受け入れ条件
 - `go test ./cmd/conctl/...` 成功。
+- `go list -deps ./cmd/concrnt ./cmd/conctl | grep -E "repotest|testutil|testify"` が空。
 - `conctl op gc-commitlog --dry-run` 相当の出力が移植前後で一致（件数ベースで手動確認）。
 
 ### T1.4 `repotest` 準拠スイートの導入（Postgres で先に通す）
 
 成果物
 - `internal/infra/repository/repotest/{repotest,record,ack,chunkline,residence}.go`（`support-firestore` から）。`RunRecordSuite`, `RunAckSuite`, `RunChunklineSuite`, `RunResidenceSuite`。
-- `internal/infra/repository/postgres/suite_test.go`（同）。
+- `internal/infra/repository/postgres/suite_test.go`（同）。`repotest.Backend` は `Core`（record / residence / chunkline を兼ねる1オブジェクト）、`Inspect` の形にし、`Maintenance` フィールドは持たない（C9）。
 - `develop` で増えた契約メソッドのテストを repotest に追加: `QueryByParentOrderByKey`（キー順、プレースホルダ行、`since/until` 包含）、`QueryCommitLogs`（`c_date,id` 順、owner フィルタ、ページング）。期待値は現行 Postgres の挙動を正とする。
 - 既存の `postgres/*_test.go` のうち repotest と重複するものは削除してよいが、Postgres 固有（インデックス存在検査 `postgres_test.go` など）は残す。
 
@@ -144,12 +148,24 @@
 - `README.md`: バックエンド選択（`backends.database`、現時点では `postgres` のみ）、テストの回し方。
 - `internal/infra/repository/CONTRACT.md`: §2 の原則を転記し、「契約を変えるときの手順（repotest → 各バックエンド → shapes）」を書く。フェーズ2で肉付けする。
 
+### PR #114 への追加指示（2026-10-28）
+
+実装中に出た判断の記録。計画本文は上記のとおり更新済み。
+
+- `inspect` パッケージを廃し、`Inspector` インターフェースは `repotest` に、Postgres 実装は `postgres/inspect_test.go` に移す（C10）。
+- `record.MaintenanceRepository` を廃し、メソッドを `record.Repository` に統合する（C9）。`repository.Set.RecordMaintenance` と `repotest.Backend.Maintenance` も消す。
+- `CONTRACT.md` の C2 を本書 §2 の最新文言に合わせる（書き込み時にエントリが無ければ再計算）。C9 / C10 を追記する。
+- `.github/workflows/test.yml` の push トリガーに `feat/repository-contract` を追加する。
+- `import-commitlog` の再試行パスで、拒否された行のアドレスに当たる delete が先行パスで受理されると削除済みレコードが復活しうる。フェーズ2の往復テスト（§4 完了条件）までに、delete を同じ再試行パスへ持ち越すか、`--help` に制約として明記するかを決める。
+
 ### フェーズ1 完了条件
 
 - 上記すべてが `develop` にマージ済み。
 - `develop` で `go test ./...` が CI で緑。
 - `backends.database: postgres`（既定）で起動し、repotest 4 スイートを Postgres が通す。
 - リポジトリに Firestore 実装コードが含まれていない（`ls internal/infra/repository/firestore` が存在しない）。
+- `internal/infra/repository/inspect` パッケージが存在せず、`postgres` の本番ファイルに inspector がない（C10）。
+- `record.MaintenanceRepository` 型が存在しない（C9）。
 
 ---
 
@@ -333,6 +349,7 @@ backends:
 
 - `develop` 側で増え、`support-firestore` が持たないメソッド: `QueryByParentOrderByKey`（CIP-5 `orderby=key`）、`QueryCommitLogs`（`c_date, id` 順のレプリケーション走査）。`shapes` に形状を追加し、`QueryCommitLogs` は `commits` を `cDate, __name__` で範囲走査する。
 - フェーズ2で変わった契約: カウント系は `Compute*`（走査実装）に、`GetSignedDocuments` 複数取得、`record_keys` への `redirect` 非正規化、`MaintenanceRepository`。
+- Firestore の `Core` ストアは1オブジェクトで record / residence / chunkline を実装し（C9）、`Inspector` 実装は `firestore/inspect_test.go` に置く（C10）。
 - `AggregateStore` の Firestore 実装（`internal/infra/aggregate/firestore`）を追加し、`storetest` を通す。`Apply` は `FieldValue.Increment` 相当。
 - `shapes` の Firestore コンシューマ: `firestore.indexes.json` の生成と、`shapes_test.go` によるドリフト検出、起動時の `VerifyIndexes` プローブ。
 
@@ -370,6 +387,8 @@ backends:
   ```
 - `support-firestore` からの移植は `git show origin/support-firestore:<path>` で取り、**`develop` の変更を上書きしない**。両側変更ファイル（§3 方針に列挙）は手で 3-way マージし、PR 本文にそのファイル名を明記する。
 - 契約（`internal/usecase/*/Repository`）を変えるときは、同じ PR で repotest と **全バックエンド**を更新する。片方だけ通る状態をマージしない。
+- テスト専用コードは `_test.go` へ（C10）。やむを得ず共有する型は `repotest` / `testutil` / `storetest` に置き、非テストファイルから import しない。
+- 新しいリポジトリインターフェースを切る前に C9 を適用する: 既存のテーブルを共有するなら既存のストアにメソッドを足す。
 - 生成物（`schemas/*.go`、フェーズ3以降は `deploy/firestore/firestore.indexes.json`）は手で編集しない。生成コマンドを PR 本文に書く。
 - 既存の挙動変更が避けられない場合は PR タイトルに `behavior:` を付け、本文に差分を書く。
 - 本書の §8 以外の設計判断を変えたいときは、変える前にユーザーに確認する。
@@ -406,7 +425,7 @@ backends:
 
 - [ ] T1.1 `RunInTx` 契約、usecase 全面移行、Postgres 実装（リトライ付き）
 - [ ] T1.2 `repository.Set/Open`、`main.go` / `conctl` 配線、`backends.database` 設定
-- [ ] T1.3 `MaintenanceRepository`、`Inspector`、`gc-commitlog`/`dump-commitlog` 移行
+- [ ] T1.3 保守用メソッドを `record.Repository` に統合、`Inspector`（interface は repotest、実装は `inspect_test.go`）、`gc-commitlog`/`dump-commitlog` 移行
 - [ ] T1.4 repotest 導入、`QueryByParentOrderByKey` / `QueryCommitLogs` のテスト追加、Postgres で緑
 - [ ] T1.5 `.github/workflows/test.yml`
 - [ ] T1.6 README / `CONTRACT.md` 初版
