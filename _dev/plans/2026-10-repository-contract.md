@@ -61,7 +61,7 @@
 | # | 原則 | 意味 | 根拠 |
 |---|---|---|---|
 | C1 | **JOIN を前提にしない** | 契約の読み取りメソッドは「1コレクションの等価フィルタ + 高々1つの範囲条件 + 並び順」または「ID による単発/複数取得」で満たせる形にする。必要なフィールドはキー側に非正規化する。 | Firestore / Dynamo / Spanner で同一形状が使える。Postgres では往復削減になる。 |
-| C2 | **集計はキャッシュ** | 件数などの集計値は、一次データから常に再計算できる **派生キャッシュ** として扱う。リクエスト経路では集計層（`AggregateStore`）を読み、ミス時だけ一次データから計算して格納する。書き込み時の加算は「エントリが既にある場合の最適化」に過ぎず、正しさの根拠にしない。集計ロジックの変更はバージョン番号を上げるだけで済み、保存先の移転やデータ消失はログ再生を要さない。 | 読み取り増幅の排除と、集計の「使い捨て可能性」の両立。 |
+| C2 | **集計はキャッシュ** | 件数などの集計値は、一次データから常に再計算できる **派生キャッシュ** として扱う。リクエスト経路では集計層（`AggregateStore`）を読み、ミス時だけ一次データから計算して格納する。書き込み時の加算は「エントリが既にある場合の最適化」に過ぎず、正しさの根拠にしない。集計ロジックの変更時は全エントリを手動で削除すればよく、保存先の移転やデータ消失もログ再生を要さない。 | 読み取り増幅の排除と、集計の「使い捨て可能性」の両立。 |
 | C3 | **自動採番に依存しない** | 契約上の識別子は CDID、URI のハッシュ、クライアント生成のランダム ID（gen）のみ。`bigserial` の値が契約に漏れてはならない。 | 分散 DB のホットスポット回避、バックエンド間移行。 |
 | C4 | **トランザクションは `RunInTx(ctx, fn)`** | `fn` は再実行されうる（競合リトライ）。`fn` 内で外部副作用を起こさない。1トランザクションの書き込み数は上限（Firestore 500）を超えない設計にし、大量削除はジョブキューへ。 | Firestore / Spanner / CRDB の楽観的・直列化可能トランザクションに合わせる。 |
 | C5 | **クエリ形状はレジストリで宣言** | バックエンドが発行するクエリ形状は `shapes` に列挙し、各バックエンドはその形状を満たすインデックスを持つことをテストで検証する。 | インデックス定義の機械化、ドリフト検出。 |
@@ -200,7 +200,7 @@ T1.6 で Firestore 側に実装する。`shapes.go` にも形状を追加する�
 
 ### T2.2 集計キャッシュ層 `AggregateStore`（C2）
 
-目的: 集計値を **一次データから再計算可能な派生キャッシュ** として扱い、(a) 欠落時はその場で計算、(b) ロジック変更はバージョン更新だけ、(c) 保存先の差し替えが可能、(d) 書き込み時の加算は最適化に留める、を満たす。
+目的: 集計値を **一次データから再計算可能な派生キャッシュ** として扱い、(a) 読み取り時も書き込み時も、エントリが無ければその場で一次データから計算、(b) ロジック変更は全エントリの手動削除だけ、(c) 保存先の差し替えが可能、(d) 書き込み時の加算は「エントリがある場合の近道」に留める、を満たす。
 
 #### 構成
 
@@ -211,8 +211,8 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
   └─ record.Repository     一次データからの高コスト計算（Compute* メソッド群）
 ```
 
-- `internal/usecase/aggregate/` を新設。`Definition` は `{Name, Version int, Compute(ctx, target) (Value, error), Apply(Value, Delta) Value, TTL}` を持つ。
-- **キー** = `Name + ":v" + Version + ":" + targetKey`。`Version` を上げると旧キーは参照されなくなり、新キーは次の読み取りで遅延生成される。旧キーの掃除は TTL（Redis/memcached/Firestore TTL ポリシー）か `conctl op aggregate-sweep`。
+- `internal/usecase/aggregate/` を新設。`Definition` は `{Name, Compute(ctx, target) (Value, error), Apply(Value, Delta) Value, TTL}` を持つ。
+- **キー** = `Name + ":" + targetKey`。バージョンは持たない。集計ロジックを変えたときは `conctl op aggregate-invalidate --all`（または `--def name`）で全エントリを削除し、以後の読み書きで再生成させる。
 - `AggregateStore` インターフェース（最小）:
   ```go
   type Entry struct { Value []byte; AsOf time.Time; Deltas int }
@@ -223,6 +223,8 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
       // Apply は存在するエントリにだけ差分を適用し、無ければ false を返す
       Apply(ctx, key, delta []byte, applied func(old []byte) []byte) (bool, error)
       Invalidate(ctx, key) error
+      // InvalidateAll は name プレフィックス（"" なら全部）に一致するエントリを削除する。ロジック変更時の手動全削除に使う。
+      InvalidateAll(ctx, namePrefix string) error
   }
   ```
   実装は `internal/infra/aggregate/{postgres,firestore,redis,memcached,inmemory}`。**Redis / memcached 実装は揮発でよい**（消えたら再計算）。
@@ -239,22 +241,28 @@ usecase/aggregate          集計定義 + read-through ロジック（バック�
 2. ミス → `def.Compute(ctx, target)` を実行（高コスト許容）。`AsOf = 計算開始時刻`。
 3. `Store.PutIfAbsent(key, entry, ttl)`。負けた場合は相手の値を `Get` し直して返す。
 
-#### 書き込み時の差分適用（最適化）
+#### 書き込み時の処理（エントリがあれば差分適用、無ければ再計算）
 
-- `CreateAssociation` / `DeleteAssociation` / `Acknowledge` 系の **usecase** 側で、`RunInTx` が成功した **後**（postProcess）に `Store.Apply(key, delta)` を呼ぶ。トランザクション内では呼ばない（C4: クロージャ内に外部副作用を置かない。集計層は別ストアになりうる）。
-- `Apply` はエントリが無ければ何もしない（`false`）。差分の数 `Deltas` を数え、`def.MaxDeltas` を超えたら `Invalidate` して次回読み取りで再計算させる。
-- **複雑な操作は加算せず `Invalidate`**: `DeleteRecordByKey` のカスケード、GC、`import-commitlog`、`conctl` の修復コマンド。
+- `CreateAssociation` / `DeleteAssociation` / `Acknowledge` 系の **usecase** 側で、`RunInTx` が成功した **後**（postProcess）に `aggregate.Usecase.Touch(ctx, def, target, delta, itemReceivedAt)` を呼ぶ。トランザクション内では呼ばない（C4: クロージャ内に外部副作用を置かない。集計層は別ストアになりうる）。
+- `Touch` の手順:
+  1. `Store.Apply(key, delta)` を試す。エントリがあれば適用して終了。
+  2. 無ければ **その場で `def.Compute(ctx, target)` を実行**する（高コスト許容）。自分の書き込みは既にコミット済みなので、計算結果には自分の項目が含まれる。`AsOf = 計算開始時刻`。
+  3. `Store.PutIfAbsent(key, entry, ttl)`。勝てば終了。
+  4. 負けた場合（並行する別の書き込みか読み取りが先に生成した）: 相手の `AsOf` が自分の項目の受信時刻 `itemReceivedAt` より前なら、相手の計算が自分の項目を見ていない可能性があるので `Apply(delta)` する。そうでなければ何もしない。
+- 読み取りと書き込みのどちらが先にエントリを作っても結果は同じ。読み取りの read-through（上記）と `Touch` は同じ `computeAndPut` を共有する。
+- `Apply` は差分の数 `Deltas` を数え、`def.MaxDeltas` を超えたら `Invalidate` して次回の読み書きで再計算させる。
+- **複雑な操作は差分を作らず `Invalidate`**: `DeleteRecordByKey` のカスケード、GC、`import-commitlog`、`conctl` の修復コマンド。無効化後、次の読み書きが再計算する。
+- コールドキーへの書き込み集中（例: 新規投稿への最初のリアクション群）では複数の書き込みが同時に `Compute` を走らせ、1 つだけが `PutIfAbsent` に勝つ。計算は 1 ターゲット単位で有界なので許容する。問題になれば `Store.SetNX` 相当の短命ロック（「計算中」マーカー、数秒）で 1 回に絞る拡張を入れる（任意）。
 - 厳密性の扱い:
-  - Postgres 実装: `Apply` と `PutIfAbsent` は同一トランザクションで `pg_advisory_xact_lock(hash(key))` を取るので、同一キーに対して直列化され、取りこぼしが起きない。
-  - Firestore / Redis / memcached 実装: 遅延生成と並行書き込みの間に小さな競合窓がある（計算のスナップショット後にコミットされた項目が、エントリ未存在のため差分適用もされない）。**これは TTL による再計算で収束する結果整合として許容する**。集計値はキャッシュであり正本ではない、が設計の前提。
-- `AsOf` は読み取り側が「この値はいつ時点の計算か」を知るために保持し、`Apply` 時に更新する。API レスポンスには出さない（将来 `Cache-Control` の算出に使えるよう残す）。
+  - Postgres 実装: `Apply` と `PutIfAbsent` は同一トランザクションで `pg_advisory_xact_lock(hash(key))` を取るので、同一キーに対して直列化される。
+  - Firestore / Redis / memcached 実装: 手順 4 の `AsOf` 比較はサーバ時刻に依存するため、レプリカ間のクロック差程度の競合窓が残る。**これは TTL による再計算で収束する結果整合として許容する**。集計値はキャッシュであり正本ではない、が設計の前提。
+- `AsOf` は「この値はいつ時点の計算か」を保持し、`Apply` 時は更新しない（計算時点を表すため）。API レスポンスには出さない。
 
 #### 運用ツール
 
 - `conctl op aggregate-verify --sample N [--def name]`: ランダムに N ターゲットを選び、キャッシュ値と `Compute` の結果を比較して差分を報告。差分があったキーは `Invalidate`。
-- `conctl op aggregate-invalidate --def name [--target uri]`: 明示無効化。
-- `conctl op aggregate-sweep`: 現行バージョン以外のキーを削除（TTL を持たないストア向け）。
-- **`rebuild-counters` のような全件再計算コマンドは作らない**。全件が必要なら `Version` を上げるだけでよい。
+- `conctl op aggregate-invalidate (--all | --def name [--target uri])`: 明示無効化。**集計ロジックを変更したリリースでは `--all` を手動で実行する**。手順を `MIGRATION.md` の運用節に書く。
+- **`rebuild-counters` のような全件再計算コマンドは作らない**。削除すれば次の読み書きが再計算する。
 
 #### 設定
 
@@ -267,7 +275,7 @@ backends:
 ```
 
 受け入れ条件
-- `internal/usecase/aggregate` の単体テストが `inmemory` ストアで Docker なしに通り、以下を検証する: ミス → Compute → Put、ヒット時に Compute が呼ばれない、`Version` 変更で再計算、`Apply` が未存在キーに作用しない、`MaxDeltas` 超過で `Invalidate`、`PutIfAbsent` の競合で先勝ち。
+- `internal/usecase/aggregate` の単体テストが `inmemory` ストアで Docker なしに通り、以下を検証する: 読み取りミス → Compute → Put、ヒット時に Compute が呼ばれない、書き込み時にエントリが無ければ Compute → Put（結果に自分の項目が含まれる）、エントリがあれば Apply のみで Compute が呼ばれない、`PutIfAbsent` で負けたとき `AsOf` と受信時刻の比較で Apply の有無が決まる、`MaxDeltas` 超過で `Invalidate`、`InvalidateAll` 後の読み書きで再計算。
 - `AggregateStore` の **準拠テスト**（`internal/infra/aggregate/storetest`）を 5 実装すべてが通す。
 - repotest に `Compute*` のケースを追加し、既存のカウント系メソッドの期待値（`ByVariant` の順序を含む）をそのまま引き継ぐ。
 - 既存 DB の集計データは **移行しない**（初回読み取りで生成される）。PR 本文にその旨と、ariake 規模での初回生成コストの見積りを書く。
@@ -326,7 +334,7 @@ backends:
 - `CONTRACT.md` の表に「違反」行が残っていない。
 - Postgres / Firestore / SQLite の 3 バックエンドが同じ repotest を通す。
 - カウント系 API が全バックエンドでキャッシュヒット時 O(1) 読み取り。ミス時の `Compute*` は集計層からしか呼ばれない。
-- `AggregateStore` の保存先を設定だけで切り替えられ（例: postgres → redis）、切り替え後にログ再生なしで値が再生成される。
+- `AggregateStore` の保存先を設定だけで切り替えられ（例: postgres → redis）、切り替え後や `aggregate-invalidate --all` 後に、ログ再生なしで読み書き双方から値が再生成される。
 - 代表 3 リクエストのリポジトリ呼び出し回数が目標以下。
 - `dump-commitlog` → `import-commitlog` で Postgres → SQLite → Postgres の往復をし、`dump-commitlog` の出力が一致する（§2 C8 の実証）。手順を `MIGRATION.md` に追記。
 
@@ -360,7 +368,7 @@ backends:
 | `support-firestore` と `develop` の 3-way マージで `develop` 側の修正を落とす | `commit_test.go` や replication のテストが失敗 / 期待値を書き換えたくなる | 期待値は変えない。`git log -p origin/develop -- <file>` で develop 側の意図を読んでから当てる。 |
 | 集計キャッシュと実データのドリフト | `aggregate-verify` に差分 | 設計上は TTL で収束する。差分が TTL 内に消えない場合は `Apply` 側の差分符号・キー生成の誤り。複雑経路（カスケード、GC、import）が `Invalidate` を呼んでいるか確認。 |
 | Firestore 単一エントリの書き込み上限 | 人気投稿へのリアクション集中で `Apply` が `Aborted` 連発 | `Apply` は最適化なので **失敗しても無視して `Invalidate`** に落とす。ホットキーはそれで自然に read-through に戻る。 |
-| 初回読み取りの計算コスト（コールドスタート） | デプロイ直後や `Version` 更新直後に `Compute*` が集中 | 人気ターゲットの事前ウォーム（`conctl op aggregate-warm --top N`）を任意で用意。計算は 1 ターゲット単位で有界。 |
+| 初回アクセスの計算コスト（コールドスタート） | `aggregate-invalidate --all` 直後や保存先切り替え直後に `Compute*` が集中 | 計算は 1 ターゲット単位で有界。必要なら人気ターゲットの事前ウォーム（`conctl op aggregate-warm --top N`）を任意で用意。 |
 | エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
 | Postgres 起動時マイグレーションの多重実行 | 複数レプリカ同時起動で DDL 競合 | `pg_advisory_xact_lock` + `IF NOT EXISTS` + `schema_migrations` で冪等に。 |
 | 既存 DB への列追加 backfill が長い | `record_keys.redirect` backfill で起動が遅延 | バッチ分割、起動をブロックしないバックグラウンド実行、未 backfill 行は `records` へフォールバック。 |
@@ -389,7 +397,7 @@ backends:
 - [ ] T1.6 Firestore バックエンド移植 + 不足メソッド + `MIGRATION.md`
 - [ ] T1.7 README / `CONTRACT.md` 初版
 - [ ] T2.1 契約棚卸し表
-- [ ] T2.2 `AggregateStore` 層（5 実装 + storetest）、`Compute*` 契約、ハンドラ移行、`aggregate-verify` / `aggregate-invalidate` / `aggregate-sweep`
+- [ ] T2.2 `AggregateStore` 層（5 実装 + storetest）、`Compute*` 契約、read-through と書き込み時再計算、ハンドラ移行、`aggregate-verify` / `aggregate-invalidate`
 - [ ] T2.3 shapes 中立化、両バックエンドのインデックス検証、`pg_advisory_xact_lock`
 - [ ] T2.4 複数取得、chunkline 非正規化、往復回数テスト
 - [ ] T2.5 SQLite バックエンド
