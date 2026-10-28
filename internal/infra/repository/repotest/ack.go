@@ -195,11 +195,11 @@ func testGetAcknowledgeRecordsServesHeldSide(t *testing.T, be Backend) {
 	_, err = repo.GetAcknowledgeRecords(ctx, "", "", "", nil, nil, 0, "desc")
 	require.Error(t, err, "one of from / to is required")
 
-	counts, err := repo.GetAcknowledgeRecordCounts(ctx, localAcker, "", "")
+	counts, err := repo.ComputeAcknowledgeCounts(ctx, localAcker, "", "")
 	require.NoError(t, err)
 	require.EqualValues(t, 2, counts[schema])
 
-	counts, err = repo.GetAcknowledgeRecordCounts(ctx, "", local, "")
+	counts, err = repo.ComputeAcknowledgeCounts(ctx, "", local, "")
 	require.NoError(t, err)
 	require.EqualValues(t, 2, counts[schema])
 }

@@ -13,8 +13,8 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 )
 
 // legacyProofTypeAckReference is the proof type the v1.11.0-beta builds gave
@@ -50,6 +50,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 		"is a no-op. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
+		if err := op.RequirePostgres(); err != nil {
+			return err
+		}
 		stats, err := repairAnchoredAcks(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairAnchoredAcksDryRun)
 		if err != nil {
 			return err
@@ -62,6 +65,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 			verb, stats.Holdings, stats.RestoredAcks, stats.RemovedRows, stats.Orphans, stats.StaleMirrors, stats.NullOwners)
 		if repairAnchoredAcksDryRun {
 			fmt.Fprintln(os.Stderr, "schema migration (ackeds table, entities.created_at, acks foreign key) is applied by the real run")
+		}
+		if !repairAnchoredAcksDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
 		}
 		return nil
 	}),
@@ -333,9 +339,14 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	}
 
 	// Step 5: the rest of the schema (ackeds indexes, entities.created_at, the
-	// acks foreign key the split just made satisfiable).
+	// acks foreign key the split just made satisfiable). The baseline step may
+	// already be recorded as applied, so the tables are brought up to date
+	// directly before the remaining numbered steps run.
 	if !dryRun {
-		if err := database.MigratePostgres(db.WithContext(ctx)); err != nil {
+		if err := postgres.AutoMigrateTables(db.WithContext(ctx)); err != nil {
+			return stats, fmt.Errorf("schema baseline: %w", err)
+		}
+		if err := postgres.Migrate(ctx, db); err != nil {
 			return stats, fmt.Errorf("schema migration: %w", err)
 		}
 	}

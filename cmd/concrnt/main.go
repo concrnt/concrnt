@@ -13,9 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/prometheus/client_golang/prometheus/collectors"
+	"gorm.io/gorm"
 
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
@@ -41,6 +46,7 @@ import (
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -204,26 +210,73 @@ func main() {
 	}
 	cl.SetUserAgent("concrnt", version)
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
-	if err != nil {
-		panic("failed to connect database: " + err.Error())
-	}
-	if err := database.MigratePostgres(db); err != nil {
-		panic("failed to migrate database: " + err.Error())
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
-	}
-	defer sqlDB.Close()
+	// the record store backend: every repository of one backend is built
+	// here, by hand, from that backend's package (CONTRACT.md)
+	var (
+		recordRepo       record.Repository
+		entityMetaRepo   usecase.EntityMetaRepository
+		serverRepo       server.Repository
+		notificationRepo notification.Repository
+		abuseRepo        abuse.Repository
+		databaseReady    func(ctx context.Context) error
+		db               *gorm.DB // postgres only; the aggregate store's default home
+	)
+	switch conf.Backends.Database {
+	case "", "postgres":
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		if err := postgres.Migrate(ctx, pg); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		sqlDB, err := pg.DB()
+		if err != nil {
+			panic("failed to get sql.DB: " + err.Error())
+		}
+		defer sqlDB.Close()
+		// connection pool usage (go_sql_*): the pool is small, so saturation
+		// and wait time are the first thing to check when everything gets slow
+		prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-	recordRepo := pgrecord.New(db, cl, domainConfig)
-	entityMetaRepo := postgres.NewEntityMetaRepository(db)
+		db = pg
+		databaseReady = sqlDB.PingContext
+		recordRepo = pgrecord.New(pg, cl, domainConfig)
+		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
+		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
+		notificationRepo = postgres.NewNotificationRepository(pg)
+		abuseRepo = postgres.NewAbuseRepository(pg)
+	case "sqlite":
+		lite, err := sqlite.Open(conf.Backends.SQLitePath())
+		if err != nil {
+			panic("failed to open database: " + err.Error())
+		}
+		defer lite.Close()
+		if err := sqlite.Migrate(ctx, lite); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.DB, "concrnt"))
+
+		databaseReady = lite.Ready
+		recordRepo = sqliterecord.New(lite, cl, domainConfig)
+		entityMetaRepo = sqlite.NewEntityMetaRepository(lite)
+		serverRepo = sqlite.NewServerRepository(&domainConfig, lite, cl)
+		notificationRepo = sqlite.NewNotificationRepository(lite)
+		abuseRepo = sqlite.NewAbuseRepository(lite)
+	default:
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite)")
+	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+
+	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, db, redis)
+	if err != nil {
+		panic("failed to open aggregate store: " + err.Error())
+	}
+	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
@@ -263,9 +316,10 @@ func main() {
 		cl,
 	)
 
-	serverUC := server.New(postgres.NewServerRepository(&domainConfig, db, cl), &domainConfig, softwareInfo, moduleManager, cl)
+	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	recordUC.SetAggregates(aggregateUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := recordRepo
@@ -294,7 +348,7 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationUC := notification.New(postgres.NewNotificationRepository(db), redisKVS, notificationPusher)
+	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
 	workerSub := worker.NewWorkerSubscriber(elector)
@@ -338,7 +392,7 @@ func main() {
 		}
 	}()
 
-	abuseUC := abuse.New(postgres.NewAbuseRepository(db))
+	abuseUC := abuse.New(abuseRepo)
 
 	var notificationReactor *worker.NotificationReactor
 	if webpushOpts != nil {
@@ -419,17 +473,13 @@ func main() {
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
-	// connection pool usage (go_sql_*): the pool is small, so saturation
-	// and wait time are the first thing to check when everything gets slow
-	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
-
-	// every backend the public API needs gates readiness: postgres holds
-	// the data, redis carries delivery jobs and realtime events, memcached
-	// serves the timeline chunks. the sweep stays under the kubelet's probe
-	// timeout so a hung backend reads as "down" rather than as a timed-out
-	// probe with no body
+	// every backend the public API needs gates readiness: the database
+	// holds the data, redis carries delivery jobs and realtime events,
+	// memcached serves the timeline chunks. the sweep stays under the
+	// kubelet's probe timeout so a hung backend reads as "down" rather than
+	// as a timed-out probe with no body
 	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("postgres", sqlDB.PingContext)
+	readiness.Add("database", databaseReady)
 	readiness.Add("redis", func(ctx context.Context) error {
 		return redis.Ping(ctx).Err()
 	})

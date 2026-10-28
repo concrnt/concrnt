@@ -79,12 +79,10 @@ func (r *Repository) GetAssociatedRecords(
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecords")
 	defer span.End()
 
-	var associations []models.Association
-
 	query := r.db.WithContext(ctx).
 		Model(&models.Association{}).
-		Preload("Document").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Joins("JOIN commit_logs c ON c.id = associations.document_id").
 		Where("rk.uri = ?", targetURI)
 
 	if schema != "" {
@@ -113,36 +111,42 @@ func (r *Repository) GetAssociatedRecords(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&associations).Error; err != nil {
+	var associations []commitRow
+	if err := query.Select("associations.document_id AS document_id, associations.owner AS owner, associations.created_at AS created_at, c.document AS document, c.proof AS proof").Scan(&associations).Error; err != nil {
 		return nil, err
 	}
 
-	rows := make([]ucrecord.QueryRow, len(associations))
-	for i, assoc := range associations {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(assoc.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		ccfs := concrnt.ComposeCCFSURI(assoc.Owner, concrnt.CCFSTypeConcrnt, assoc.DocumentID)
-
-		rows[i] = ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCFS:     &ccfs,
-				Document: assoc.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: assoc.CreatedAt,
-		}
-	}
-
-	return rows, nil
+	return commitRows(associations)
 }
 
-func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsBySchema")
+// commitRow is a state row (association, ack, acked) joined with its commit
+// log; Owner is the namespace its ccfs URI is composed in.
+type commitRow struct {
+	DocumentID string
+	Owner      string
+	CreatedAt  time.Time
+	Document   string
+	Proof      string
+}
+
+func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
+	out := make([]ucrecord.QueryRow, len(rows))
+	for i, row := range rows {
+		var proof concrnt.Proof
+		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
+			return nil, err
+		}
+		ccfs := concrnt.ComposeCCFSURI(row.Owner, concrnt.CCFSTypeConcrnt, row.DocumentID)
+		out[i] = ucrecord.QueryRow{
+			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: row.Document, Proof: proof},
+			CreatedAt: row.CreatedAt,
+		}
+	}
+	return out, nil
+}
+
+func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
 	defer span.End()
 
 	var counts []struct {
@@ -171,14 +175,17 @@ func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targ
 	return result, nil
 }
 
-func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsByVariant")
+func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
 	defer span.End()
 
+	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
+	// to min_created_at); the earliest association of each variant decides
+	// the variant order
 	var counts []struct {
-		Variant  string
-		Count    int64
-		MinCDate time.Time
+		Variant      string
+		Count        int64
+		MinCreatedAt time.Time
 	}
 
 	err := r.db.WithContext(ctx).
@@ -199,7 +206,7 @@ func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, tar
 	for _, c := range counts {
 		result[c.Variant] = utils.OrderedKV[int64]{
 			Value: c.Count,
-			Order: c.MinCDate.UnixNano(),
+			Order: c.MinCreatedAt.UnixNano(),
 		}
 	}
 

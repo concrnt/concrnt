@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/zeebo/xxh3"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -29,6 +31,11 @@ func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("CreateRecordFreshKeyConditionalUpsert", func(t *testing.T) { testCreateRecordFreshKeyConditionalUpsert(t, open(t)) })
 	t.Run("GetAllCommitLogsByOwner", func(t *testing.T) { testGetAllCommitLogsByOwner(t, open(t)) })
 	t.Run("QueryByParentOrderByKey", func(t *testing.T) { testRecordQueryByParentOrderByKey(t, open(t)) })
+	t.Run("HasCommitLog", func(t *testing.T) { testHasCommitLog(t, open(t)) })
+	t.Run("GetSignedDocumentByCCFS", func(t *testing.T) { testGetSignedDocumentByCCFS(t, open(t)) })
+	t.Run("GetSignedDocuments", func(t *testing.T) { testGetSignedDocuments(t, open(t)) })
+	t.Run("HierarchicalRecordPoliciesMulti", func(t *testing.T) { testHierarchicalRecordPoliciesMulti(t, open(t)) })
+	t.Run("GetEntityByCCIDAndAlias", func(t *testing.T) { testGetEntityByCCIDAndAlias(t, open(t)) })
 }
 
 func testRecordWrites(t *testing.T, be Backend) {
@@ -255,6 +262,12 @@ func testRecordWrites(t *testing.T, be Backend) {
 		require.Equal(t, targetURI, *stored.Redirect)
 		require.Equal(t, "https://schema.example/target.json", stored.Schema)
 		require.True(t, stored.CreatedAt.Equal(targetCreatedAt))
+
+		// the key carries the redirect too (chunkline reads it from the key)
+		refKey := mustRecordKey(t, ctx, in, "cckv://con1owner/timeline/ref-1")
+		require.NotNil(t, refKey.Redirect)
+		require.Equal(t, targetURI, *refKey.Redirect)
+		require.Nil(t, mustRecordKey(t, ctx, in, key).Redirect, "a plain record's key has no redirect")
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
@@ -607,6 +620,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		base + "/a/b",                    // grandchild
 		base + "2",                       // sibling sharing the string prefix — never in the subtree
 		"cckv://con1owner/lists/it_em/x", // LIKE-metacharacter decoy: '_' matches any char unescaped
+		"cckv://con1owner/lists/ITEM/y",  // case decoy: keys are case-sensitive
 	}
 	createdAt := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
 	for i, key := range keys {
@@ -670,6 +684,12 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		require.Equal(t, []string{"cckv://con1owner/lists/it_em/x"}, urisOf(sds))
 	})
 
+	t.Run("case differs, subtree differs", func(t *testing.T) {
+		sds, err := repo.QueryRecordSubtree(ctx, "cckv://con1owner/lists/ITEM", true)
+		require.NoError(t, err)
+		require.Equal(t, []string{"cckv://con1owner/lists/ITEM/y"}, urisOf(sds))
+	})
+
 	t.Run("subtree delete removes exactly the enumerated keys", func(t *testing.T) {
 		sds, err := repo.QueryRecordSubtree(ctx, base, true)
 		require.NoError(t, err)
@@ -701,7 +721,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		require.False(t, associationExists(t, ctx, in, "subtree-association"))
 
 		// siblings and decoys survive
-		for i := 3; i < 5; i++ {
+		for i := 3; i < 6; i++ {
 			require.True(t, recordExists(t, ctx, in, fmt.Sprintf("subtree-%d", i)), "record %d must survive", i)
 		}
 
@@ -773,6 +793,30 @@ func testRecordQueryAuthorFilter(t *testing.T, be Backend) {
 		rows, err := repo.QueryByPrefix(ctx, parent+"/", "", "con1bob", nil, nil, 0, "asc")
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/e2"}, urisOfRows(rows))
+	})
+
+	// the prefix is a literal: "_" in it matches itself only (a raw "%" cannot
+	// appear in a key, so only "_" is observable)
+	t.Run("prefix metacharacters are literal", func(t *testing.T) {
+		for i, key := range []string{parent + "/t_1", parent + "/tx1"} {
+			id := fmt.Sprintf("prefixmeta-%d", i)
+			sd := SignedDocument(t, concrnt.Document[map[string]string]{
+				Kind:      "record",
+				Key:       key,
+				Value:     map[string]string{"body": key},
+				Author:    "con1alice",
+				Schema:    "https://schema.example/item.json",
+				CreatedAt: createdAt.Add(time.Duration(10+i) * time.Second),
+			})
+			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+				_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1alice", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(10+i)*time.Second))
+				return err
+			})
+		}
+
+		rows, err := repo.QueryByPrefix(ctx, parent+"/t_", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/t_1"}, urisOfRows(rows), "underscore must not match any character")
 	})
 }
 
@@ -1117,6 +1161,44 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 		require.Empty(t, rows, "a sibling owner sharing the prefix must not match")
 	})
 
+	// The order is byte order of the key, whatever the backend's default
+	// collation does with case and punctuation: "B" < "a" < "a-b" < "a_b".
+	t.Run("key order is byte order", func(t *testing.T) {
+		parent := root + "/bytes"
+		for i, key := range []string{parent + "/a_b", parent + "/B", parent + "/a-b", parent + "/a"} {
+			id := fmt.Sprintf("byteorder-%d", i)
+			sd := SignedDocument(t, concrnt.Document[map[string]string]{
+				Kind:      "record",
+				Key:       key,
+				Value:     map[string]string{"body": key},
+				Author:    owner,
+				Schema:    "https://schema.example/item.json",
+				CreatedAt: createdAt,
+			})
+			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
+				_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
+				return err
+			})
+		}
+
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows))
+
+		since := parent + "/a"
+		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", &since, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows), "the since bound is a byte-order bound too")
+
+		sds, err := repo.QueryRecordSubtree(ctx, parent, false)
+		require.NoError(t, err)
+		uris := make([]string, 0, len(sds))
+		for _, sd := range sds {
+			uris = append(uris, *sd.CCKV)
+		}
+		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, uris)
+	})
+
 	t.Run("createdAt ordering also accepts the owner root", func(t *testing.T) {
 		rows, err := repo.QueryByParent(ctx, root, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
@@ -1126,4 +1208,271 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows), "placeholders stay out of the createdAt listing")
 	})
+}
+
+func testHasCommitLog(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	has, err := repo.HasCommitLog(ctx, "has-1")
+	require.NoError(t, err)
+	require.False(t, has)
+
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+		// a duplicate id is a silent no-op
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	has, err = repo.HasCommitLog(ctx, "has-1")
+	require.NoError(t, err)
+	require.True(t, has)
+	require.Equal(t, "{}", mustCommit(t, ctx, be.Inspect, "has-1").Document, "the first write wins")
+
+	// a rolled-back write leaves nothing behind
+	InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-2", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+	has, err = repo.HasCommitLog(ctx, "has-2")
+	require.NoError(t, err)
+	require.False(t, has)
+}
+
+// A ccfs URI resolves through the commit log: the document comes back with
+// its CCKV filled in when a key currently points at it, and without one
+// otherwise (a commit that never was or no longer is a record). A cckv
+// placeholder key and an unknown id are not found; a non-concrnt ccfs type
+// is not found either.
+func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	key := "cckv://con1owner/notes/n1"
+	createdAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	sd := SignedDocument(t, concrnt.Document[map[string]string]{
+		Kind:      "record",
+		Key:       key,
+		Value:     map[string]string{"body": "n1"},
+		Author:    "con1owner",
+		Schema:    "https://schema.example/note.json",
+		CreatedAt: createdAt,
+	})
+	WithCommit(t, ctx, repo, "ccfs-record", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		_, err := repo.CreateRecord(ctx, tx, "ccfs-record", key, "con1owner", "con1owner", "https://schema.example/note.json", nil, nil, []string{}, nil, createdAt)
+		return err
+	})
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "ccfs-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	ccfs := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-record")
+	got, err := repo.GetSignedDocument(ctx, ccfs)
+	require.NoError(t, err)
+	require.Equal(t, sd.Document, got.Document)
+	require.Equal(t, sd.Proof, got.Proof)
+	require.NotNil(t, got.CCFS)
+	require.Equal(t, ccfs, *got.CCFS)
+	require.NotNil(t, got.CCKV)
+	require.Equal(t, key, *got.CCKV)
+
+	// the cckv side fills in the ccfs too
+	got, err = repo.GetSignedDocument(ctx, key)
+	require.NoError(t, err)
+	require.NotNil(t, got.CCFS)
+	require.Equal(t, ccfs, *got.CCFS)
+
+	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-keyless")
+	got, err = repo.GetSignedDocument(ctx, keyless)
+	require.NoError(t, err)
+	require.Equal(t, "{}", got.Document)
+	require.Nil(t, got.CCKV, "a commit no key points at has no cckv")
+
+	_, err = repo.GetSignedDocument(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-unknown"))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown id must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "cckv://con1owner/notes")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "a placeholder key must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "cckv://con1owner/notes/none")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "an unknown key must be not found, got %v", err)
+
+	_, err = repo.GetSignedDocument(ctx, "ccfs://con1owner/"+concrnt.CCFSTypeBlob+"/"+strings.Repeat("0", 64))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "a non-concrnt ccfs type must be not found, got %v", err)
+}
+
+// GetSignedDocuments resolves a mixed batch of cckv and ccfs URIs in one go:
+// each hit carries the same CCKV / CCFS as the single lookup would, misses
+// (unknown keys and ids, placeholder keys, non-concrnt ccfs types) are
+// simply absent, and an empty batch is an empty map.
+func testGetSignedDocuments(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	seed := func(id, key string) concrnt.SignedDocument {
+		t.Helper()
+		sd := SignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"id": id},
+			Author:    "con1owner",
+			Schema:    "https://schema.example/post.json",
+			CreatedAt: createdAt,
+		})
+		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
+			return err
+		})
+		return sd
+	}
+	sd1 := seed("multi-1", "cckv://con1owner/posts/p1")
+	sd2 := seed("multi-2", "cckv://con1owner/posts/p2")
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		require.NoError(t, repo.CreateCommitLog(ctx, tx, "multi-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+	})
+
+	ccfs2 := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-2")
+	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-keyless")
+	uris := []string{
+		"cckv://con1owner/posts/p1",
+		ccfs2,
+		keyless,
+		"cckv://con1owner/posts/none",
+		"cckv://con1owner/posts", // placeholder
+		concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-none"),
+		"ccfs://con1owner/" + concrnt.CCFSTypeBlob + "/" + strings.Repeat("0", 64),
+	}
+	got, err := repo.GetSignedDocuments(ctx, uris)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	p1 := got["cckv://con1owner/posts/p1"]
+	require.NotNil(t, p1)
+	require.Equal(t, sd1.Document, p1.Document)
+	require.Equal(t, sd1.Proof, p1.Proof)
+	require.Equal(t, "cckv://con1owner/posts/p1", *p1.CCKV)
+	require.Equal(t, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-1"), *p1.CCFS)
+
+	p2 := got[ccfs2]
+	require.NotNil(t, p2)
+	require.Equal(t, sd2.Document, p2.Document)
+	require.Equal(t, ccfs2, *p2.CCFS)
+	require.Equal(t, "cckv://con1owner/posts/p2", *p2.CCKV)
+
+	kl := got[keyless]
+	require.NotNil(t, kl)
+	require.Equal(t, "{}", kl.Document)
+	require.Nil(t, kl.CCKV)
+
+	single, err := repo.GetSignedDocument(ctx, ccfs2)
+	require.NoError(t, err)
+	require.Equal(t, single, p2, "the batch result equals the single lookup")
+
+	got, err = repo.GetSignedDocuments(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// The multi variant assembles the same stacks the single lookup does, one
+// per input URI, including URIs with no policies at all.
+func testHierarchicalRecordPoliciesMulti(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	policyJSON := `{"entries":[{"url":"https://example.com/p.json"}]}`
+	dist := []string{"cckv://con1elsewhere/tl"}
+	for i, key := range []string{"cckv://con1multi/l1", "cckv://con1multi/l1/l2", "cckv://con1multi/other"} {
+		id := fmt.Sprintf("multi-policy-%d", i)
+		createdAt := time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC)
+		sd := SignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"body": "x"},
+			Author:    "con1multi",
+			Schema:    "https://schema.example/post.json",
+			CreatedAt: createdAt,
+		})
+		var policies *string
+		var distributions []string
+		switch i {
+		case 0:
+			policies = Ptr(policyJSON)
+		case 1:
+			distributions = dist
+		}
+		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1multi", func(tx record.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1multi", "con1multi", "https://schema.example/post.json", nil, policies, distributions, nil, createdAt)
+			return err
+		})
+	}
+
+	uris := []string{"cckv://con1multi/l1/l2", "cckv://con1multi/l1/l2/l3", "cckv://con1multi/other", "cckv://con1multi/l1/l2"}
+	stacks, err := repo.GetHierarchicalRecordPoliciesMulti(ctx, uris)
+	require.NoError(t, err)
+	require.Len(t, stacks, 3)
+	for _, uri := range uris {
+		single, err := repo.GetHierarchicalRecordPolicies(ctx, uri)
+		require.NoError(t, err)
+		require.Equal(t, single, stacks[uri], "stack of %s", uri)
+	}
+	require.Len(t, stacks["cckv://con1multi/l1/l2"], 2, "l1's policy layer, then l2's distributing layer")
+	require.Equal(t, "cckv://con1multi/l1", stacks["cckv://con1multi/l1/l2"][0].Source)
+	require.Equal(t, "cckv://con1multi/l1/l2", stacks["cckv://con1multi/l1/l2"][1].Source)
+	require.Equal(t, dist, *stacks["cckv://con1multi/l1/l2"][1].VirtualParents)
+	require.Empty(t, stacks["cckv://con1multi/other"])
+
+	_, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{concrnt.ComposeCCFSURI("con1multi", concrnt.CCFSTypeConcrnt, "multi-policy-0")})
+	require.Error(t, err, "the multi lookup is keyed by cckv")
+
+	stacks, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, stacks)
+}
+
+// An entity is read back by ccid or by alias together with the signed
+// document that registered it; unknown lookups are not found.
+func testGetEntityByCCIDAndAlias(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	ccid := "con1entityentityentityentityentityentityen"
+	alias := "alice.example.com"
+	createdAt := time.Date(2026, 5, 3, 0, 0, 0, 0, time.UTC)
+	sd := SignedDocument(t, concrnt.Document[schemas.Entity]{
+		Kind:      "entity",
+		Value:     schemas.Entity{Domain: "example.com"},
+		Author:    ccid,
+		Schema:    schemas.EntityURL,
+		CreatedAt: createdAt,
+	})
+	WithCommit(t, ctx, repo, "entity-lookup", "127.0.0.1", sd, ccid, func(tx record.RepositoryTx) error {
+		applied, err := repo.CreateEntity(ctx, tx, ccid, &alias, "example.com", "entity-lookup", createdAt)
+		require.True(t, applied)
+		return err
+	})
+
+	for _, lookup := range []struct {
+		name string
+		get  func() (*domain.Entity, error)
+	}{
+		{"ccid", func() (*domain.Entity, error) { return repo.GetEntityByCCID(ctx, ccid) }},
+		{"alias", func() (*domain.Entity, error) { return repo.GetEntityByAlias(ctx, alias) }},
+	} {
+		t.Run("by "+lookup.name, func(t *testing.T) {
+			entity, err := lookup.get()
+			require.NoError(t, err)
+			require.Equal(t, ccid, entity.ID)
+			require.Equal(t, "example.com", entity.Domain)
+			require.NotNil(t, entity.Alias)
+			require.Equal(t, alias, *entity.Alias)
+			require.NotNil(t, entity.SignedDocument)
+			require.Equal(t, sd.Document, entity.SignedDocument.Document)
+			require.Equal(t, sd.Proof, entity.SignedDocument.Proof)
+		})
+	}
+
+	_, err := repo.GetEntityByCCID(ctx, "con1nobodynobodynobodynobodynobodynobodyno")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown ccid must be not found, got %v", err)
+	_, err = repo.GetEntityByAlias(ctx, "nobody.example.com")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown alias must be not found, got %v", err)
 }

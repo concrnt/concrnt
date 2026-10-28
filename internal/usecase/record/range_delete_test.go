@@ -135,6 +135,15 @@ func (r *rangeDeleteRepo) GetSignedDocument(ctx context.Context, uri string) (*c
 	}
 	return nil, domain.NotFoundError{Resource: uri}
 }
+func (r *rangeDeleteRepo) GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error) {
+	out := map[string]*concrnt.SignedDocument{}
+	for _, uri := range uris {
+		if sd, ok := r.stored[uri]; ok {
+			out[uri] = &sd
+		}
+	}
+	return out, nil
+}
 func (r *rangeDeleteRepo) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	if rm, ok := r.removals[keyURI]; ok {
 		return rm[0], rm[1], nil

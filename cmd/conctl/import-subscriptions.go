@@ -7,8 +7,6 @@ import (
 	"os"
 	"strings"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
-
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt/internal/domain"
@@ -59,7 +57,7 @@ var importSubscriptionsCmd = &cobra.Command{
 				ok++
 				continue
 			}
-			if _, err := postgres.NewNotificationRepository(op.DB).Subscribe(ctx, sub); err != nil {
+			if _, err := op.Notification.Subscribe(ctx, sub); err != nil {
 				failed++
 				fmt.Fprintf(os.Stderr, "line %d (%s/%s): failed to save: %v\n", lineNo, sub.VendorID, sub.Owner, err)
 				continue

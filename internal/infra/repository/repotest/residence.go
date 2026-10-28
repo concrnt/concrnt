@@ -18,6 +18,7 @@ import (
 // test.
 func RunResidenceSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("UpdateMetaInfo", func(t *testing.T) { testResidenceUpdateMetaInfo(t, open(t)) })
+	t.Run("EntityMetaLifecycle", func(t *testing.T) { testResidenceEntityMetaLifecycle(t, open(t)) })
 	t.Run("MarkCommitLogsGcCandidateByOwner", func(t *testing.T) { testResidenceMarkCommitLogsGcCandidateByOwner(t, open(t)) })
 }
 
@@ -47,6 +48,52 @@ func testResidenceUpdateMetaInfo(t *testing.T, be Backend) {
 	require.JSONEq(t, `{"email":"b@example.com"}`, meta.Info)
 	require.NotNil(t, meta.Inviter)
 	require.Equal(t, inviter, *meta.Inviter)
+}
+
+// SaveMeta upserts by ccid (inviter included), GetMeta reports NotFound for
+// an unknown ccid, ListMetas returns every row or just the one owner, and
+// DeleteMeta is idempotent.
+func testResidenceEntityMetaLifecycle(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.EntityMeta
+
+	a := "con1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	b := "con1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"
+
+	_, err := repo.GetMeta(ctx, a)
+	require.True(t, errors.Is(err, domain.ErrNotFound), "expected not found, got %v", err)
+
+	require.NoError(t, repo.SaveMeta(ctx, domain.EntityMeta{ID: a, Inviter: &inviter, Info: `{"email":"a@example.com"}`}))
+	require.NoError(t, repo.SaveMeta(ctx, domain.EntityMeta{ID: b, Info: `{}`}))
+
+	// upsert replaces inviter and info
+	require.NoError(t, repo.SaveMeta(ctx, domain.EntityMeta{ID: a, Inviter: nil, Info: `{"email":"a2@example.com"}`}))
+	meta, err := repo.GetMeta(ctx, a)
+	require.NoError(t, err)
+	require.Nil(t, meta.Inviter)
+	require.JSONEq(t, `{"email":"a2@example.com"}`, meta.Info)
+
+	all, err := repo.ListMetas(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+
+	one, err := repo.ListMetas(ctx, b)
+	require.NoError(t, err)
+	require.Len(t, one, 1)
+	require.Equal(t, b, one[0].ID)
+
+	none, err := repo.ListMetas(ctx, "con1nobody")
+	require.NoError(t, err)
+	require.Empty(t, none)
+
+	require.NoError(t, repo.DeleteMeta(ctx, a))
+	require.NoError(t, repo.DeleteMeta(ctx, a), "delete is idempotent")
+	_, err = repo.GetMeta(ctx, a)
+	require.True(t, errors.Is(err, domain.ErrNotFound))
+	all, err = repo.ListMetas(ctx, "")
+	require.NoError(t, err)
+	require.Len(t, all, 1)
 }
 
 // Unregister flags every commit the departing user owns. Every commit has

@@ -143,6 +143,10 @@ func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, f
 		sd.CCFS = &ccfs
 	}
 
+	if created {
+		postProcesses = append(postProcesses, uc.ackCountsInvalidated(doc.Kind, from.ID, to.ID))
+	}
+
 	return &commitApplyResult{result: &sd, noop: !created, postProcesses: postProcesses}, nil
 
 }

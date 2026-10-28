@@ -120,6 +120,8 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 			return &commitApplyResult{result: &sd, noop: true}, nil
 		}
 
+		postProcesses = append(postProcesses, uc.associationCountsTouched(*parsed.Associate, parsed.Schema, parsed.AssociationVariant, parsed.CreatedAt, mode))
+
 		if mode == domain.CommitModeExecute {
 			actions, err := uc.createReferenceDistributionActions(ctx, ip, parsed.Author, ccfs, requester, sd, distributionsFromPtr(parsed.Distributes), mode)
 			if err != nil {
@@ -150,23 +152,16 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 				span.RecordError(err)
 				return nil, errors.Join(errors.New("target document failed signature verification"), err)
 			}
-
-			var targetDoc concrnt.Document[any]
-			err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
-		} else { // あるとき
-			dists, err := uc.repo.GetDistributions(ctx, target)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-			distributions = append(distributions, dists...)
 		}
+
+		// the stored record's distributions are the document's own
+		var targetDoc concrnt.Document[any]
+		err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
 
 		// 各タイムラインを購読しているクライアントに、そのタイムラインにassociationが追加されたことを通知するために、
 		// association本体をリモートサーバーに転送し、eventの発生を促す。

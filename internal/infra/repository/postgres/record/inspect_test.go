@@ -78,6 +78,7 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 	return &repotest.KeyState{
 		RecordID:        key.RecordID,
 		RecordCreatedAt: key.RecordCreatedAt,
+		Redirect:        key.Redirect,
 	}, nil
 }
 
@@ -143,5 +144,11 @@ func (i *inspector) Acked(ctx context.Context, from, to, schema string) (*repote
 func (i *inspector) AckCount(ctx context.Context) (int64, error) {
 	var count int64
 	err := i.db.WithContext(ctx).Model(&models.Ack{}).Count(&count).Error
+	return count, err
+}
+
+func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
+	var count int64
+	err := i.db.WithContext(ctx).Model(&models.AbuseReport{}).Count(&count).Error
 	return count, err
 }

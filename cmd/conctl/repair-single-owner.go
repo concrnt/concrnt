@@ -39,6 +39,9 @@ var repairSingleOwnerCmd = &cobra.Command{
 		"in place for the operator to drop. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
+		if err := op.RequirePostgres(); err != nil {
+			return err
+		}
 		stats, err := repairSingleOwner(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairSingleOwnerDryRun)
 		if err != nil {
 			return err
@@ -49,6 +52,9 @@ var repairSingleOwnerCmd = &cobra.Command{
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d commit owners, %d entity timestamps, %d acked holdings, %d receiving-side raw acks\n",
 			verb, stats.Owners, stats.EntityTimestamps, stats.AckedHoldings, stats.DisownedRawAcks)
+		if !repairSingleOwnerDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
+		}
 		return nil
 	}),
 }
