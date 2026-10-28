@@ -9,9 +9,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # repository-layer tests start Postgres (and the Firestore emulator) via
-    # dockertest; the emulator image is large, so leave room for the pull
-    timeout-minutes: 30
+    # repository-layer tests start Postgres via dockertest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

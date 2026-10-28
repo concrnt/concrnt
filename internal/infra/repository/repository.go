@@ -36,7 +36,7 @@ type Set struct {
 	Notification      notification.Repository
 	Abuse             abuse.Repository
 
-	// Name is the backend name ("postgres", "firestore"), for logs.
+	// Name is the backend name ("postgres"), for logs.
 	Name string
 	// Collectors are backend-specific Prometheus collectors.
 	Collectors []prometheus.Collector
@@ -64,10 +64,8 @@ func Open(ctx context.Context, conf config.Backends, deps Deps) (*Set, error) {
 	switch strings.ToLower(conf.Database) {
 	case "", "postgres":
 		return openPostgres(conf, deps)
-	case "firestore":
-		return nil, fmt.Errorf("backends.database %q is not built into this binary yet", conf.Database)
 	default:
-		return nil, fmt.Errorf("unknown backends.database %q (expected postgres or firestore)", conf.Database)
+		return nil, fmt.Errorf("unknown backends.database %q (expected postgres)", conf.Database)
 	}
 }
 
