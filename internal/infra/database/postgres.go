@@ -12,8 +12,6 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
-
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
 func NewPostgres(dsn string) (*gorm.DB, error) {
@@ -72,31 +70,4 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	}
 
 	return db, nil
-}
-
-// migrationLockID serializes AutoMigrate across replicas starting simultaneously.
-const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
-
-func MigratePostgres(db *gorm.DB) error {
-	// session-level advisory lock must be taken and released on the same connection
-	return db.Connection(func(conn *gorm.DB) error {
-		if err := conn.Exec("SELECT pg_advisory_lock(?)", migrationLockID).Error; err != nil {
-			return err
-		}
-		defer conn.Exec("SELECT pg_advisory_unlock(?)", migrationLockID)
-
-		return conn.AutoMigrate(
-			&models.CommitLog{},
-			&models.Record{},
-			&models.RecordKey{},
-			&models.Association{},
-			&models.Ack{},
-			&models.Acked{},
-			&models.Server{},
-			&models.Entity{},
-			&models.EntityMeta{},
-			&models.Subscription{},
-			&models.AbuseReport{},
-		)
-	})
 }

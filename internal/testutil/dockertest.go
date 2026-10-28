@@ -21,7 +21,7 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
-	"github.com/concrnt/concrnt/internal/infra/database"
+	pgrepo "github.com/concrnt/concrnt/internal/infra/repository/postgres"
 )
 
 var (
@@ -149,7 +149,9 @@ func CreateDB() (*gorm.DB, func()) {
 		log.Fatalf("Could not connect to docker: %s", err)
 	}
 
-	database.MigratePostgres(db)
+	if err := pgrepo.Migrate(context.Background(), db); err != nil {
+		log.Fatalf("Could not migrate database: %s", err)
+	}
 
 	return db, cleanup
 }

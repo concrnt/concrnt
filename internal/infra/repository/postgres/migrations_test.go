@@ -1,24 +1,26 @@
-package database_test
+package postgres_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/infra/database"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
-	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/testutil"
 )
 
-// MigratePostgres must succeed on a fresh database and be re-runnable on an
-// already-migrated one (the server runs it at every start). testutil.CreateDB
-// discards the migration error, so this is the explicit check that every
-// table — including the ones listed after models.Acked — exists.
-func TestMigratePostgresIsIdempotent(t *testing.T) {
+// Migrate must succeed on a fresh database and be re-runnable on an
+// already-migrated one (the server runs it at every start): the second run
+// finds every step recorded and applies nothing.
+func TestMigrateIsIdempotent(t *testing.T) {
+	ctx := context.Background()
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 
-	require.NoError(t, database.MigratePostgres(db))
+	require.NoError(t, postgres.Migrate(ctx, db))
 
 	for _, model := range []any{
 		&models.CommitLog{}, &models.Record{}, &models.RecordKey{}, &models.Association{},
@@ -26,6 +28,18 @@ func TestMigratePostgresIsIdempotent(t *testing.T) {
 		&models.Subscription{}, &models.AbuseReport{},
 	} {
 		require.True(t, db.Migrator().HasTable(model), "table for %T must exist after migration", model)
+	}
+
+	type migrationRow struct {
+		Version int
+		Name    string
+	}
+	var rows []migrationRow
+	require.NoError(t, db.Raw("SELECT version, name FROM schema_migrations ORDER BY version").Scan(&rows).Error)
+	require.NotEmpty(t, rows)
+	require.Equal(t, 1, rows[0].Version)
+	for i, row := range rows {
+		require.Equal(t, i+1, row.Version, "steps are numbered contiguously from 1")
 	}
 
 	// Index names are unique per schema in Postgres, and gorm's HasIndex check

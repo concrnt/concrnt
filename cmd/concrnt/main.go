@@ -208,7 +208,7 @@ func main() {
 	if err != nil {
 		panic("failed to connect database: " + err.Error())
 	}
-	if err := database.MigratePostgres(db); err != nil {
+	if err := postgres.Migrate(ctx, db); err != nil {
 		panic("failed to migrate database: " + err.Error())
 	}
 	sqlDB, err := db.DB()
