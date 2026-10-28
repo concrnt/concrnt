@@ -102,7 +102,7 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
 // QueryRecordSubtree returns every live record whose key is base itself
 // (includeSelf) or lies under base's path subtree (base + "/..."), ordered by
-// URI so base leads. Unlike QueryByPrefix's raw prefix match this never picks
+// URI (byte order) so base leads. Unlike QueryByPrefix's raw prefix match this never picks
 // up sibling keys ("item2" for base "item"), and metacharacters in base are
 // escaped — the result is exactly the set a range delete may remove.
 func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
@@ -121,7 +121,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	}
 
 	var rks []models.RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Order(`uri COLLATE "C" ASC`).Preload("Record.Document").Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -247,17 +247,20 @@ func (r *Repository) QueryByParentOrderByKey(
 	if author != "" {
 		query = query.Where("r.author = ?", author)
 	}
+	// byte order (CONTRACT.md "Key order"): the collation is forced on the
+	// bounds and the ordering alike so the (parent_id, uri COLLATE "C") index
+	// serves both
 	if since != nil {
-		query = query.Where("record_keys.uri >= ?", *since)
+		query = query.Where(`record_keys.uri COLLATE "C" >= ?`, *since)
 	}
 	if until != nil {
-		query = query.Where("record_keys.uri <= ?", *until)
+		query = query.Where(`record_keys.uri COLLATE "C" <= ?`, *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("record_keys.uri DESC")
+		query = query.Order(`record_keys.uri COLLATE "C" DESC`)
 	} else {
-		query = query.Order("record_keys.uri ASC")
+		query = query.Order(`record_keys.uri COLLATE "C" ASC`)
 	}
 
 	if limit > 0 {

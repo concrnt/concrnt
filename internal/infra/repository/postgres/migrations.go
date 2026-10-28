@@ -20,6 +20,12 @@ type migration struct {
 
 var migrations = []migration{
 	{1, "baseline_tables", AutoMigrateTables},
+	// the key-ordered child listing moved to byte order (CONTRACT.md "Key
+	// order"); the index under this name was built on the database collation
+	// and is rebuilt by ensureIndexes with COLLATE "C"
+	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
+		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
+	}},
 }
 
 // AutoMigrateTables creates or extends every table from its model (tables,
@@ -45,7 +51,8 @@ func AutoMigrateTables(db *gorm.DB) error {
 // migrationLockID serializes Migrate across replicas starting simultaneously.
 const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
 
-// Migrate brings the schema up to date. Everything runs in one transaction
+// Migrate brings the schema up to date: the pending numbered steps, then the
+// shape indexes that do not exist yet. Everything runs in one transaction
 // under a transaction-scoped advisory lock, so concurrent starters queue up
 // and a failed step leaves the database untouched.
 func Migrate(ctx context.Context, db *gorm.DB) error {
@@ -81,6 +88,6 @@ func Migrate(ctx context.Context, db *gorm.DB) error {
 				return err
 			}
 		}
-		return nil
+		return ensureIndexes(tx)
 	})
 }
