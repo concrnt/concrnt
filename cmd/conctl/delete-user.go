@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/infra/objectstore"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 var (
@@ -240,7 +242,16 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 				break
 			}
 			for _, cl := range logs {
-				if err := commitsFile.writeCommitLog(cl); err != nil {
+				var proof concrnt.Proof
+				if cl.Proof != "" {
+					if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+						return stats, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
+					}
+				}
+				err := commitsFile.writeCommitLog(record.CommitLogEntry{
+					ID: cl.ID, IP: cl.IP, Document: cl.Document, Proof: proof, Owner: cl.Owner, CDate: cl.CDate,
+				})
+				if err != nil {
 					return stats, err
 				}
 				ids = append(ids, cl.ID)

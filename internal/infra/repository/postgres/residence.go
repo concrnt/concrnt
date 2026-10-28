@@ -187,3 +187,28 @@ func (r *ResidenceRepository) GetEntityByAlias(ctx context.Context, alias string
 		SignedDocument: &signedDocument,
 	}, nil
 }
+
+func (r *ResidenceRepository) ListMetas(ctx context.Context, owner string) ([]domain.EntityMeta, error) {
+	ctx, span := tracer.Start(ctx, "ResidenceRepository.ListMetas")
+	defer span.End()
+
+	var metas []models.EntityMeta
+	q := r.db.WithContext(ctx)
+	if owner != "" {
+		q = q.Where("id = ?", owner)
+	}
+	if err := q.Find(&metas).Error; err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	result := make([]domain.EntityMeta, 0, len(metas))
+	for _, m := range metas {
+		result = append(result, domain.EntityMeta{
+			ID:      m.ID,
+			Inviter: m.Inviter,
+			Info:    m.Info,
+		})
+	}
+	return result, nil
+}

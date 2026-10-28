@@ -10,7 +10,6 @@ import (
 
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/infra/objectstore"
 )
 
@@ -56,7 +55,7 @@ var gcCommitlogCmd = &cobra.Command{
 		"request IPs) the erase path removes: treat the bucket as personal data — restrict\n" +
 		"access, set an expiration lifecycle (and one aborting incomplete multipart uploads),\n" +
 		"or use --no-backup when erasure must be final.\n" +
-		"Reads and writes Postgres directly; safe to run against a live server. Re-running is a no-op.",
+		"Reads and writes the database directly; safe to run against a live server. Re-running is a no-op.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
 		ctx := cmd.Context()
@@ -86,12 +85,10 @@ var gcCommitlogCmd = &cobra.Command{
 		// keeping the match strictly older-than. Hash-based ids ('x'-prefixed)
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
+		maint := op.Repos.RecordMaintenance
 
 		if gcCommitlogDryRun {
-			var count int64
-			err := op.DB.WithContext(ctx).
-				Raw("SELECT count(*) FROM commit_logs WHERE gc_candidate AND id < ?", cutoff).
-				Scan(&count).Error
+			count, err := maint.CountGcCandidates(ctx, cutoff)
 			if err != nil {
 				return fmt.Errorf("failed to count commit logs: %w", err)
 			}
@@ -104,20 +101,29 @@ var gcCommitlogCmd = &cobra.Command{
 			return nil
 		}
 
-		var total int64
+		total := 0
 		if bucket == "" {
 			for {
-				// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
-				// each statement (and its cascade) bounded.
-				res := op.DB.WithContext(ctx).
-					Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT ?)", cutoff, gcCommitlogBatchSize)
-				if res.Error != nil {
-					return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+				// batching keeps each delete (and its cascade) bounded
+				logs, err := maint.ListGcCandidates(ctx, cutoff, "", gcCommitlogBatchSize)
+				if err != nil {
+					return fmt.Errorf("failed to list commit logs: %w", err)
 				}
-				if res.RowsAffected == 0 {
+				if len(logs) == 0 {
 					break
 				}
-				total += res.RowsAffected
+				ids := make([]string, 0, len(logs))
+				for _, cl := range logs {
+					ids = append(ids, cl.ID)
+				}
+				deleted, err := maint.DeleteCommitLogs(ctx, ids)
+				if err != nil {
+					return fmt.Errorf("failed to delete commit logs: %w", err)
+				}
+				if deleted == 0 {
+					break
+				}
+				total += deleted
 				fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 			}
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
@@ -136,19 +142,12 @@ var gcCommitlogCmd = &cobra.Command{
 		defer backup.close()
 
 		// Snapshot every candidate into the backup file, remembering the ids so
-		// the delete below touches exactly the rows that were backed up. Paging
-		// by id keeps the primary-key index in use (see dump-commitlog).
+		// the delete below touches exactly the rows that were backed up.
 		var ids []string
 		cursor := ""
 		for {
-			var logs []models.CommitLog
-			q := op.DB.WithContext(ctx).
-				Where("gc_candidate AND id < ?", cutoff).
-				Order("id ASC").Limit(gcCommitlogBatchSize)
-			if cursor != "" {
-				q = q.Where("id > ?", cursor)
-			}
-			if err := q.Find(&logs).Error; err != nil {
+			logs, err := maint.ListGcCandidates(ctx, cutoff, cursor, gcCommitlogBatchSize)
+			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}
 			if len(logs) == 0 {
@@ -182,14 +181,14 @@ var gcCommitlogCmd = &cobra.Command{
 		// Only now, with the backup durable, delete exactly the backed-up rows.
 		for start := 0; start < len(ids); start += gcCommitlogBatchSize {
 			batch := ids[start:min(start+gcCommitlogBatchSize, len(ids))]
-			res := op.DB.WithContext(ctx).Exec("DELETE FROM commit_logs WHERE id IN ?", batch)
-			if res.Error != nil {
-				return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+			deleted, err := maint.DeleteCommitLogs(ctx, batch)
+			if err != nil {
+				return fmt.Errorf("failed to delete commit logs: %w", err)
 			}
-			if res.RowsAffected != int64(len(batch)) {
-				fmt.Fprintf(os.Stderr, "warning: expected to delete %d commit logs but deleted %d (concurrent gc?)\n", len(batch), res.RowsAffected)
+			if deleted != len(batch) {
+				fmt.Fprintf(os.Stderr, "warning: expected to delete %d commit logs but deleted %d (concurrent gc?)\n", len(batch), deleted)
 			}
-			total += res.RowsAffected
+			total += deleted
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 		}
 		fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
