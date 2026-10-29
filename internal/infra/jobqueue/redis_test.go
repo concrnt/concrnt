@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -190,7 +191,8 @@ func TestRedisJobQueue_ScanDLQPagesAndKeepsRaw(t *testing.T) {
 		t.Fatalf("ScanDLQ returned %d entries, want %d", len(dead), total)
 	}
 	for i, dl := range dead {
-		if i > 0 && dl.StreamID <= dead[i-1].StreamID {
+		// stream ID は "<ms>-<seq>" なので文字列比較では "-10" < "-9" になる
+		if i > 0 && streamIDKey(t, dl.StreamID) <= streamIDKey(t, dead[i-1].StreamID) {
 			t.Fatalf("entry %d (%s) is not after entry %d (%s)", i, dl.StreamID, i-1, dead[i-1].StreamID)
 		}
 		if i == 7 {
@@ -335,4 +337,21 @@ func TestRedisJobQueue_ReportsLoopHeartbeats(t *testing.T) {
 	if stalled := watchdog.Stalled(time.Now().Add(time.Hour)); len(stalled) != 0 {
 		t.Fatalf("stopped loops must release their heartbeat: %v", stalled)
 	}
+}
+
+func streamIDKey(t *testing.T, id string) uint64 {
+	t.Helper()
+	ms, seq, ok := strings.Cut(id, "-")
+	if !ok {
+		t.Fatalf("malformed stream id %q", id)
+	}
+	m, err := strconv.ParseUint(ms, 10, 64)
+	if err != nil {
+		t.Fatalf("malformed stream id %q: %v", id, err)
+	}
+	n, err := strconv.ParseUint(seq, 10, 64)
+	if err != nil {
+		t.Fatalf("malformed stream id %q: %v", id, err)
+	}
+	return m<<20 | n
 }
