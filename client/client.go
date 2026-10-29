@@ -38,10 +38,10 @@ const (
 )
 
 type Client struct {
-	client     *http.Client
-	cache      *cache.Cache
-	lastFailed map[string]time.Time
-	failCount  map[string]int
+	client          *http.Client
+	cache           *cache.Cache
+	lastFailed      map[string]time.Time
+	failCount       map[string]int
 	plainHosts      map[string]time.Time
 	onlineMu        sync.RWMutex
 	userAgent       string

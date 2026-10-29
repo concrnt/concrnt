@@ -1117,7 +1117,7 @@ func (h *Handler) handleImportRepository(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", maxImportBodyBytes))
 		}
 		if errors.Is(err, bufio.ErrTooLong) {
-			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, fmt.Sprintf("a line exceeds %d bytes", record.MaxImportLineBytes))
+			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, fmt.Sprintf("a line exceeds %d bytes", 1<<20))
 		}
 		return presenter.BadRequest(c, err)
 	}
