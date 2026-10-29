@@ -1,10 +1,12 @@
 package record
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/concrnt/concrnt"
@@ -47,14 +49,18 @@ type ImportResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
-func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, jsonl string) []ImportResult {
+// Per-line failures go in the result; a read failure (incl. bufio.ErrTooLong)
+// is the error.
+func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, r io.Reader) ([]ImportResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.ImportCommitLogs")
 	defer span.End()
 
 	results := []ImportResult{}
 
-	lines := strings.SplitSeq(jsonl, "\n")
-	for line := range lines {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for sc.Scan() {
+		line := sc.Text()
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
@@ -62,25 +68,34 @@ func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, jsonl string
 		err := json.Unmarshal([]byte(line), &sd)
 		if err != nil {
 			span.RecordError(err)
-			result := ImportResult{
-				Document: line,
+			results = append(results, ImportResult{
+				Document: truncate(line, 1<<10),
 				Error:    fmt.Sprintf("failed to parse line as SignedDocument: %v", err),
-			}
-			results = append(results, result)
+			})
 			continue
 		}
 
 		_, err = uc.Commit(ctx, ip, sd, domain.CommitModeLocalOnlyExecute)
 		if err != nil {
 			span.RecordError(err)
-			result := ImportResult{
-				Document: line,
+			results = append(results, ImportResult{
+				Document: truncate(line, 1<<10),
 				Error:    fmt.Sprintf("failed to commit document: %v", err),
-			}
-			results = append(results, result)
+			})
 			continue
 		}
 	}
+	if err := sc.Err(); err != nil {
+		span.RecordError(err)
+		return results, err
+	}
 
-	return results
+	return results, nil
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
 }

@@ -1,11 +1,11 @@
 package rest
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -87,7 +87,13 @@ var Endpoints = map[string]string{
 
 func (h *Handler) RegisterRoutes(app *echo.Echo, e *echo.Group) {
 
-	api := e.Group(apiPrefix, echomiddleware.CORS())
+	bodyLimit := echomiddleware.BodyLimitWithConfig(echomiddleware.BodyLimitConfig{
+		Limit: "1M",
+		Skipper: func(c echo.Context) bool {
+			return c.Path() == apiPrefix+"/repository" || c.Path() == apiPrefix+"/batch"
+		},
+	})
+	api := e.Group(apiPrefix, echomiddleware.CORS(), bodyLimit)
 	api.POST("/commit", h.handleCommit)
 	api.OPTIONS("/commit", h.handleNop)
 	api.GET("/resolve", h.handleResolve)
@@ -141,7 +147,7 @@ func (h *Handler) RegisterRoutes(app *echo.Echo, e *echo.Group) {
 	// api.GET("/internal/signal/subscriptions", h.handleCurrentSubs)
 	// api.OPTIONS("/internal/signal/subscriptions", h.handleNop)
 
-	api.POST("/batch", batchHandler(app, h.config.FQDN, h.chunklineItrBatchHandler()))
+	api.POST("/batch", batchHandler(app, h.config.FQDN, h.chunklineItrBatchHandler()), echomiddleware.BodyLimit("16M"))
 
 }
 
@@ -1088,19 +1094,33 @@ func (h *Handler) handleDumpRepository(c echo.Context) error {
 	return c.String(http.StatusOK, dump)
 }
 
+// maxImportBodyBytes bounds a whole repository import request. conctl posts
+// up to 1000 lines per request, each at most a MaxDocumentSize document.
+const maxImportBodyBytes = 64 << 20
+
 func (h *Handler) handleImportRepository(c echo.Context) error {
 	ctx := c.Request().Context()
 
-	var dump string
-	dumpBytes, err := io.ReadAll(c.Request().Body)
-	if err != nil {
-		return presenter.BadRequest(c, err)
+	// Either a user (domain.Entity) or a service account (CSID string) may
+	// import; Commit decides what each is allowed to do.
+	if ctx.Value(interop.RequesterCtxKey) == nil {
+		return presenter.Forbidden(c, "authentication required")
 	}
-	dump = string(dumpBytes)
 
 	ip := c.RealIP()
 
-	results := h.record.ImportCommitLogs(ctx, ip, dump)
+	body := http.MaxBytesReader(c.Response(), c.Request().Body, maxImportBodyBytes)
+	results, err := h.record.ImportCommitLogs(ctx, ip, body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds %d bytes", maxImportBodyBytes))
+		}
+		if errors.Is(err, bufio.ErrTooLong) {
+			return echo.NewHTTPError(http.StatusRequestEntityTooLarge, fmt.Sprintf("a line exceeds %d bytes", record.MaxImportLineBytes))
+		}
+		return presenter.BadRequest(c, err)
+	}
 	return presenter.OK(c, results)
 }
 
