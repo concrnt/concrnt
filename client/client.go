@@ -1081,6 +1081,12 @@ func (c *Client) Commit(ctx context.Context, resolver string, sd concrnt.SignedD
 	return nil
 }
 
+// realtimeReadLimit bounds one message read from a peer's realtime feed, so a
+// misbehaving peer cannot make us buffer an arbitrarily large frame. Events
+// carry public-view signed documents (the API accepts 1M per document, 16M
+// per batch), so 16 MiB is generous.
+const realtimeReadLimit = 16 << 20
+
 func (c *Client) Realtime(ctx context.Context, fqdn string) (*websocket.Conn, error) {
 	_, span := tracer.Start(ctx, "Client.Realtime")
 	defer span.End()
@@ -1127,6 +1133,7 @@ func (c *Client) Realtime(ctx context.Context, fqdn string) (*websocket.Conn, er
 		span.RecordError(err)
 		return nil, err
 	}
+	conn.SetReadLimit(realtimeReadLimit)
 
 	return conn, nil
 }

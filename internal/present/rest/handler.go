@@ -899,6 +899,17 @@ var upgrader = websocket.Upgrader{
 // write loop forever.
 const realtimeWriteWait = 10 * time.Second
 
+// realtimeMaxMessageBytes bounds one message read from a realtime client, so
+// a client cannot make the server buffer an arbitrarily large frame (gorilla
+// answers a bigger one with close 1009). realtimeMaxPrefixes bounds the
+// subscription list of one request; extra prefixes are dropped, and the
+// "subscribed" reply shows the list in effect. A realistic prefix is ~110-130
+// bytes, so 3000 of them stay well under the message limit.
+const (
+	realtimeMaxMessageBytes = 1 << 20
+	realtimeMaxPrefixes     = 3000
+)
+
 func (h *Handler) handleRealtime(c echo.Context) error {
 	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
@@ -912,6 +923,7 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 	defer func() {
 		ws.Close()
 	}()
+	ws.SetReadLimit(realtimeMaxMessageBytes)
 
 	// The channels are deliberately never closed: the producers spawned by
 	// Realtime (and the redis pubsub goroutines below it) send on output and
@@ -946,6 +958,13 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 							slog.String("module", "socket"),
 						)
 					}
+				} else if errors.Is(err, websocket.ErrReadLimit) {
+					// client misbehaviour, not a server fault: keep it out of
+					// the error log so it cannot be used to flood it
+					slog.DebugContext(
+						ctx, "WebSocket message exceeds read limit",
+						slog.String("module", "socket"),
+					)
 				} else {
 					slog.ErrorContext(
 						ctx, "Error reading message",
@@ -968,6 +987,9 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 				prefixes := req.Prefixes
 				if prefixes == nil {
 					prefixes = []string{}
+				}
+				if len(prefixes) > realtimeMaxPrefixes {
+					prefixes = prefixes[:realtimeMaxPrefixes]
 				}
 				select {
 				case input <- prefixes:
