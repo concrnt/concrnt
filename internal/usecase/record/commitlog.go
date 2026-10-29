@@ -49,6 +49,14 @@ type ImportResult struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// MaxImportLineBytes bounds one line of a commit log import; a longer line
+// fails the import with bufio.ErrTooLong.
+const MaxImportLineBytes = 1 << 20
+
+// maxImportEchoBytes bounds how much of a rejected line is echoed back in
+// the result.
+const maxImportEchoBytes = 1 << 10
+
 // Per-line failures go in the result; a read failure (incl. bufio.ErrTooLong)
 // is the error.
 func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, r io.Reader) ([]ImportResult, error) {
@@ -58,7 +66,7 @@ func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, r io.Reader)
 	results := []ImportResult{}
 
 	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	sc.Buffer(make([]byte, 0, 64<<10), MaxImportLineBytes)
 	for sc.Scan() {
 		line := sc.Text()
 		if strings.TrimSpace(line) == "" {
@@ -69,7 +77,7 @@ func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, r io.Reader)
 		if err != nil {
 			span.RecordError(err)
 			results = append(results, ImportResult{
-				Document: truncate(line, 1<<10),
+				Document: truncate(line, maxImportEchoBytes),
 				Error:    fmt.Sprintf("failed to parse line as SignedDocument: %v", err),
 			})
 			continue
@@ -79,7 +87,7 @@ func (uc *Usecase) ImportCommitLogs(ctx context.Context, ip string, r io.Reader)
 		if err != nil {
 			span.RecordError(err)
 			results = append(results, ImportResult{
-				Document: truncate(line, 1<<10),
+				Document: truncate(line, maxImportEchoBytes),
 				Error:    fmt.Sprintf("failed to commit document: %v", err),
 			})
 			continue
