@@ -8,7 +8,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/utils"
 )
@@ -29,7 +29,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 		return false, err
 	}
 
-	association := models.Association{
+	association := postgres.Association{
 		TargetID:   targetRK.ID,
 		DocumentID: documentID,
 		Unique:     unique,
@@ -66,7 +66,7 @@ func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.Reposito
 		return err
 	}
 
-	return db.Delete(&models.Association{}, "document_id = ?", documentID).Error
+	return db.Delete(&postgres.Association{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -80,7 +80,7 @@ func (r *Repository) GetAssociatedRecords(
 	defer span.End()
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Association{}).
+		Model(&postgres.Association{}).
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Joins("JOIN commit_logs c ON c.id = associations.document_id").
 		Where("rk.uri = ?", targetURI)
@@ -155,7 +155,7 @@ func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targe
 	}
 
 	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
+		Model(&postgres.Association{}).
 		Select("schema, COUNT(*) AS count").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).
@@ -189,7 +189,7 @@ func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targ
 	}
 
 	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
+		Model(&postgres.Association{}).
 		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).

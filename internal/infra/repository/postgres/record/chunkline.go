@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/chunkline"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 )
 
 const (
@@ -27,9 +27,9 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	}
 
 	var firstChunk *int64
-	firstCollectionMember := models.RecordKey{}
+	firstCollectionMember := postgres.RecordKey{}
 	err = r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&postgres.RecordKey{}).
 		Where("record_keys.parent_id = ?", recordKey.ID).
 		Where("record_keys.record_created_at IS NOT NULL").
 		Order("record_keys.record_created_at ASC").
@@ -113,7 +113,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		return nil, err
 	}
 
-	var members []models.RecordKey
+	var members []postgres.RecordKey
 	err = r.db.WithContext(ctx).
 		Where("parent_id = ?", parentRecordKey.ID).
 		Where("record_created_at < ?", chunkDate).

@@ -4,13 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
+func nowMicros() int64 {
+	return Micros(time.Now())
+}
+
 // The schema mirrors the Postgres one table for table (see
-// internal/infra/database/models): text ids, INTEGER microsecond
-// timestamps, INTEGER booleans, JSON text for arrays, and the same
-// foreign-key cascades. Indexes come from the shape registry (indexes.go);
-// only primary keys and unique constraints are declared here.
+// internal/infra/repository/postgres/models.go): text ids, INTEGER
+// microsecond timestamps, INTEGER booleans, JSON text for arrays, and the
+// same foreign-key cascades. The access path each index serves is listed in
+// CONTRACT.md. SQLite's default BINARY collation already is byte order, so
+// the key-ordered index needs no collation.
 var tables = []string{
 	`CREATE TABLE IF NOT EXISTS commit_logs (
 		id TEXT PRIMARY KEY,
@@ -119,6 +125,29 @@ var tables = []string{
 	)`,
 }
 
+var indexes = []string{
+	`CREATE INDEX IF NOT EXISTS idx_commit_logs_owner_c_date ON commit_logs (owner, c_date)`,
+	`CREATE INDEX IF NOT EXISTS idx_commit_logs_c_date_id ON commit_logs (c_date, id)`,
+	`CREATE INDEX IF NOT EXISTS idx_commit_logs_gc_candidate ON commit_logs (gc_candidate)`,
+	`CREATE INDEX IF NOT EXISTS idx_record_keys_parent_id_record_id ON record_keys (parent_id, record_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_record_keys_parent_created_at_record_id ON record_keys (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL AND record_created_at IS NOT NULL`,
+	`CREATE INDEX IF NOT EXISTS idx_record_keys_parent_id_uri ON record_keys (parent_id, uri)`,
+	`CREATE INDEX IF NOT EXISTS idx_records_schema_created_at_document_id ON records (schema, created_at, document_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_records_author_created_at_document_id ON records (author, created_at, document_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_records_document_id_created_at ON records (document_id, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acks_from_valid_created_at ON acks ("from", valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acks_to_valid_created_at ON acks ("to", valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acks_schema_valid_created_at ON acks (schema, valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acked_from_valid_created_at ON ackeds ("from", valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acked_to_valid_created_at ON ackeds ("to", valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_acked_schema_valid_created_at ON ackeds (schema, valid, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_associations_target_id ON associations (target_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_associations_target_schema_variant_author ON associations (target_id, schema, variant, author)`,
+	`CREATE INDEX IF NOT EXISTS idx_associations_target_schema_variant_created_at ON associations (target_id, schema, variant, created_at)`,
+	`CREATE INDEX IF NOT EXISTS idx_servers_cs_id ON servers (cs_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_entities_alias ON entities (alias)`,
+}
+
 type migration struct {
 	Version int
 	Name    string
@@ -127,7 +156,7 @@ type migration struct {
 
 var migrations = []migration{
 	{1, "baseline_tables", func(ctx context.Context, tx *sql.Tx) error {
-		for _, stmt := range tables {
+		for _, stmt := range append(append([]string{}, tables...), indexes...) {
 			if _, err := tx.ExecContext(ctx, stmt); err != nil {
 				return err
 			}
@@ -136,9 +165,8 @@ var migrations = []migration{
 	}},
 }
 
-// Migrate applies the pending numbered steps and then creates every shape
-// index that is missing, all in one IMMEDIATE transaction (the writer lock
-// serialises concurrent starters).
+// Migrate applies the pending numbered steps in one IMMEDIATE transaction
+// (the writer lock serialises concurrent starters).
 func Migrate(ctx context.Context, db *DB) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -180,16 +208,6 @@ func Migrate(ctx context.Context, db *DB) error {
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)", m.Version, m.Name, nowMicros()); err != nil {
 			return err
-		}
-	}
-
-	ddl, err := IndexDDL()
-	if err != nil {
-		return err
-	}
-	for _, stmt := range ddl {
-		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("%s: %w", stmt, err)
 		}
 	}
 	return tx.Commit()

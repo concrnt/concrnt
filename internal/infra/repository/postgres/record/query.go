@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -22,7 +22,7 @@ func (r *Repository) QueryByPrefix(
 
 	// the prefix is a literal (CONTRACT.md): its LIKE metacharacters are
 	// escaped so "it_em" cannot match "items"
-	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false).
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).
 		Where(`uri LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
@@ -69,7 +69,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
-	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false)
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false)
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
@@ -107,7 +107,7 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false)
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false)
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -169,7 +169,7 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	query := joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), true)
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), true)
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {

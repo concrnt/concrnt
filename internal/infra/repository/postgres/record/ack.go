@@ -8,7 +8,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -21,7 +21,7 @@ func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, d
 		return false, err
 	}
 
-	ack := models.Ack{
+	ack := postgres.Ack{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -67,7 +67,7 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 		return false, err
 	}
 
-	ack := models.Acked{
+	ack := postgres.Acked{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -109,7 +109,7 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 	defer span.End()
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
+		Model(&postgres.Ack{}).
 		Joins("JOIN commit_logs c ON c.id = acks.document_id").
 		Where("acks.from = ?", from).
 		Where("acks.valid = ?", true)
@@ -150,7 +150,7 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 	defer span.End()
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
+		Model(&postgres.Acked{}).
 		Joins("JOIN commit_logs c ON c.id = ackeds.document_id").
 		Where("ackeds.to = ?", to).
 		Where("ackeds.valid = ?", true)
@@ -214,7 +214,7 @@ func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
+		Model(&postgres.Ack{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("acks.from = ?", from)
@@ -249,7 +249,7 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
+		Model(&postgres.Acked{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("ackeds.to = ?", to)

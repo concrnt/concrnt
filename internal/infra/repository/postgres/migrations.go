@@ -7,7 +7,6 @@ import (
 	"gorm.io/gorm"
 
 	aggpg "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
 // migration is one numbered, idempotent schema step. Steps are applied in
@@ -23,7 +22,7 @@ var migrations = []migration{
 	{1, "baseline_tables", AutoMigrateTables},
 	// the key-ordered child listing moved to byte order (CONTRACT.md "Key
 	// order"); the index under this name was built on the database collation
-	// and is rebuilt by ensureIndexes with COLLATE "C"
+	// and is rebuilt by AutoMigrate with COLLATE "C"
 	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
 		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
 	}},
@@ -46,33 +45,37 @@ var migrations = []migration{
 	}},
 }
 
-// AutoMigrateTables creates or extends every table from its model (tables,
-// primary keys, unique constraints, foreign keys). Migrate runs it once as
-// the baseline; `conctl op repair-anchored-acks` runs it again after it has
-// reshaped a pre-baseline schema by hand.
+// AutoMigrateTables creates or extends every table from its model: tables,
+// columns, primary keys, unique constraints, foreign keys and indexes. It is
+// additive, so Migrate runs it at every start after the numbered steps: a new
+// column or index only needs its tag. Changing an existing index needs a step
+// that drops it by name (see step 2); AutoMigrate then recreates it from the
+// tag. `conctl op repair-anchored-acks` runs it again after it has reshaped a
+// pre-baseline schema by hand.
 func AutoMigrateTables(db *gorm.DB) error {
 	return db.AutoMigrate(
-		&models.CommitLog{},
-		&models.Record{},
-		&models.RecordKey{},
-		&models.Association{},
-		&models.Ack{},
-		&models.Acked{},
-		&models.Server{},
-		&models.Entity{},
-		&models.EntityMeta{},
-		&models.Subscription{},
-		&models.AbuseReport{},
+		&CommitLog{},
+		&Record{},
+		&RecordKey{},
+		&Association{},
+		&Ack{},
+		&Acked{},
+		&Server{},
+		&Entity{},
+		&EntityMeta{},
+		&Subscription{},
+		&AbuseReport{},
 	)
 }
 
 // migrationLockID serializes Migrate across replicas starting simultaneously.
 const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
 
-// Migrate brings the schema up to date: the pending numbered steps, then the
-// shape indexes that do not exist yet. Everything runs in one transaction
-// under a transaction-scoped advisory lock, so concurrent starters queue up
-// and a failed step leaves the database untouched.
+// Migrate brings the schema up to date: the pending numbered steps, then
+// AutoMigrate for whatever the models declare and the database lacks.
+// Everything runs in one transaction under a transaction-scoped advisory
+// lock, so concurrent starters queue up and a failed step leaves the
+// database untouched.
 func Migrate(ctx context.Context, db *gorm.DB) error {
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLockID).Error; err != nil {
@@ -106,6 +109,6 @@ func Migrate(ctx context.Context, db *gorm.DB) error {
 				return err
 			}
 		}
-		return ensureIndexes(tx)
+		return AutoMigrateTables(tx)
 	})
 }

@@ -14,7 +14,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -46,7 +46,7 @@ func (r *Repository) CreateRecord(
 	// key, an equal or older one is a no-op. Deciding under the row lock
 	// closes the read-then-write race between concurrent commits, same as
 	// CreateEntity's conditional upsert.
-	var oldRecordKey models.RecordKey
+	var oldRecordKey postgres.RecordKey
 	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", key).
 		Take(&oldRecordKey).Error
@@ -58,7 +58,7 @@ func (r *Repository) CreateRecord(
 		return false, nil
 	}
 
-	record := models.Record{
+	record := postgres.Record{
 		DocumentID:    documentID,
 		Owner:         owner,
 		Author:        author,
@@ -90,7 +90,7 @@ func (r *Repository) CreateRecord(
 	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
 
 	// RecordKeyを作る
-	rk := models.RecordKey{
+	rk := postgres.RecordKey{
 		URI:             key,
 		ParentID:        pid,
 		RecordID:        &documentID,
@@ -119,13 +119,13 @@ func (r *Repository) CreateRecord(
 
 	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
 	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if err := db.Model(&models.CommitLog{}).
+		if err := db.Model(&postgres.CommitLog{}).
 			Where("id = ?", oldRecordKey.RecordID).
 			Update("gc_candidate", true).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
-		if err := db.Delete(&models.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
+		if err := db.Delete(&postgres.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
@@ -150,7 +150,7 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var rk models.RecordKey
+		var rk postgres.RecordKey
 		err = r.db.WithContext(ctx).
 			Where("record_id = ?", parsed.CDID).
 			Take(&rk).Error
@@ -247,7 +247,7 @@ func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[strin
 	var entries []tuple
 	if len(uris) > 0 {
 		err := r.db.WithContext(ctx).
-			Model(&models.Record{}).
+			Model(&postgres.Record{}).
 			Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
 			Joins("JOIN record_keys rk ON rk.record_id = records.document_id").
 			Where("rk.uri IN ?", uris).
@@ -307,7 +307,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 
 	switch parsed.Scheme {
 	case "cckv":
-		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false).Where("record_keys.uri = ?", uri))
+		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).Where("record_keys.uri = ?", uri))
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -376,7 +376,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 
 	out := make(map[string]*concrnt.SignedDocument, len(uris))
 	if len(keys) > 0 {
-		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&models.RecordKey{}), false).Where("record_keys.uri IN ?", keys))
+		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).Where("record_keys.uri IN ?", keys))
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -417,7 +417,7 @@ func (r *Repository) signedDocumentsByID(ctx context.Context, ids []string) (map
 		URI      *string
 	}
 	err := r.db.WithContext(ctx).
-		Model(&models.CommitLog{}).
+		Model(&postgres.CommitLog{}).
 		Select("commit_logs.id AS id, commit_logs.document AS document, commit_logs.proof AS proof, rk.uri AS uri").
 		Joins("LEFT JOIN record_keys rk ON rk.record_id = commit_logs.id").
 		Where("commit_logs.id IN ?", ids).
@@ -446,8 +446,8 @@ func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.Reposito
 		return err
 	}
 
-	q := db.Model(&models.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
-	return db.Where("document_id = (?)", q).Delete(&models.Record{}).Error
+	q := db.Model(&postgres.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
+	return db.Where("document_id = (?)", q).Delete(&postgres.Record{}).Error
 }
 
 func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
@@ -460,7 +460,7 @@ func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.R
 		return err
 	}
 
-	return db.Delete(&models.Record{}, "document_id = ?", documentID).Error
+	return db.Delete(&postgres.Record{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
@@ -502,7 +502,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	return *row.ParentURI, itemID, nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
 	defer span.End()
 
@@ -536,7 +536,7 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 				pid = &parentID.ID
 			}
 
-			newRecordKey := models.RecordKey{
+			newRecordKey := postgres.RecordKey{
 				URI:      parentURI,
 				RecordID: nil,
 				ParentID: pid,
@@ -567,11 +567,11 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	return parentRK, nil
 }
 
-func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetRecordKeyByURI")
 	defer span.End()
 
-	var recordKey models.RecordKey
+	var recordKey postgres.RecordKey
 	err := db.WithContext(ctx).
 		Where("uri = ?", uri).
 		Take(&recordKey).Error

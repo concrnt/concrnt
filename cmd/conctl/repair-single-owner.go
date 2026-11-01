@@ -13,7 +13,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/schemas"
 )
 
@@ -129,7 +129,7 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 	// per batch and applied in one statement: a round trip and a commit per
 	// row is what makes a production-sized table take hours.
 	hasLegacyOwners := db.Migrator().HasTable("commit_owners")
-	var unowned []models.CommitLog
+	var unowned []postgres.CommitLog
 	if err := db.WithContext(ctx).Select("id", "document").Where("(owner = '' OR owner IS NULL)").FindInBatches(&unowned, 500, func(tx *gorm.DB, batch int) error {
 		legacyOwners := map[string][]string{}
 		if hasLegacyOwners {
@@ -184,7 +184,7 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 	}
 
 	// Step 2: entities.created_at from the entity document.
-	var entities []models.Entity
+	var entities []postgres.Entity
 	if err := db.WithContext(ctx).Preload("Document").Where("created_at = 'epoch'").FindInBatches(&entities, 500, func(tx *gorm.DB, batch int) error {
 		var rows []string // "(id, createdAt)" placeholders
 		var args []any
@@ -212,7 +212,7 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 	// Step 3: the target's holding for every ack whose target is local, and
 	// Step 4: removal of the receiving-side raw ack copies. Both are applied
 	// in one transaction per batch, holdings first.
-	var acks []models.Ack
+	var acks []postgres.Ack
 	if err := db.WithContext(ctx).Preload("Document").FindInBatches(&acks, 500, func(tx *gorm.DB, batch int) error {
 		// the holdings already in place for this batch, keyed by (from, to, schema)
 		var keys []string // "(from, to, schema)" placeholders
@@ -221,17 +221,17 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 			keys = append(keys, "(?, ?, ?)")
 			keyArgs = append(keyArgs, ack.From, ack.To, ack.Schema)
 		}
-		var held []models.Acked
+		var held []postgres.Acked
 		if err := db.WithContext(ctx).Where(`("from", "to", schema) IN (`+strings.Join(keys, ", ")+`)`, keyArgs...).Find(&held).Error; err != nil {
 			return err
 		}
-		existing := map[[3]string]models.Acked{}
+		existing := map[[3]string]postgres.Acked{}
 		for _, h := range held {
 			existing[[3]string{h.From, h.To, h.Schema}] = h
 		}
 
-		var holdingCommits []models.CommitLog
-		var holdings []models.Acked
+		var holdingCommits []postgres.CommitLog
+		var holdings []postgres.Acked
 		var disowned []string
 		for _, ack := range acks {
 			fromLocal, err := isLocal(ack.From)
@@ -265,14 +265,14 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 					if err != nil {
 						return err
 					}
-					holdingCommits = append(holdingCommits, models.CommitLog{
+					holdingCommits = append(holdingCommits, postgres.CommitLog{
 						ID:       ackedID,
 						IP:       ack.Document.IP,
 						Document: acked.Document,
 						Proof:    string(proofBytes),
 						Owner:    ack.To,
 					})
-					holdings = append(holdings, models.Acked{
+					holdings = append(holdings, postgres.Acked{
 						From:       ack.From,
 						To:         ack.To,
 						Schema:     ack.Schema,
@@ -307,10 +307,10 @@ func repairSingleOwner(ctx context.Context, db *gorm.DB, fqdn string, dryRun boo
 				}
 			}
 			if len(disowned) > 0 {
-				if err := tx.Where("document_id IN ?", disowned).Delete(&models.Ack{}).Error; err != nil {
+				if err := tx.Where("document_id IN ?", disowned).Delete(&postgres.Ack{}).Error; err != nil {
 					return fmt.Errorf("disown raw copies: %w", err)
 				}
-				if err := tx.Model(&models.CommitLog{}).Where("id IN ?", disowned).
+				if err := tx.Model(&postgres.CommitLog{}).Where("id IN ?", disowned).
 					Updates(map[string]any{"owner": "", "gc_candidate": true}).Error; err != nil {
 					return fmt.Errorf("disown raw copies: %w", err)
 				}

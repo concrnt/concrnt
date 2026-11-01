@@ -11,7 +11,6 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
@@ -29,7 +28,7 @@ func NewServerRepository(config *domain.Config, db *gorm.DB, cl *client.Client) 
 	}
 }
 
-func modelToDomainServer(m *models.Server) (*domain.Server, error) {
+func modelToDomainServer(m *Server) (*domain.Server, error) {
 	var wkc concrnt.WellKnownConcrnt
 	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
 		return nil, err
@@ -55,7 +54,7 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
 	defer span.End()
 
-	var server models.Server
+	var server Server
 	err := r.db.WithContext(ctx).
 		Where("cs_id = ?", csid).
 		Take(&server).Error
@@ -79,7 +78,7 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 		return nil, err
 	}
 
-	newServer := models.Server{
+	newServer := Server{
 		ID:        wkc.Domain,
 		CSID:      wkc.CSID,
 		Layer:     wkc.Layer,
@@ -102,7 +101,7 @@ func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (
 	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
 	defer span.End()
 
-	var server models.Server
+	var server Server
 	err := r.db.WithContext(ctx).
 		Where("id = ?", fqdn).
 		Take(&server).Error
@@ -122,7 +121,7 @@ func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (
 		return nil, err
 	}
 
-	newServer := models.Server{
+	newServer := Server{
 		ID:        wkc.Domain,
 		CSID:      wkc.CSID,
 		Layer:     wkc.Layer,
@@ -145,7 +144,7 @@ func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrn
 	ctx, span := tracer.Start(ctx, "ServerRepository.List")
 	defer span.End()
 
-	servers, err := gorm.G[models.Server](r.db).Find(ctx)
+	servers, err := gorm.G[Server](r.db).Find(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -10,7 +10,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -82,7 +82,7 @@ func seedBetaState(t *testing.T, db *gorm.DB) betaState {
 		require.NoError(t, err)
 		proofBytes, err := json.Marshal(sd.Proof)
 		require.NoError(t, err)
-		require.NoError(t, db.WithContext(ctx).Create(&models.CommitLog{ID: id, IP: "127.0.0.1", Document: sd.Document, Proof: string(proofBytes), GcCandidate: gc}).Error)
+		require.NoError(t, db.WithContext(ctx).Create(&postgres.CommitLog{ID: id, IP: "127.0.0.1", Document: sd.Document, Proof: string(proofBytes), GcCandidate: gc}).Error)
 		require.NoError(t, db.Exec(`UPDATE commit_logs SET owner = ? WHERE id = ?`, owner, id).Error)
 		return id
 	}
@@ -176,9 +176,9 @@ func TestRepairAnchoredAcks(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want, stats)
 	require.True(t, db.Migrator().HasColumn("acks", "ack_commit_id"))
-	require.False(t, db.Migrator().HasTable(&models.Acked{}))
+	require.False(t, db.Migrator().HasTable(&postgres.Acked{}))
 	var count int64
-	require.NoError(t, db.Model(&models.Ack{}).Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.Ack{}).Count(&count).Error)
 	require.EqualValues(t, 5, count)
 
 	stats, err = repairAnchoredAcks(ctx, db, repairFQDN, false)
@@ -189,12 +189,12 @@ func TestRepairAnchoredAcks(t *testing.T) {
 	// and entities.created_at in place
 	require.False(t, db.Migrator().HasColumn("acks", "ack_commit_id"))
 	require.False(t, db.Migrator().HasColumn("acks", "acked_commit_id"))
-	require.True(t, db.Migrator().HasConstraint(&models.Ack{}, "fk_acks_document"))
-	require.True(t, db.Migrator().HasTable(&models.Acked{}))
-	require.True(t, db.Migrator().HasColumn(&models.Entity{}, "created_at"))
+	require.True(t, db.Migrator().HasConstraint(&postgres.Ack{}, "fk_acks_document"))
+	require.True(t, db.Migrator().HasTable(&postgres.Acked{}))
+	require.True(t, db.Migrator().HasColumn(&postgres.Entity{}, "created_at"))
 
-	commitOf := func(id string) *models.CommitLog {
-		var log models.CommitLog
+	commitOf := func(id string) *postgres.CommitLog {
+		var log postgres.CommitLog
 		err := db.Where("id = ?", id).Take(&log).Error
 		if err == gorm.ErrRecordNotFound {
 			return nil
@@ -202,12 +202,12 @@ func TestRepairAnchoredAcks(t *testing.T) {
 		require.NoError(t, err)
 		return &log
 	}
-	holdingOf := func(from, to, schema string) models.Acked {
-		var holding models.Acked
+	holdingOf := func(from, to, schema string) postgres.Acked {
+		var holding postgres.Acked
 		require.NoError(t, db.Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema).Take(&holding).Error, "holding %s -> %s", from, to)
 		return holding
 	}
-	requireAcked := func(holding models.Acked, owner string) {
+	requireAcked := func(holding postgres.Acked, owner string) {
 		t.Helper()
 		log := commitOf(holding.DocumentID)
 		require.NotNil(t, log)
@@ -228,7 +228,7 @@ func TestRepairAnchoredAcks(t *testing.T) {
 	}
 
 	// acker-side rows survive for local authors only, keyed by the ack commit
-	var acks []models.Ack
+	var acks []postgres.Ack
 	require.NoError(t, db.Order("document_id").Find(&acks).Error)
 	ids := map[string]bool{}
 	for _, a := range acks {
@@ -247,7 +247,7 @@ func TestRepairAnchoredAcks(t *testing.T) {
 	requireAcked(holdingOf(st.bob, st.alice, followSchema), st.alice)
 	requireAcked(holdingOf(st.carol, st.bob, followSchema), st.bob)
 	requireAcked(holdingOf(st.alice, st.bob, lostSchema), st.bob)
-	require.NoError(t, db.Model(&models.Acked{}).Where(`"to" = ?`, st.carol).Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.Acked{}).Where(`"to" = ?`, st.carol).Count(&count).Error)
 	require.Zero(t, count)
 
 	// the sorted-value mirror kept its CDID and was rewritten in place
@@ -257,12 +257,12 @@ func TestRepairAnchoredAcks(t *testing.T) {
 	for _, id := range []string{st.mirrorAliceBob, st.mirrorCarolBob, st.mirrorAliceBobLost, st.staleMirror} {
 		require.Nil(t, commitOf(id), "legacy mirror %s must be deleted", id)
 	}
-	require.NoError(t, db.Model(&models.CommitLog{}).Where("proof LIKE ?", "%"+legacyProofTypeAckReference+"%").Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.CommitLog{}).Where("proof LIKE ?", "%"+legacyProofTypeAckReference+"%").Count(&count).Error)
 	require.Zero(t, count)
 
 	// NULL owner spelled ''
 	require.Equal(t, "", commitOf(st.passThrough).Owner)
-	require.NoError(t, db.Model(&models.CommitLog{}).Where("owner IS NULL").Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.CommitLog{}).Where("owner IS NULL").Count(&count).Error)
 	require.Zero(t, count)
 
 	// re-running is a no-op
