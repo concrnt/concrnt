@@ -100,10 +100,10 @@ func newOperationContext() (*operationContext, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open database: %w", err)
 		}
-		op.Record = sqliterecord.New(lite, cl, globalConfig)
-		op.EntityMeta = sqlite.NewEntityMetaRepository(lite)
-		op.Server = sqlite.NewServerRepository(&globalConfig, lite, cl)
-		op.Notification = sqlite.NewNotificationRepository(lite)
+		op.Record = sqliterecord.New(lite.DB, cl, globalConfig)
+		op.EntityMeta = sqlite.NewEntityMetaRepository(lite.DB)
+		op.Server = sqlite.NewServerRepository(&globalConfig, lite.DB, cl)
+		op.Notification = sqlite.NewNotificationRepository(lite.DB)
 		op.close = lite.Close
 	default:
 		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite)", conf.Backends.Database)

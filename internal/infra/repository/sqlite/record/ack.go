@@ -5,42 +5,53 @@ import (
 	"errors"
 	"time"
 
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
-
-// saveAckState is the accept-if-newer upsert shared by the acks and ackeds
-// tables (CIP-10 §4): only a document with a strictly newer createdAt moves
-// the (from, to, schema) state; an equal or older one changes nothing.
-func saveAckState(ctx context.Context, tx ucrecord.RepositoryTx, table, documentID, from, to, schema string, createdAt time.Time, valid bool) (bool, error) {
-	db, err := getRecordTx(tx)
-	if err != nil {
-		return false, err
-	}
-	res, err := db.ExecContext(ctx, `INSERT INTO `+table+` ("from", "to", schema, document_id, valid, created_at, c_date) VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT ("from", "to", schema) DO UPDATE SET valid = excluded.valid, document_id = excluded.document_id, created_at = excluded.created_at
-		WHERE `+table+`.created_at < excluded.created_at`,
-		from, to, schema, documentID, valid, sqlitedb.Micros(createdAt), nowMicros())
-	if err != nil {
-		return false, err
-	}
-	affected, err := res.RowsAffected()
-	return affected > 0, err
-}
 
 func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
 	defer span.End()
 
-	applied, err := saveAckState(ctx, tx, "acks", documentID, from, to, schema, createdAt, valid)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
-		span.RecordError(err)
+		return false, err
 	}
-	return applied, err
+
+	ack := sqlitedb.Ack{
+		From:       from,
+		To:         to,
+		Schema:     schema,
+		DocumentID: documentID,
+		Valid:      valid,
+		CreatedAt:  sqlitedb.Micros(createdAt),
+	}
+
+	// CIP-10 §4: only a document with a strictly newer createdAt may move
+	// the (from, to, schema) state; an equal or older one is a no-op
+	// (RowsAffected 0). The key is createdAt alone — never the document id —
+	// so the acker's and the associate owner's servers, which hold different
+	// documents with the same createdAt, reach the same decision.
+	result := db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
+		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": sqlitedb.Micros(createdAt)}),
+		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("acks.created_at < excluded.created_at")}},
+	}).Create(&ack)
+	if result.Error != nil {
+		span.RecordError(result.Error)
+		return false, result.Error
+	}
+
+	return result.RowsAffected > 0, nil
+
 }
 
 func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
 	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, true)
+
 }
 
 func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
@@ -51,116 +62,227 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
 	defer span.End()
 
-	applied, err := saveAckState(ctx, tx, "ackeds", documentID, from, to, schema, createdAt, valid)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
-		span.RecordError(err)
+		return false, err
 	}
-	return applied, err
+
+	ack := sqlitedb.Acked{
+		From:       from,
+		To:         to,
+		Schema:     schema,
+		DocumentID: documentID,
+		Valid:      valid,
+		CreatedAt:  sqlitedb.Micros(createdAt),
+	}
+
+	// CIP-10 §4: only a document with a strictly newer createdAt may move
+	// the (from, to, schema) state; an equal or older one is a no-op
+	// (RowsAffected 0). The key is createdAt alone — never the document id —
+	// so the acker's and the associate owner's servers, which hold different
+	// documents with the same createdAt, reach the same decision.
+	result := db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
+		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": sqlitedb.Micros(createdAt)}),
+		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("ackeds.created_at < excluded.created_at")}},
+	}).Create(&ack)
+	if result.Error != nil {
+		span.RecordError(result.Error)
+		return false, result.Error
+	}
+
+	return result.RowsAffected > 0, nil
+
 }
 
 func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
 	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, true)
+
 }
 
 func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
 	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, false)
 }
 
-// ackRecords lists the valid state rows of one side: table acks keyed by
-// "from" (the ccfs namespace is the acker's), table ackeds keyed by "to"
-// (the associate owner's).
-func (r *Repository) ackRecords(ctx context.Context, table, sideColumn, side, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	query := `SELECT s.document_id, s."` + sideColumn + `", s.created_at, c.document, c.proof FROM ` + table + ` s
-		JOIN commit_logs c ON c.id = s.document_id
-		WHERE s."` + sideColumn + `" = ? AND s.valid = 1`
-	args := []any{side}
+func (r *Repository) getAckRecords(ctx context.Context, from, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.getAckRecords")
+	defer span.End()
+
+	query := r.db.WithContext(ctx).
+		Model(&sqlitedb.Ack{}).
+		Joins("JOIN commit_logs c ON c.id = acks.document_id").
+		Where(`acks."from" = ?`, from).
+		Where("acks.valid = ?", true)
+
 	if schema != "" {
-		query += " AND s.schema = ?"
-		args = append(args, schema)
+		query = query.Where("acks.schema = ?", schema)
 	}
+
 	if since != nil {
-		query += " AND s.created_at >= ?"
-		args = append(args, sqlitedb.Micros(*since))
+		query = query.Where("acks.created_at >= ?", sqlitedb.Micros(*since))
 	}
 	if until != nil {
-		query += " AND s.created_at <= ?"
-		args = append(args, sqlitedb.Micros(*until))
+		query = query.Where("acks.created_at <= ?", sqlitedb.Micros(*until))
 	}
+
 	if order == "desc" {
-		query += " ORDER BY s.created_at DESC, s.document_id DESC"
+		query = query.Order("acks.created_at DESC, acks.document_id DESC")
 	} else {
-		query += " ORDER BY s.created_at ASC, s.document_id ASC"
+		query = query.Order("acks.created_at ASC, acks.document_id ASC")
 	}
+
 	if limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, limit)
+		query = query.Limit(limit)
 	}
-	return scanCommitRows(ctx, r.db, query, args...)
+
+	// CIP-3 §3.4: the ack's ccfs identity is held by the acker's server
+	var acks []commitRow
+	if err := query.Select(`acks.document_id AS document_id, acks."from" AS owner, acks.created_at AS created_at, c.document AS document, c.proof AS proof`).Scan(&acks).Error; err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return commitRows(acks)
+}
+
+func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.getAckedRecords")
+	defer span.End()
+
+	query := r.db.WithContext(ctx).
+		Model(&sqlitedb.Acked{}).
+		Joins("JOIN commit_logs c ON c.id = ackeds.document_id").
+		Where(`ackeds."to" = ?`, to).
+		Where("ackeds.valid = ?", true)
+
+	if schema != "" {
+		query = query.Where("ackeds.schema = ?", schema)
+	}
+
+	if since != nil {
+		query = query.Where("ackeds.created_at >= ?", sqlitedb.Micros(*since))
+	}
+	if until != nil {
+		query = query.Where("ackeds.created_at <= ?", sqlitedb.Micros(*until))
+	}
+
+	if order == "desc" {
+		query = query.Order("ackeds.created_at DESC, ackeds.document_id DESC")
+	} else {
+		query = query.Order("ackeds.created_at ASC, ackeds.document_id ASC")
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	// CIP-3 §3.4: an acked's ccfs identity is held by the associate owner's
+	// server
+	var acked []commitRow
+	if err := query.Select(`ackeds.document_id AS document_id, ackeds."to" AS owner, ackeds.created_at AS created_at, c.document AS document, c.proof AS proof`).Scan(&acked).Error; err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return commitRows(acked)
 }
 
 func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
 	defer span.End()
 
-	var rows []ucrecord.QueryRow
-	var err error
-	switch {
-	case from != "":
-		rows, err = r.ackRecords(ctx, "acks", "from", from, schema, since, until, limit, order)
-	case to != "":
-		rows, err = r.ackRecords(ctx, "ackeds", "to", to, schema, since, until, limit, order)
-	default:
-		err = errors.New("either 'from' or 'to' must be specified")
+	if from != "" {
+		return r.getAckRecords(ctx, from, schema, since, until, limit, order)
+	} else if to != "" {
+		return r.getAckedRecords(ctx, to, schema, since, until, limit, order)
+	} else {
+		err := errors.New("either 'from' or 'to' must be specified")
+		span.RecordError(err)
+		return nil, err
 	}
+}
+
+func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.getAckRecordCounts")
+	defer span.End()
+
+	type result struct {
+		Schema string
+		Count  int64
+	}
+
+	var results []result
+
+	query := r.db.WithContext(ctx).
+		Model(&sqlitedb.Ack{}).
+		Select("schema, COUNT(*) AS count").
+		Where("valid = ?", true).
+		Where(`acks."from" = ?`, from)
+
+	if schema != "" {
+		query = query.Where("acks.schema = ?", schema)
+	}
+
+	err := query.Group("schema").Scan(&results).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	return rows, nil
+
+	counts := make(map[string]int64)
+	for _, r := range results {
+		counts[r.Schema] = r.Count
+	}
+
+	return counts, nil
 }
 
-func (r *Repository) ackCounts(ctx context.Context, table, sideColumn, side, schema string) (map[string]int64, error) {
-	query := `SELECT schema, COUNT(*) FROM ` + table + ` WHERE "` + sideColumn + `" = ? AND valid = 1`
-	args := []any{side}
-	if schema != "" {
-		query += " AND schema = ?"
-		args = append(args, schema)
+func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.getAckedRecordCounts")
+	defer span.End()
+
+	type result struct {
+		Schema string
+		Count  int64
 	}
-	rows, err := r.db.QueryContext(ctx, query+" GROUP BY schema", args...)
+
+	var results []result
+
+	query := r.db.WithContext(ctx).
+		Model(&sqlitedb.Acked{}).
+		Select("schema, COUNT(*) AS count").
+		Where("valid = ?", true).
+		Where(`ackeds."to" = ?`, to)
+
+	if schema != "" {
+		query = query.Where("ackeds.schema = ?", schema)
+	}
+
+	err := query.Group("schema").Scan(&results).Error
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	counts := map[string]int64{}
-	for rows.Next() {
-		var s string
-		var n int64
-		if err := rows.Scan(&s, &n); err != nil {
-			return nil, err
-		}
-		counts[s] = n
+	counts := make(map[string]int64)
+	for _, r := range results {
+		counts[r.Schema] = r.Count
 	}
-	return counts, rows.Err()
+
+	return counts, nil
 }
 
 func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
-	var counts map[string]int64
-	var err error
-	switch {
-	case from != "":
-		counts, err = r.ackCounts(ctx, "acks", "from", from, schema)
-	case to != "":
-		counts, err = r.ackCounts(ctx, "ackeds", "to", to, schema)
-	default:
-		err = errors.New("either 'from' or 'to' must be specified")
-	}
-	if err != nil {
+	if from != "" {
+		return r.getAckRecordCounts(ctx, from, schema)
+	} else if to != "" {
+		return r.getAckedRecordCounts(ctx, to, schema)
+	} else {
+		err := errors.New("either 'from' or 'to' must be specified")
 		span.RecordError(err)
 		return nil, err
 	}
-	return counts, nil
 }

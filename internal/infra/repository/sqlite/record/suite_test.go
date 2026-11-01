@@ -12,14 +12,21 @@ import (
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
 
-// openBackend opens a fresh database file (no Docker) and wires the
-// repositories under test into a repotest.Backend.
-func openBackend(t *testing.T) repotest.Backend {
+// openDB opens a fresh, migrated database file (no Docker) that lives for
+// the test.
+func openDB(t *testing.T) *sqlitedb.DB {
 	t.Helper()
 	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "concrnt.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 	require.NoError(t, sqlitedb.Migrate(context.Background(), db))
+	return db
+}
+
+// openBackend wires the repositories under test into a repotest.Backend.
+func openBackend(t *testing.T) repotest.Backend {
+	t.Helper()
+	db := openDB(t).DB
 	cl, _ := repotest.PeerClient(t)
 	return repotest.Backend{
 		Record:       New(db, nil, domain.Config{}),

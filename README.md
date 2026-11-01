@@ -180,9 +180,11 @@ backend's package, and every backend passes the same contract suites
 - `postgres` (default): `internal/infra/repository/postgres`, GORM over
   `backends.postgresDsn`. Schema changes are numbered steps in
   `postgres/migrations.go`, applied at server start.
-- `sqlite`: `internal/infra/repository/sqlite`, `database/sql` over the pure-Go
-  `modernc.org/sqlite`, one file at `backends.sqlite.path` (default
-  `./concrnt.db`). No database server to run, so a single-binary server is
+- `sqlite`: `internal/infra/repository/sqlite`, GORM over the pure-Go (wasm,
+  no cgo) `github.com/ncruces/go-sqlite3`, one file at `backends.sqlite.path`
+  (default `./concrnt.db`). Its own models live in `sqlite/models.go` and are
+  AutoMigrated at start; numbered steps go in `sqlite/migrations.go`. No
+  database server to run, so a single-binary server is
 
   ```sh
   # redis and memcached are still required (delivery jobs, realtime events,

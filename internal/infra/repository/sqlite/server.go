@@ -2,10 +2,11 @@ package sqlite
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
@@ -15,20 +16,27 @@ import (
 
 type ServerRepository struct {
 	config *domain.Config
-	db     *DB
+	db     *gorm.DB
 	client *client.Client
 }
 
-func NewServerRepository(config *domain.Config, db *DB, cl *client.Client) server.Repository {
-	return &ServerRepository{config: config, db: db, client: cl}
+func NewServerRepository(config *domain.Config, db *gorm.DB, cl *client.Client) server.Repository {
+	return &ServerRepository{
+		config: config,
+		db:     db,
+		client: cl,
+	}
 }
 
-func toDomainServer(tag, wellKnown string) (*domain.Server, error) {
+func modelToDomainServer(m *Server) (*domain.Server, error) {
 	var wkc concrnt.WellKnownConcrnt
-	if err := json.Unmarshal([]byte(wellKnown), &wkc); err != nil {
+	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
 		return nil, err
 	}
-	return &domain.Server{TagString: tag, WellKnown: wkc}, nil
+	return &domain.Server{
+		TagString: m.Tag,
+		WellKnown: wkc,
+	}, nil
 }
 
 func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
@@ -36,71 +44,125 @@ func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint 
 	defer span.End()
 
 	if concrnt.IsCSID(identifier) {
-		return r.getAndCache(ctx, "cs_id", identifier, hint, true)
+		return r.GetAndCacheByCSID(ctx, identifier, hint)
+	} else {
+		return r.GetAndCacheByFQDN(ctx, identifier)
 	}
-	return r.getAndCache(ctx, "id", identifier, nil, false)
 }
 
-// getAndCache answers from the cached row under column = identifier, or
-// fetches the well-known through the client and upserts it by domain. A
-// csid lookup with no cached row and no hint is a miss.
-func (r *ServerRepository) getAndCache(ctx context.Context, column, identifier string, hint *string, needsHint bool) (*domain.Server, error) {
-	var tag, wellKnown string
-	err := r.db.QueryRowContext(ctx, "SELECT tag, well_known FROM servers WHERE "+column+" = ?", identifier).Scan(&tag, &wellKnown)
-	if err == nil && wellKnown != "" {
-		return toDomainServer(tag, wellKnown)
+func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
+	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
+	defer span.End()
+
+	var server Server
+	err := r.db.WithContext(ctx).
+		Where("cs_id = ?", csid).
+		Take(&server).Error
+	if err == nil && server.WellKnown != "" {
+		return modelToDomainServer(&server)
 	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	if needsHint && hint == nil {
+
+	if hint == nil {
 		return nil, domain.ErrNotFound
 	}
 
-	wkc, err := r.client.GetServer(ctx, identifier, hint)
+	wkc, err := r.client.GetServer(ctx, csid, hint)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
+
 	serialized, err := json.Marshal(wkc)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
-	now := nowMicros()
-	_, err = r.db.ExecContext(ctx, `INSERT INTO servers (id, cs_id, layer, tag, well_known, c_date, m_date) VALUES (?, ?, ?, '', ?, ?, ?)
-		ON CONFLICT (id) DO UPDATE SET cs_id = excluded.cs_id, layer = excluded.layer, tag = excluded.tag, well_known = excluded.well_known, m_date = excluded.m_date`,
-		wkc.Domain, wkc.CSID, wkc.Layer, string(serialized), now, now)
+
+	newServer := Server{
+		ID:        wkc.Domain,
+		CSID:      wkc.CSID,
+		Layer:     wkc.Layer,
+		Tag:       "",
+		WellKnown: string(serialized),
+	}
+
+	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known", "m_date"}),
+	}).Create(&newServer).Error
 	if err != nil {
 		return nil, err
 	}
-	return toDomainServer("", string(serialized))
+
+	return modelToDomainServer(&newServer)
+}
+
+func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
+	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
+	defer span.End()
+
+	var server Server
+	err := r.db.WithContext(ctx).
+		Where("id = ?", fqdn).
+		Take(&server).Error
+	if err == nil && server.WellKnown != "" {
+		return modelToDomainServer(&server)
+	}
+
+	wkc, err := r.client.GetServer(ctx, fqdn, nil)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	serialized, err := json.Marshal(wkc)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	newServer := Server{
+		ID:        wkc.Domain,
+		CSID:      wkc.CSID,
+		Layer:     wkc.Layer,
+		Tag:       "",
+		WellKnown: string(serialized),
+	}
+
+	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known", "m_date"}),
+	}).Create(&newServer).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return modelToDomainServer(&newServer)
 }
 
 func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {
 	ctx, span := tracer.Start(ctx, "ServerRepository.List")
 	defer span.End()
 
-	rows, err := r.db.QueryContext(ctx, "SELECT id, well_known FROM servers")
+	servers, err := gorm.G[Server](r.db).Find(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	result := []*concrnt.WellKnownConcrnt{}
-	for rows.Next() {
-		var id, wellKnown string
-		if err := rows.Scan(&id, &wellKnown); err != nil {
-			return nil, err
-		}
-		if wellKnown == "" {
-			span.RecordError(fmt.Errorf("server with empty well-known: %s", id))
+	result := make([]*concrnt.WellKnownConcrnt, 0, len(servers))
+	for _, server := range servers {
+		if server.WellKnown == "" {
+			span.RecordError(fmt.Errorf("server with empty well-known: %s", server.ID))
 			continue
 		}
 		var wkc concrnt.WellKnownConcrnt
-		if err := json.Unmarshal([]byte(wellKnown), &wkc); err != nil {
+		err := json.Unmarshal([]byte(server.WellKnown), &wkc)
+		if err != nil {
 			span.RecordError(err)
 			continue
 		}
 		result = append(result, &wkc)
 	}
-	return result, rows.Err()
+
+	return result, nil
 }

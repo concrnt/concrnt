@@ -1,28 +1,36 @@
-// Package sqlite is the SQLite backend of the repository contract over
-// database/sql and the pure-Go modernc.org/sqlite driver (no GORM, no cgo):
-// the reference for writing a backend without an ORM, and the backend that
-// runs the contract suites without Docker.
+// Package sqlite is the SQLite backend of the repository contract: GORM over
+// the pure-Go (wasm, no cgo) github.com/ncruces/go-sqlite3 driver, with its
+// own models (models.go) and migrations (migrations.go), and the backend
+// that runs the contract suites without Docker.
 package sqlite
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/XSAM/otelsql"
+	"github.com/ncruces/go-sqlite3/gormlite"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	_ "modernc.org/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	"gorm.io/plugin/opentelemetry/tracing"
+
+	_ "github.com/ncruces/go-sqlite3/driver"
 )
 
 // DB is an open database. Close removes the file again when the path was
 // ":memory:" (an ephemeral database; a real in-memory one cannot be shared
 // across the pool's connections).
 type DB struct {
-	*sql.DB
+	*gorm.DB
 	ephemeral string
 }
 
@@ -73,7 +81,7 @@ func Open(path string, pragmas ...string) (*DB, error) {
 	q["_pragma"] = defaults
 	dsn := "file:" + path + "?" + q.Encode()
 
-	sqlDB, err := otelsql.Open("sqlite", dsn,
+	sqlDB, err := otelsql.Open("sqlite3", dsn,
 		otelsql.WithAttributes(semconv.DBSystemSqlite),
 		otelsql.WithSpanOptions(otelsql.SpanOptions{
 			OmitConnResetSession: true,
@@ -97,13 +105,48 @@ func Open(path string, pragmas ...string) (*DB, error) {
 
 	if err := sqlDB.PingContext(context.Background()); err != nil {
 		sqlDB.Close()
+		if ephemeral != "" {
+			os.RemoveAll(ephemeral)
+		}
 		return nil, fmt.Errorf("sqlite %s: %w", path, err)
 	}
-	return &DB{DB: sqlDB, ephemeral: ephemeral}, nil
+
+	gormLogger := logger.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
+		logger.Config{
+			SlowThreshold:             300 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  true,
+		},
+	)
+	db, err := gorm.Open(gormlite.OpenDB(sqlDB), &gorm.Config{
+		TranslateError: true,
+		Logger:         gormLogger,
+	})
+	if err != nil {
+		sqlDB.Close()
+		return nil, err
+	}
+	if err := db.Use(tracing.NewPlugin()); err != nil {
+		slog.Error("failed to enable tracing plugin for sqlite", slog.String("error", err.Error()))
+	}
+
+	return &DB{DB: db, ephemeral: ephemeral}, nil
+}
+
+// SQL is the underlying connection pool (the embedded field hides gorm's
+// DB method of the same name).
+func (db *DB) SQL() *sql.DB {
+	sqlDB, err := db.DB.DB()
+	if err != nil {
+		panic(err) // gormlite.OpenDB always sets a *sql.DB
+	}
+	return sqlDB
 }
 
 func (db *DB) Close() error {
-	err := db.DB.Close()
+	err := db.SQL().Close()
 	if db.ephemeral != "" {
 		os.RemoveAll(db.ephemeral)
 	}
@@ -112,20 +155,5 @@ func (db *DB) Close() error {
 
 // Ready reports whether the database answers.
 func (db *DB) Ready(ctx context.Context) error {
-	var one int
-	return db.QueryRowContext(ctx, "SELECT 1").Scan(&one)
-}
-
-// Placeholders renders n comma-separated "?" for an IN list.
-func Placeholders(n int) string {
-	return strings.TrimSuffix(strings.Repeat("?, ", n), ", ")
-}
-
-// Args widens a string slice to query arguments.
-func Args(values []string) []any {
-	out := make([]any, len(values))
-	for i, v := range values {
-		out[i] = v
-	}
-	return out
+	return db.SQL().PingContext(ctx)
 }

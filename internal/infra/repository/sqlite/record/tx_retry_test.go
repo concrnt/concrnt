@@ -23,7 +23,7 @@ func TestRunInTxRetriesOnBusy(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 	require.NoError(t, sqlitedb.Migrate(ctx, db))
-	repo := New(db, nil, domain.Config{})
+	repo := New(db.DB, nil, domain.Config{})
 
 	holding := make(chan struct{})
 	released := make(chan struct{})
@@ -40,7 +40,7 @@ func TestRunInTxRetriesOnBusy(t *testing.T) {
 	}()
 	<-holding
 
-	_, err = db.BeginTx(ctx, nil)
+	_, err = db.SQL().BeginTx(ctx, nil)
 	require.Error(t, err, "a second writer cannot begin while the lock is held")
 	require.True(t, isRetryableTxError(err), "the busy error must be the retryable kind, got %v", err)
 

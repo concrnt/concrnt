@@ -255,14 +255,15 @@ func main() {
 		if err := sqlite.Migrate(ctx, lite); err != nil {
 			panic("failed to migrate database: " + err.Error())
 		}
-		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.DB, "concrnt"))
+		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.SQL(), "concrnt"))
 
+		// db stays nil: the aggregate store takes a gorm handle as Postgres
 		databaseReady = lite.Ready
-		recordRepo = sqliterecord.New(lite, cl, domainConfig)
-		entityMetaRepo = sqlite.NewEntityMetaRepository(lite)
-		serverRepo = sqlite.NewServerRepository(&domainConfig, lite, cl)
-		notificationRepo = sqlite.NewNotificationRepository(lite)
-		abuseRepo = sqlite.NewAbuseRepository(lite)
+		recordRepo = sqliterecord.New(lite.DB, cl, domainConfig)
+		entityMetaRepo = sqlite.NewEntityMetaRepository(lite.DB)
+		serverRepo = sqlite.NewServerRepository(&domainConfig, lite.DB, cl)
+		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
+		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
 	default:
 		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite)")
 	}

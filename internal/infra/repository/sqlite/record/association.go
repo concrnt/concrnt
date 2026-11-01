@@ -2,8 +2,12 @@ package record
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
+	"gorm.io/gorm/clause"
+
+	"github.com/concrnt/concrnt"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/utils"
@@ -13,136 +17,198 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(tx)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
 		return false, err
 	}
 
-	target, err := getRecordKey(ctx, db, targetURI)
+	targetRK, err := GetRecordKeyByURI(ctx, db, targetURI)
 	if err != nil {
 		span.RecordError(err)
 		return false, err
 	}
 
-	// a bare ON CONFLICT DO NOTHING suppresses duplicates on both the
-	// document_id primary key and the unique column, making duplicate
-	// deliveries a silent success like record/ack
-	res, err := db.ExecContext(ctx, `INSERT INTO associations (document_id, target_id, owner, author, schema, variant, "unique", created_at, c_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT DO NOTHING`,
-		documentID, target.ID, owner, author, schema, sqlitedb.NullString(variant), unique, sqlitedb.Micros(createdAt), nowMicros())
-	if err != nil {
-		span.RecordError(err)
-		return false, err
+	association := sqlitedb.Association{
+		TargetID:   targetRK.ID,
+		DocumentID: documentID,
+		Unique:     unique,
+
+		Owner:     owner,
+		Author:    author,
+		Variant:   variant,
+		Schema:    schema,
+		CreatedAt: sqlitedb.Micros(createdAt),
 	}
-	affected, err := res.RowsAffected()
-	return affected > 0, err
+
+	// A targetless ON CONFLICT DO NOTHING suppresses duplicates on both the
+	// document_id primary key (same document re-delivered) and
+	// uni_associations_unique (same logical association under a new document
+	// id), making duplicate deliveries a silent success like record/ack.
+	result := db.Clauses(clause.OnConflict{
+		DoNothing: true,
+	}).Create(&association)
+	if result.Error != nil {
+		span.RecordError(result.Error)
+		return false, result.Error
+	}
+
+	return result.RowsAffected > 0, nil
 }
 
 func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(tx)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
-	_, err = db.ExecContext(ctx, "DELETE FROM associations WHERE document_id = ?", documentID)
-	return err
+
+	return db.Delete(&sqlitedb.Association{}, "document_id = ?", documentID).Error
 }
 
-func (r *Repository) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+func (r *Repository) GetAssociatedRecords(
+	ctx context.Context,
+	targetURI, schema, variant, author string,
+	since, until *time.Time,
+	limit int,
+	order string,
+) ([]ucrecord.QueryRow, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecords")
 	defer span.End()
 
-	query := `SELECT a.document_id, a.owner, a.created_at, c.document, c.proof FROM associations a
-		JOIN record_keys rk ON rk.id = a.target_id
-		JOIN commit_logs c ON c.id = a.document_id
-		WHERE rk.uri = ?`
-	args := []any{targetURI}
+	query := r.db.WithContext(ctx).
+		Model(&sqlitedb.Association{}).
+		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Joins("JOIN commit_logs c ON c.id = associations.document_id").
+		Where("rk.uri = ?", targetURI)
+
 	if schema != "" {
-		query += " AND a.schema = ?"
-		args = append(args, schema)
+		query = query.Where("associations.schema = ?", schema)
 	}
 	if variant != "" {
-		query += " AND a.variant = ?"
-		args = append(args, variant)
+		query = query.Where("associations.variant = ?", variant)
 	}
 	if author != "" {
-		query += " AND a.author = ?"
-		args = append(args, author)
+		query = query.Where("associations.author = ?", author)
 	}
 	if since != nil {
-		query += " AND a.created_at >= ?"
-		args = append(args, sqlitedb.Micros(*since))
+		query = query.Where("associations.created_at >= ?", sqlitedb.Micros(*since))
 	}
 	if until != nil {
-		query += " AND a.created_at <= ?"
-		args = append(args, sqlitedb.Micros(*until))
-	}
-	if order == "desc" {
-		query += " ORDER BY a.created_at DESC, a.document_id DESC"
-	} else {
-		query += " ORDER BY a.created_at ASC, a.document_id ASC"
-	}
-	if limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, limit)
+		query = query.Where("associations.created_at <= ?", sqlitedb.Micros(*until))
 	}
 
-	rows, err := scanCommitRows(ctx, r.db, query, args...)
-	if err != nil {
-		span.RecordError(err)
+	if order == "desc" {
+		query = query.Order("associations.created_at DESC, associations.document_id DESC")
+	} else {
+		query = query.Order("associations.created_at ASC, associations.document_id ASC")
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	var associations []commitRow
+	if err := query.Select("associations.document_id AS document_id, associations.owner AS owner, associations.created_at AS created_at, c.document AS document, c.proof AS proof").Scan(&associations).Error; err != nil {
 		return nil, err
 	}
-	return rows, nil
+
+	return commitRows(associations)
+}
+
+// commitRow is a state row (association, ack, acked) joined with its commit
+// log; Owner is the namespace its ccfs URI is composed in.
+type commitRow struct {
+	DocumentID string
+	Owner      string
+	CreatedAt  int64
+	Document   string
+	Proof      string
+}
+
+func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
+	out := make([]ucrecord.QueryRow, len(rows))
+	for i, row := range rows {
+		var proof concrnt.Proof
+		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
+			return nil, err
+		}
+		ccfs := concrnt.ComposeCCFSURI(row.Owner, concrnt.CCFSTypeConcrnt, row.DocumentID)
+		out[i] = ucrecord.QueryRow{
+			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: row.Document, Proof: proof},
+			CreatedAt: sqlitedb.Time(row.CreatedAt),
+		}
+	}
+	return out, nil
 }
 
 func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
 	defer span.End()
 
-	rows, err := r.db.QueryContext(ctx, "SELECT a.schema, COUNT(*) FROM associations a JOIN record_keys rk ON rk.id = a.target_id WHERE rk.uri = ? GROUP BY a.schema", targetURI)
+	var counts []struct {
+		Schema string
+		Count  int64
+	}
+
+	err := r.db.WithContext(ctx).
+		Model(&sqlitedb.Association{}).
+		Select("schema, COUNT(*) AS count").
+		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Where("rk.uri = ?", targetURI).
+		Group("schema").
+		Scan(&counts).Error
+
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	result := map[string]int64{}
-	for rows.Next() {
-		var schema string
-		var count int64
-		if err := rows.Scan(&schema, &count); err != nil {
-			return nil, err
-		}
-		result[schema] = count
+	result := make(map[string]int64)
+	for _, c := range counts {
+		result[c.Schema] = c.Count
 	}
-	return result, rows.Err()
+
+	return result, nil
 }
 
 func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
 	defer span.End()
 
-	// the earliest association of each variant decides the variant order
-	rows, err := r.db.QueryContext(ctx, `SELECT COALESCE(a.variant, ''), COUNT(*), MIN(a.created_at) AS min_created_at FROM associations a
-		JOIN record_keys rk ON rk.id = a.target_id WHERE rk.uri = ? AND a.schema = ? GROUP BY a.variant ORDER BY min_created_at ASC`, targetURI, schema)
+	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
+	// to min_created_at); the earliest association of each variant decides
+	// the variant order
+	var counts []struct {
+		Variant      string
+		Count        int64
+		MinCreatedAt int64
+	}
+
+	err := r.db.WithContext(ctx).
+		Model(&sqlitedb.Association{}).
+		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
+		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Where("rk.uri = ?", targetURI).
+		Where("associations.schema = ?", schema).
+		Group("variant").
+		Order("min_created_at ASC").
+		Scan(&counts).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	result := utils.OrderedKVMap[int64]{}
-	for rows.Next() {
-		var variant string
-		var count, minCreatedAt int64
-		if err := rows.Scan(&variant, &count, &minCreatedAt); err != nil {
-			return nil, err
+	result := make(utils.OrderedKVMap[int64])
+	for _, c := range counts {
+		result[c.Variant] = utils.OrderedKV[int64]{
+			Value: c.Count,
+			Order: sqlitedb.Time(c.MinCreatedAt).UnixNano(),
 		}
-		result[variant] = utils.OrderedKV[int64]{Value: count, Order: sqlitedb.Time(minCreatedAt).UnixNano()}
 	}
-	return &result, rows.Err()
+
+	return &result, nil
 }

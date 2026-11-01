@@ -2,9 +2,10 @@ package record
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"time"
+
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
@@ -13,129 +14,141 @@ import (
 // inspector is the SQLite repotest.Inspector: white-box reads of the tables
 // the contract suites assert on, for tests only.
 type inspector struct {
-	db *sqlitedb.DB
+	db *gorm.DB
 }
 
-func newInspector(db *sqlitedb.DB) repotest.Inspector {
+// NewInspector returns the repotest.Inspector over db.
+func newInspector(db *gorm.DB) repotest.Inspector {
 	return &inspector{db: db}
 }
 
-// absent maps a missing row to nil, nil.
-func absent(err error) error {
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+// take runs query into dest, mapping a missing row to false, nil.
+func take(query *gorm.DB, dest any) (bool, error) {
+	err := query.Take(dest).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
 	}
-	return err
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (i *inspector) Commit(ctx context.Context, id string) (*repotest.CommitState, error) {
-	var c repotest.CommitState
-	var cDate int64
-	err := i.db.QueryRowContext(ctx, "SELECT ip, document, proof, owner, gc_candidate, c_date FROM commit_logs WHERE id = ?", id).
-		Scan(&c.IP, &c.Document, &c.Proof, &c.Owner, &c.GcCandidate, &cDate)
-	if err != nil {
-		return nil, absent(err)
+	var commit sqlitedb.CommitLog
+	found, err := take(i.db.WithContext(ctx).Where("id = ?", id), &commit)
+	if err != nil || !found {
+		return nil, err
 	}
-	c.CDate = sqlitedb.Time(cDate)
-	return &c, nil
+	return &repotest.CommitState{
+		IP:          commit.IP,
+		Document:    commit.Document,
+		Proof:       commit.Proof,
+		Owner:       commit.Owner,
+		GcCandidate: commit.GcCandidate,
+		CDate:       sqlitedb.Time(commit.CDate),
+	}, nil
 }
 
 func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Time) error {
-	_, err := i.db.ExecContext(ctx, "UPDATE commit_logs SET c_date = ? WHERE id = ?", sqlitedb.Micros(cDate), id)
-	return err
+	return i.db.WithContext(ctx).Model(&sqlitedb.CommitLog{}).Where("id = ?", id).Update("c_date", sqlitedb.Micros(cDate)).Error
 }
 
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
-	var r repotest.RecordState
-	var redirect sql.NullString
-	var distributions string
-	var createdAt int64
-	err := i.db.QueryRowContext(ctx, "SELECT owner, schema, redirect, distributions, created_at FROM records WHERE document_id = ?", documentID).
-		Scan(&r.Owner, &r.Schema, &redirect, &distributions, &createdAt)
-	if err != nil {
-		return nil, absent(err)
-	}
-	r.Redirect = sqlitedb.StringPtr(redirect)
-	if r.Distributions, err = sqlitedb.Strings(distributions); err != nil {
+	var rec sqlitedb.Record
+	found, err := take(i.db.WithContext(ctx).Where("document_id = ?", documentID), &rec)
+	if err != nil || !found {
 		return nil, err
 	}
-	r.CreatedAt = sqlitedb.Time(createdAt)
-	return &r, nil
+	return &repotest.RecordState{
+		Owner:         rec.Owner,
+		Schema:        rec.Schema,
+		Redirect:      rec.Redirect,
+		Distributions: []string(rec.Distributions),
+		CreatedAt:     sqlitedb.Time(rec.CreatedAt),
+	}, nil
 }
 
 func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeyState, error) {
-	var recordID, redirect sql.NullString
-	var recordCreatedAt sql.NullInt64
-	err := i.db.QueryRowContext(ctx, "SELECT record_id, record_created_at, redirect FROM record_keys WHERE uri = ?", uri).
-		Scan(&recordID, &recordCreatedAt, &redirect)
-	if err != nil {
-		return nil, absent(err)
+	var key sqlitedb.RecordKey
+	found, err := take(i.db.WithContext(ctx).Where("uri = ?", uri), &key)
+	if err != nil || !found {
+		return nil, err
 	}
 	return &repotest.KeyState{
-		RecordID:        sqlitedb.StringPtr(recordID),
-		RecordCreatedAt: sqlitedb.NullTime(recordCreatedAt),
-		Redirect:        sqlitedb.StringPtr(redirect),
+		RecordID:        key.RecordID,
+		RecordCreatedAt: sqlitedb.TimePtr(key.RecordCreatedAt),
+		Redirect:        key.Redirect,
 	}, nil
 }
 
 func (i *inspector) Entity(ctx context.Context, ccid string) (*repotest.EntityState, error) {
-	var e repotest.EntityState
-	var createdAt int64
-	err := i.db.QueryRowContext(ctx, "SELECT document_id, domain, created_at FROM entities WHERE id = ?", ccid).
-		Scan(&e.DocumentID, &e.Domain, &createdAt)
-	if err != nil {
-		return nil, absent(err)
+	var entity sqlitedb.Entity
+	found, err := take(i.db.WithContext(ctx).Where("id = ?", ccid), &entity)
+	if err != nil || !found {
+		return nil, err
 	}
-	e.CreatedAt = sqlitedb.Time(createdAt)
-	return &e, nil
+	return &repotest.EntityState{
+		DocumentID: entity.DocumentID,
+		Domain:     entity.Domain,
+		CreatedAt:  sqlitedb.Time(entity.CreatedAt),
+	}, nil
 }
 
 func (i *inspector) Association(ctx context.Context, documentID string) (*repotest.AssociationState, error) {
-	var a repotest.AssociationState
-	var variant sql.NullString
-	err := i.db.QueryRowContext(ctx, `SELECT owner, author, variant, "unique" FROM associations WHERE document_id = ?`, documentID).
-		Scan(&a.Owner, &a.Author, &variant, &a.Unique)
-	if err != nil {
-		return nil, absent(err)
+	var assoc sqlitedb.Association
+	found, err := take(i.db.WithContext(ctx).Where("document_id = ?", documentID), &assoc)
+	if err != nil || !found {
+		return nil, err
 	}
-	a.Variant = sqlitedb.StringPtr(variant)
-	return &a, nil
+	return &repotest.AssociationState{
+		Owner:   assoc.Owner,
+		Author:  assoc.Author,
+		Variant: assoc.Variant,
+		Unique:  assoc.Unique,
+	}, nil
 }
 
 func (i *inspector) AssociationCountByUnique(ctx context.Context, unique string) (int64, error) {
 	var count int64
-	err := i.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM associations WHERE "unique" = ?`, unique).Scan(&count)
+	err := i.db.WithContext(ctx).Model(&sqlitedb.Association{}).Where(`"unique" = ?`, unique).Count(&count).Error
 	return count, err
 }
 
-func (i *inspector) ackState(ctx context.Context, table, from, to, schema string) (*repotest.AckState, error) {
-	var a repotest.AckState
-	var createdAt int64
-	err := i.db.QueryRowContext(ctx, `SELECT document_id, valid, created_at FROM `+table+` WHERE "from" = ? AND "to" = ? AND schema = ?`, from, to, schema).
-		Scan(&a.DocumentID, &a.Valid, &createdAt)
-	if err != nil {
-		return nil, absent(err)
-	}
-	a.CreatedAt = sqlitedb.Time(createdAt)
-	return &a, nil
-}
-
 func (i *inspector) Ack(ctx context.Context, from, to, schema string) (*repotest.AckState, error) {
-	return i.ackState(ctx, "acks", from, to, schema)
+	var ack sqlitedb.Ack
+	found, err := take(i.db.WithContext(ctx).Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema), &ack)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &repotest.AckState{
+		DocumentID: ack.DocumentID,
+		Valid:      ack.Valid,
+		CreatedAt:  sqlitedb.Time(ack.CreatedAt),
+	}, nil
 }
 
 func (i *inspector) Acked(ctx context.Context, from, to, schema string) (*repotest.AckState, error) {
-	return i.ackState(ctx, "ackeds", from, to, schema)
+	var acked sqlitedb.Acked
+	found, err := take(i.db.WithContext(ctx).Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema), &acked)
+	if err != nil || !found {
+		return nil, err
+	}
+	return &repotest.AckState{
+		DocumentID: acked.DocumentID,
+		Valid:      acked.Valid,
+		CreatedAt:  sqlitedb.Time(acked.CreatedAt),
+	}, nil
 }
 
 func (i *inspector) AckCount(ctx context.Context) (int64, error) {
 	var count int64
-	err := i.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM acks").Scan(&count)
+	err := i.db.WithContext(ctx).Model(&sqlitedb.Ack{}).Count(&count).Error
 	return count, err
 }
 
 func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
 	var count int64
-	err := i.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM abuse_reports").Scan(&count)
+	err := i.db.WithContext(ctx).Model(&sqlitedb.AbuseReport{}).Count(&count).Error
 	return count, err
 }

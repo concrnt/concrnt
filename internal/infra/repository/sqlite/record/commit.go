@@ -2,11 +2,13 @@ package record
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
@@ -17,15 +19,19 @@ func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) 
 	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
 	defer span.End()
 
-	var one int
-	err := r.db.QueryRowContext(ctx, "SELECT 1 FROM commit_logs WHERE id = ?", id).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
+	var commitLog sqlitedb.CommitLog
+	err := r.db.WithContext(ctx).
+		Select("id").
+		Where("id = ?", id).
+		Take(&commitLog).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
 	if err != nil {
 		span.RecordError(err)
 		return false, err
 	}
+
 	return true, nil
 }
 
@@ -33,7 +39,7 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
 	defer span.End()
 
-	db, err := getRecordTx(tx)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -45,12 +51,21 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		return err
 	}
 
-	_, err = db.ExecContext(ctx, `INSERT INTO commit_logs (id, ip, document, proof, owner, gc_candidate, c_date) VALUES (?, ?, ?, ?, ?, 0, ?)
-		ON CONFLICT (id) DO NOTHING`, id, ip, document, string(proofBytes), owner, nowMicros())
-	if err != nil {
+	commitLog := sqlitedb.CommitLog{
+		ID:       id,
+		IP:       ip,
+		Document: document,
+		Owner:    owner,
+		Proof:    string(proofBytes),
+	}
+
+	if err := db.Clauses(clause.OnConflict{
+		DoNothing: true,
+	}).Create(&commitLog).Error; err != nil {
 		span.RecordError(err)
 		return err
 	}
+
 	return nil
 }
 
@@ -58,122 +73,137 @@ func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.R
 	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
 	defer span.End()
 
-	db, err := getRecordTx(tx)
+	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
-	_, err = db.ExecContext(ctx, "UPDATE commit_logs SET gc_candidate = 1 WHERE id = ?", documentID)
-	if err != nil {
+
+	if err := db.Model(&sqlitedb.CommitLog{}).
+		Where("id = ?", documentID).
+		Update("gc_candidate", true).Error; err != nil {
 		span.RecordError(err)
+		return err
 	}
-	return err
+
+	return nil
 }
 
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
 	defer span.End()
 
-	rows, err := r.db.QueryContext(ctx, "SELECT document, proof FROM commit_logs WHERE owner = ? ORDER BY c_date ASC", owner)
+	var commitLogs []sqlitedb.CommitLog
+	err := r.db.WithContext(ctx).
+		Where("owner = ?", owner).
+		Order("c_date ASC").
+		Find(&commitLogs).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	sds := []concrnt.SignedDocument{}
-	for rows.Next() {
-		var document, proofJSON string
-		if err := rows.Scan(&document, &proofJSON); err != nil {
-			return nil, err
-		}
+	sds := make([]concrnt.SignedDocument, len(commitLogs))
+	for i, cl := range commitLogs {
 		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(proofJSON), &proof); err != nil {
+		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		sds = append(sds, concrnt.SignedDocument{Document: document, Proof: proof})
+		sds[i] = concrnt.SignedDocument{
+			Document: cl.Document,
+			Proof:    proof,
+		}
 	}
-	return sds, rows.Err()
+
+	return sds, nil
 }
 
 func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryCommitLogs")
 	defer span.End()
 
-	query := "SELECT id, document, proof, owner, c_date FROM commit_logs WHERE 1 = 1"
-	args := []any{}
+	var commitLogs []sqlitedb.CommitLog
+
+	query := r.db.WithContext(ctx).Model(&sqlitedb.CommitLog{})
+
 	if owner != "" {
-		query += " AND owner = ?"
-		args = append(args, owner)
+		query = query.Where("owner = ?", owner)
 	}
 	if since != nil {
-		query += " AND c_date >= ?"
-		args = append(args, sqlitedb.Micros(*since))
+		query = query.Where("c_date >= ?", sqlitedb.Micros(*since))
 	}
 	if until != nil {
-		query += " AND c_date <= ?"
-		args = append(args, sqlitedb.Micros(*until))
-	}
-	if order == "desc" {
-		query += " ORDER BY c_date DESC, id DESC"
-	} else {
-		query += " ORDER BY c_date ASC, id ASC"
-	}
-	if limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, limit)
+		query = query.Where("c_date <= ?", sqlitedb.Micros(*until))
 	}
 
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
+	if order == "desc" {
+		query = query.Order("c_date DESC, id DESC")
+	} else {
+		query = query.Order("c_date ASC, id ASC")
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	if err := query.Find(&commitLogs).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	out := []ucrecord.QueryRow{}
-	for rows.Next() {
-		var id, document, proofJSON, cOwner string
-		var cDate int64
-		if err := rows.Scan(&id, &document, &proofJSON, &cOwner, &cDate); err != nil {
-			return nil, err
-		}
+	rows := make([]ucrecord.QueryRow, 0, len(commitLogs))
+	for _, cl := range commitLogs {
 		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(proofJSON), &proof); err != nil {
+		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
+
 		row := ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{Document: document, Proof: proof},
-			CreatedAt: sqlitedb.Time(cDate),
+			Row: concrnt.SignedDocument{
+				Document: cl.Document,
+				Proof:    proof,
+			},
+			CreatedAt: sqlitedb.Time(cl.CDate),
 		}
-		// an ownerless commit (unrepaired legacy row) has no ccfs namespace
-		if cOwner != "" {
-			ccfs := concrnt.ComposeCCFSURI(cOwner, concrnt.CCFSTypeConcrnt, id)
+		// an ownerless commit (unrepaired legacy row) has no ccfs namespace to
+		// compose; ComposeCCFSURI("") would yield a URI that misparses
+		if cl.Owner != "" {
+			ccfs := concrnt.ComposeCCFSURI(cl.Owner, concrnt.CCFSTypeConcrnt, cl.ID)
 			row.Row.CCFS = &ccfs
 		}
-		out = append(out, row)
+
+		rows = append(rows, row)
 	}
-	return out, rows.Err()
+
+	return rows, nil
 }
 
 func (r *Repository) CountGcCandidates(ctx context.Context, cutoffID string) (int64, error) {
 	var count int64
-	err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM commit_logs WHERE gc_candidate = 1 AND id < ?", cutoffID).Scan(&count)
+	err := r.db.WithContext(ctx).
+		Model(&sqlitedb.CommitLog{}).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Count(&count).Error
 	return count, err
 }
 
 func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]ucrecord.CommitLogEntry, error) {
-	query := "SELECT id, ip, document, proof, owner, c_date FROM commit_logs WHERE gc_candidate = 1 AND id < ?"
-	args := []any{cutoffID}
+	q := r.db.WithContext(ctx).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Order("id ASC").
+		Limit(limit)
 	if afterID != "" {
-		query += " AND id > ?"
-		args = append(args, afterID)
+		q = q.Where("id > ?", afterID)
 	}
-	query += " ORDER BY id ASC LIMIT ?"
-	args = append(args, limit)
-	return r.commitLogEntries(ctx, query, args...)
+	var logs []sqlitedb.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return commitLogEntries(logs)
 }
 
 // DeleteCommitLogs deletes the commit logs; records, record keys, acks,
@@ -182,64 +212,54 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	res, err := r.db.ExecContext(ctx, "DELETE FROM commit_logs WHERE id IN ("+sqlitedb.Placeholders(len(ids))+")", sqlitedb.Args(ids)...)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
-	return int(n), err
+	res := r.db.WithContext(ctx).Where("id IN ?", ids).Delete(&sqlitedb.CommitLog{})
+	return int(res.RowsAffected), res.Error
 }
 
-// ListCommitLogs pages by id: time-kind CDIDs are fixed-length lowercase
-// base32 whose byte order encodes the embedded timestamp.
+// ListCommitLogs orders, paginates and filters on the id column so the
+// primary-key index backs the range scan; time-kind CDIDs are fixed-length
+// lowercase base32 whose byte order encodes the embedded timestamp.
 func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLogPage) ([]ucrecord.CommitLogEntry, error) {
-	query := "SELECT id, ip, document, proof, owner, c_date FROM commit_logs WHERE 1 = 1"
-	args := []any{}
+	q := r.db.WithContext(ctx).Order("commit_logs.id ASC")
+	if page.Limit > 0 {
+		q = q.Limit(page.Limit)
+	}
 	if page.AfterID != "" {
-		query += " AND id > ?"
-		args = append(args, page.AfterID)
+		q = q.Where("commit_logs.id > ?", page.AfterID)
 	} else if page.FromID != "" {
-		query += " AND id >= ?"
-		args = append(args, page.FromID)
+		q = q.Where("commit_logs.id >= ?", page.FromID)
 	}
 	if page.UntilID != "" {
-		query += " AND id <= ?"
-		args = append(args, page.UntilID)
+		q = q.Where("commit_logs.id <= ?", page.UntilID)
 	}
 	if page.Owner != "" {
-		query += " AND owner = ?"
-		args = append(args, page.Owner)
+		q = q.Where("commit_logs.owner = ?", page.Owner)
 	}
-	query += " ORDER BY id ASC"
-	if page.Limit > 0 {
-		query += " LIMIT ?"
-		args = append(args, page.Limit)
-	}
-	return r.commitLogEntries(ctx, query, args...)
-}
 
-func (r *Repository) commitLogEntries(ctx context.Context, query string, args ...any) ([]ucrecord.CommitLogEntry, error) {
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
+	var logs []sqlitedb.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	return commitLogEntries(logs)
+}
 
-	entries := []ucrecord.CommitLogEntry{}
-	for rows.Next() {
-		var e ucrecord.CommitLogEntry
-		var proofJSON string
-		var cDate int64
-		if err := rows.Scan(&e.ID, &e.IP, &e.Document, &proofJSON, &e.Owner, &cDate); err != nil {
-			return nil, err
-		}
-		if proofJSON != "" {
-			if err := json.Unmarshal([]byte(proofJSON), &e.Proof); err != nil {
-				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", e.ID, err)
+func commitLogEntries(logs []sqlitedb.CommitLog) ([]ucrecord.CommitLogEntry, error) {
+	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
+	for _, cl := range logs {
+		var proof concrnt.Proof
+		if cl.Proof != "" {
+			if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
 			}
 		}
-		e.CDate = sqlitedb.Time(cDate)
-		entries = append(entries, e)
+		entries = append(entries, ucrecord.CommitLogEntry{
+			ID:       cl.ID,
+			IP:       cl.IP,
+			Document: cl.Document,
+			Proof:    proof,
+			Owner:    cl.Owner,
+			CDate:    sqlitedb.Time(cl.CDate),
+		})
 	}
-	return entries, rows.Err()
+	return entries, nil
 }

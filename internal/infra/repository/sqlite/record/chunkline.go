@@ -2,39 +2,49 @@ package record
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"net/url"
 	"time"
+
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/chunkline"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
 
-const defaultChunkSize = 32
+const (
+	defaultChunkSize = 32
+)
 
 func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	parent, err := getRecordKey(ctx, r.db, uri)
+	recordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	var firstChunk *int64
-	var first int64
-	err = r.db.QueryRowContext(ctx, "SELECT record_created_at FROM record_keys WHERE parent_id = ? AND record_created_at IS NOT NULL ORDER BY record_created_at ASC LIMIT 1", parent.ID).Scan(&first)
+	firstCollectionMember := sqlitedb.RecordKey{}
+	err = r.db.WithContext(ctx).
+		Model(&sqlitedb.RecordKey{}).
+		Where("record_keys.parent_id = ?", recordKey.ID).
+		Where("record_keys.record_created_at IS NOT NULL").
+		Order("record_keys.record_created_at ASC").
+		Limit(1).
+		Take(&firstCollectionMember).Error
 	if err == nil {
-		chunk := sqlitedb.Time(first).Unix() / 600
+		chunk := sqlitedb.Time(*firstCollectionMember.RecordCreatedAt).Unix() / 600
 		firstChunk = &chunk
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		span.RecordError(err)
 		return nil, err
 	}
 
 	safeURI := url.QueryEscape(uri)
+
 	return &chunkline.Manifest{
 		Version:    "1.0",
 		ChunkSize:  600,
@@ -44,6 +54,7 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
 		},
 		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
+		// Metadata: recordKey.Record.Value,
 	}, nil
 }
 
@@ -51,99 +62,99 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
-	lookup := map[string]int64{}
-	if len(uris) == 0 {
-		return lookup, nil
+	type TimelineRow struct {
+		URI          string `gorm:"column:uri"`
+		MaxCreatedAt *int64 `gorm:"column:max_created_at"`
 	}
+
+	var res []TimelineRow
+
 	cutoff := time.Unix((chunkID+1)*600, 0) // descending order
 
-	args := append([]any{sqlitedb.Micros(cutoff)}, sqlitedb.Args(uris)...)
-	rows, err := r.db.QueryContext(ctx, `SELECT parent.uri,
-			(SELECT child.record_created_at FROM record_keys child WHERE child.parent_id = parent.id AND child.record_created_at < ? ORDER BY child.record_created_at DESC LIMIT 1)
-		FROM record_keys parent WHERE parent.uri IN (`+sqlitedb.Placeholders(len(uris))+`)`, args...)
+	latestSubQuery := r.db.
+		Table("record_keys AS child").
+		Select("child.record_created_at").
+		Where("child.parent_id = parent.id").
+		Where("child.record_created_at < ?", sqlitedb.Micros(cutoff)).
+		Order("child.record_created_at DESC").
+		Limit(1)
+
+	err := r.db.WithContext(ctx).
+		Table("record_keys AS parent").
+		Select("parent.uri AS uri, (?) AS max_created_at", latestSubQuery).
+		Where("parent.uri IN ?", uris).
+		Scan(&res).Error
+
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	defer rows.Close()
 
-	for rows.Next() {
-		var uri string
-		var max sql.NullInt64
-		if err := rows.Scan(&uri, &max); err != nil {
-			return nil, err
+	lookup := make(map[string]int64)
+	for _, row := range res {
+		if row.MaxCreatedAt == nil {
+			continue
 		}
-		if max.Valid {
-			lookup[uri] = sqlitedb.Time(max.Int64).Unix() / 600
-		}
+		lookup[row.URI] = sqlitedb.Time(*row.MaxCreatedAt).Unix() / 600
 	}
-	return lookup, rows.Err()
-}
-
-type member struct {
-	URI             string
-	Redirect        sql.NullString
-	RecordCreatedAt int64
-}
-
-func (r *Repository) loadMembers(ctx context.Context, query string, args ...any) ([]member, error) {
-	rows, err := r.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	members := []member{}
-	for rows.Next() {
-		var m member
-		if err := rows.Scan(&m.URI, &m.Redirect, &m.RecordCreatedAt); err != nil {
-			return nil, err
-		}
-		members = append(members, m)
-	}
-	return members, rows.Err()
+	return lookup, nil
 }
 
 func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 
-	chunkDate := sqlitedb.Micros(time.Unix((chunkID+1)*600, 0))
-	prevChunkDate := sqlitedb.Micros(time.Unix((chunkID-1)*600, 0))
+	chunkDate := time.Unix((chunkID+1)*600, 0)
+	prevChunkDate := time.Unix((chunkID-1)*600, 0)
 
-	parent, err := getRecordKey(ctx, r.db, uri)
+	parentRecordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	const memberSelect = "SELECT uri, redirect, record_created_at FROM record_keys WHERE parent_id = ? AND record_created_at < ?"
-	members, err := r.loadMembers(ctx, memberSelect+" ORDER BY record_created_at DESC LIMIT ?", parent.ID, chunkDate, defaultChunkSize)
+	var members []sqlitedb.RecordKey
+	err = r.db.WithContext(ctx).
+		Where("parent_id = ?", parentRecordKey.ID).
+		Where("record_created_at < ?", sqlitedb.Micros(chunkDate)).
+		Order("record_created_at DESC").
+		Limit(defaultChunkSize).
+		Find(&members).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	// the window is not covered by the newest 32: read the whole window
-	if len(members) == 0 || members[len(members)-1].RecordCreatedAt >= prevChunkDate {
-		members, err = r.loadMembers(ctx, memberSelect+" AND record_created_at >= ? ORDER BY record_created_at DESC", parent.ID, chunkDate, prevChunkDate)
+	// Judge window coverage by record_created_at — the same column the queries
+	// filter and order by — not the joined Record.CreatedAt, which can diverge
+	// (e.g. backdated records) and would skip the window scan.
+	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || *members[len(members)-1].RecordCreatedAt >= sqlitedb.Micros(prevChunkDate) {
+		err = r.db.WithContext(ctx).
+			Where("parent_id = ?", parentRecordKey.ID).
+			Where("record_created_at < ?", sqlitedb.Micros(chunkDate)).
+			Where("record_created_at >= ?", sqlitedb.Micros(prevChunkDate)).
+			Order("record_created_at DESC").
+			Find(&members).Error
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 	}
 
+	// every field a body item needs is on the key row (redirect and
+	// record_created_at are denormalised there), so no record is read
 	bodyItems := make([]chunkline.BodyItem, 0, len(members))
-	for _, m := range members {
-		href := m.URI
-		if m.Redirect.Valid {
-			href = m.Redirect.String
+	for _, member := range members {
+		href := member.URI
+		if member.Redirect != nil {
+			href = *member.Redirect
 		}
 		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   sqlitedb.Time(m.RecordCreatedAt),
+			Timestamp:   sqlitedb.Time(*member.RecordCreatedAt),
 			Href:        href,
 			ContentType: "application/concrnt.document+json",
 		})
 	}
+
 	return bodyItems, nil
 }
