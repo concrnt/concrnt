@@ -26,6 +26,25 @@ services:
     extra_hosts:
       - "host.docker.internal:172.29.253.172"
 
+  # Spanner Omni, the local target of backends.database: spanner (profile
+  # spanner, so it only runs when asked for). The evaluation license it
+  # starts with lasts 90 days from the first start of the volume; create
+  # the database once with
+  #   docker compose exec spanner-omni /google/spanner/bin/spanner databases create concrnt
+  spanner-omni:
+    restart: always
+    image: us-docker.pkg.dev/spanner-omni/images/spanner-omni:2026.r4-lts
+    profiles:
+      - spanner
+    command: ["start-single-server", "--listen-addresses", "0.0.0.0"]
+    volumes:
+      - spanner-data:/spanner
+    ports:
+      - "15000:15000"
+    networks:
+      - internal
+      - external
+
   web:
     restart: always
     image: ghcr.io/concrnt/concrnt-web:main
@@ -110,6 +129,7 @@ services:
 
 volumes:
   postgres-data:
+  spanner-data:
   redis-data:
   tempo-data:
 

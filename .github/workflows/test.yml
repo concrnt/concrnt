@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - develop
+      - feat/repository-contract
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    # repository-layer tests start Postgres via dockertest
+    # repository-layer tests start Postgres via dockertest; the Spanner
+    # suites run in their own job below
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -19,3 +21,19 @@ jobs:
           cache: true
       - run: go vet ./...
       - run: go test ./... -count=1
+        env:
+          CONCRNT_TEST_SPANNER: "0"
+
+  spanner:
+    runs-on: ubuntu-latest
+    # Spanner Omni via dockertest: one container per test package, a
+    # migrated database shared by the package's tests
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: docker pull us-docker.pkg.dev/spanner-omni/images/spanner-omni:2026.r4-lts
+      - run: go test ./internal/infra/repository/spanner/... ./internal/infra/aggregate/spanner/... -count=1 -v

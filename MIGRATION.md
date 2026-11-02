@@ -16,9 +16,9 @@ dropping it is always safe and never needs a log replay.
   log). Drifted entries are dropped and rebuild on demand. A redis store
   may show transient drift from concurrent writers; it converges within
   `backends.aggregate.ttl`.
-- **Switching the store** (`backends.aggregate.store: postgres | redis`)
+- **Switching the store** (`backends.aggregate.store: postgres | spanner | redis`)
   needs no migration: the new store starts cold and fills on demand. The
-  old Postgres table (`aggregate_entries`) can be truncated.
+  old table (`aggregate_entries`, Postgres or Spanner) can be truncated.
 - Existing databases get no pre-computed counts; the first read of each
   target computes it (one `GROUP BY` over that target's associations).
 
@@ -33,16 +33,16 @@ target backend (an empty database, same FQDN and keys):
 ```sh
 # 1. dump the source (reads the database directly; no server needed)
 conctl op dump-commitlog source            # -> source.commits.jsonl, source.metas.jsonl
-conctl op dump-subscriptions > source.subscriptions.jsonl
+conctl op dump-subscriptions source.subscriptions.jsonl
 
-# 2. start the target server on the new backend (backends.database: sqlite
-#    or postgres, an empty store), then replay into it; conctl's own config
-#    must point at the target backend too, it restores the entity metas
-#    directly
+# 2. start the target server on the new backend (backends.database: sqlite,
+#    postgres or spanner, an empty store), then replay into it; conctl's own
+#    config must point at the target backend too, it restores the entity
+#    metas directly
 CONCRNT_CONFIG=/etc/concrnt/target conctl op import-commitlog \
   --endpoint http://target:8000 --concurrency 4 --rejected-out rejected.jsonl \
   source.commits.jsonl source.metas.jsonl
-CONCRNT_CONFIG=/etc/concrnt/target conctl op import-subscriptions < source.subscriptions.jsonl
+CONCRNT_CONFIG=/etc/concrnt/target conctl op import-subscriptions source.subscriptions.jsonl
 
 # 3. verify: a dump of the target lists the same commits
 CONCRNT_CONFIG=/etc/concrnt/target conctl op dump-commitlog target
@@ -70,5 +70,14 @@ Notes:
 - The target server needs the same outbound reach as the source: policy
   documents are fetched by URL during replay, so a container without CA
   certificates denies every write into a policy-governed timeline.
+- A range delete of more than 500 targets is replayed like any other
+  commit: the first 500 go in the commit, the rest in `RecordRangeDelete`
+  jobs on the target server, so the target's job queue must be running
+  (it is, when the server is) and the dump comparison of step 3 is only
+  final once that queue is idle.
+- On Spanner the database itself must exist before the server starts
+  (`spanner databases create concrnt` on Omni, the console or `gcloud` on
+  Cloud Spanner); the server creates and migrates the tables.
 - The round trip Postgres → SQLite → Postgres was verified this way on a
   218k-commit devnet dump; see the phase 2 pull request for the numbers.
+  Postgres → Spanner (Omni) → Postgres: see the phase 3 pull request.

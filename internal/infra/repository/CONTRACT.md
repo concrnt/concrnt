@@ -16,8 +16,8 @@ the contract's meaning never depends on it.
 | C1 | No joins assumed | Every read method must be satisfiable as "one collection, equality filters, at most one range condition, an ordering" or as a get by id(s). Fields a query needs live on the key side, denormalised. |
 | C2 | Aggregates are caches | Counts are derived values recomputable from the primary data. Request paths read them through the aggregate layer (`internal/usecase/aggregate`); the repository only exposes the expensive `Compute*` recomputation, which nothing but the aggregate layer and `conctl op aggregate-verify` may call. A write adjusts an existing cache entry or recomputes; it never trusts an increment for correctness. |
 | C3 | No auto-increment in the contract | Contract identifiers are CDIDs, URI hashes and client-generated random ids. A backend's serial ids never leak out. |
-| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. Keep one transaction's writes bounded (Firestore caps at 500); bulk deletes go to the job queue. |
-| C5 | Indexes are the backend's own | The method table below names the access path (the C1 shape) each method issues; that table is the only cross-backend description. Each backend declares its indexes in its own schema (the gorm tags in `postgres/models.go` and `sqlite/models.go`) and pins the resulting index set in a test (`pg_indexes` / `sqlite_master`), so a path added here lands in every backend's schema and test. Models, tables and index definitions are never shared between backends. |
+| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. The read methods take no `tx` and return **committed** state: inside `fn` they do not see what `fn` has written so far (on Postgres and SQLite they run on another connection, on Spanner as a single-use read), so a usecase never relies on reading its own uncommitted writes. Whether a backend's own write methods see their earlier statements in the same transaction is the backend's business. Keep one transaction's writes bounded (Firestore caps at 500 writes, Spanner at 80,000 mutations including index entries and cascaded rows); a range delete removes 500 targets in the commit and the rest page by page in `RecordRangeDelete` jobs. |
+| C5 | Indexes are the backend's own | The method table below names the access path (the C1 shape) each method issues; that table is the only cross-backend description. Each backend declares its indexes in its own schema (the gorm tags in `postgres/models.go` and `sqlite/models.go`, the DDL in `spanner/schema.go`) and pins the resulting index set in a test (`pg_indexes` / `sqlite_master` / `INFORMATION_SCHEMA.INDEXES`), so a path added here lands in every backend's schema and test. Models, tables and index definitions are never shared between backends. |
 | C6 | Uniqueness is explicit | Contract-level uniqueness (association `unique`, ack `(from, to, schema)`) is "a second write of the same key is a no-op / rejected", verified by repotest, however the backend enforces it. |
 | C7 | repotest defines the contract | A backend that does not pass `repotest` does not implement the contract. Change repotest before changing the contract. |
 | C8 | Migration is log replay | `conctl op dump-commitlog` / `import-commitlog` work on every backend; no backend copies another's tables. |
@@ -30,8 +30,9 @@ Wherever the contract orders or bounds by key (`QueryByParentOrderByKey`
 and its `since`/`until` cursors, `QueryRecordSubtree`), the order is **byte
 order of the UTF-8 key** (CIP-5 `orderby=key` has to be the same on every
 server). A backend whose default collation is not byte order (Postgres with
-a locale collation) must force it (`COLLATE "C"`); SQLite's `BINARY` and
-Firestore's string order already are byte order.
+a locale collation) must force it (`COLLATE "C"`); SQLite's `BINARY`,
+Spanner's code-point order of `STRING` and Firestore's string order already
+are byte order.
 
 Commit log ids (time-kind CDIDs: fixed-length lowercase base32) and the
 `c_date, id` replication cursor sort the same under every collation, so
@@ -54,7 +55,7 @@ phase 2 (`behavior:` in the PR).
 
 | Method | Shape / semantics | Verdict |
 |---|---|---|
-| `RunInTx(ctx, fn)` | Runs `fn` atomically; retries on backend contention (Postgres 40001/40P01, SQLite BUSY); `fn` may run more than once (C4). | keep |
+| `RunInTx(ctx, fn)` | Runs `fn` atomically; retries on backend contention (Postgres 40001/40P01, SQLite BUSY, Spanner ABORTED); `fn` may run more than once (C4). | keep |
 
 #### Commit log
 
@@ -68,7 +69,7 @@ phase 2 (`behavior:` in the PR).
 | `MarkCommitLogsGcCandidateByOwner(owner)` | eq(owner) → set flag; idempotent. Not transactional (unregister). | keep |
 | `CountGcCandidates(cutoffID)` | eq(gc_candidate), range(id < cutoff) → count. Offline only. | keep |
 | `ListGcCandidates(cutoffID, afterID, limit)` | eq(gc_candidate), range(afterID < id < cutoff), order(id). Offline only. | keep |
-| `DeleteCommitLogs(ids)` | tx-free multi-delete by id; everything hanging off a commit (record, key, ack, acked, association, entity) goes with it; returns the number removed. Offline only; callers invalidate aggregates afterwards. | keep |
+| `DeleteCommitLogs(ids)` | tx-free multi-delete by id; everything hanging off a commit (record, key, ack, acked, association, entity) goes with it; returns the number removed. Not atomic over the whole list: a backend with a per-commit write limit (Spanner) deletes in batches. Offline only; callers invalidate aggregates afterwards. | keep |
 | `ListCommitLogs(page)` | eq(owner)?, range(id), order(id asc), limit. Offline paging. | keep |
 
 #### Records and keys
@@ -92,7 +93,7 @@ phase 2 (`behavior:` in the PR).
 | `QueryByPrefix(prefix, schema?, author?, since, until, limit, order)` | range(key starts with prefix) ∧ eq(schema)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). Only keys holding a record. `prefix` is a literal: a backend using `LIKE` escapes `%`/`_`/`\` (bug: Postgres did not). | bug (T2.6) |
 | `QueryByParent(parent, schema?, author?, since, until, limit, order)` | eq(parent) ∧ … as above; the owner root (`cckv://<owner>`) is a valid parent and lists top-level keys that hold a record. | keep |
 | `QueryByParentOrderByKey(parent, schema?, author?, sinceKey, untilKey, limit, order)` | eq(parent), range(key, inclusive bounds), order(key, **byte order**). Placeholder (intermediate) keys come back as key-only rows unless a record filter (schema/author) drops them. | bug (byte order, T2.3) |
-| `QueryRecordSubtree(base, includeSelf)` | range(key = base ∨ key starts with base + "/"), order(key, byte order). The exact set a range delete removes. | keep |
+| `QueryRecordSubtree(base, includeSelf, afterKey, limit)` | range(key = base ∨ key starts with base + "/") ∧ range(key > afterKey)?, order(key, byte order), limit. The exact set a range delete removes; the cursor and limit page it one transaction at a time (phase 3: `RecordRangeDelete` jobs). | add (cursor, limit) |
 
 #### Associations
 
@@ -167,6 +168,41 @@ Nothing returns a backend-generated id. The `int64` values that do cross are
 chunk ids (`unix / 600` time buckets), counts, and the number of commit logs
 deleted.
 
+## Backend notes
+
+What each backend does with the contract that the other backends do not
+have to think about. None of it changes the contract's meaning.
+
+### Spanner (`internal/infra/repository/spanner`)
+
+- GoogleSQL through the native client; writes are DML statements inside
+  `ReadWriteTransaction`, so a write method sees the rows earlier statements
+  of the same transaction wrote (the conditional upserts and placeholder
+  parents rely on it). Reads outside a transaction are single-use strong
+  reads. `ABORTED` is retried by the client: that is the `RunInTx` retry.
+- `commit_logs.c_date` is a commit timestamp (`PENDING_COMMIT_TIMESTAMP()`),
+  monotonic within the database, so `QueryCommitLogs`'s `(c_date, id)`
+  order is exact. The column cannot be read in the transaction that writes
+  it; nothing in the contract does. `Inspector.SetCommitCDate` writes an
+  explicit past timestamp, which the column allows.
+- 80,000 mutations per commit, index entries and cascaded rows included.
+  `DeleteCommitLogs` deletes 100 commits per transaction; a range delete
+  pages (C4). What still exceeds it: deleting one record whose key has more
+  than roughly 15,000 associations (every association row and its four
+  index entries cascade in that one transaction). Spanner Omni does not
+  enforce the limit; Cloud Spanner does.
+- No serial ids: `record_keys` is keyed by `uri` with a `parent_uri`
+  column, associations reference the target by `uri`. `records`, `acks`,
+  `ackeds` and `associations` are interleaved in `commit_logs` (`ON DELETE
+  CASCADE`); `entities.document_id`, `record_keys.record_id` and
+  `associations.target_uri` cascade through foreign keys.
+- Time-ordered primary keys (CDIDs) are written to monotonically increasing
+  key ranges; no sharding at this scale. Adding a shard column later is a
+  DDL batch plus the key predicates, nothing in the contract.
+- Spanner Omni accepts only `projects/default/instances/default` as the
+  instance path; the evaluation license runs 90 days from the first start
+  of a data directory.
+
 ## Changing the contract
 
 1. Change (or add) the suite in `repotest` first; the expected behaviour is
@@ -185,6 +221,7 @@ deleted.
 ```sh
 go test ./internal/infra/repository/postgres/... -run Suite -count=1   # Postgres via dockertest
 go test ./internal/infra/repository/sqlite/... -run Suite -count=1     # SQLite on a temp file, no Docker
+go test ./internal/infra/repository/spanner/... -run Suite -count=1    # Spanner Omni via dockertest (CONCRNT_TEST_SPANNER_ENDPOINT reuses a running one)
 ```
 
 `repotest` must not import a backend package:

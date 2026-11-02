@@ -74,6 +74,8 @@ func (*recordingTx) IsRepositoryTx() {}
 type subtreeQueryCall struct {
 	base        string
 	includeSelf bool
+	afterURI    string
+	limit       int
 }
 
 // rangeDeleteRepo serves a fixed subtree enumeration and records the
@@ -121,9 +123,19 @@ func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx Repos
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
-func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
-	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf})
-	return r.subtree, nil
+func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
+	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf, afterURI: afterURI, limit: limit})
+	out := []concrnt.SignedDocument{}
+	for _, sd := range r.subtree {
+		if *sd.CCKV <= afterURI || slices.Contains(r.deletedURIs, *sd.CCKV) {
+			continue
+		}
+		out = append(out, sd)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
 }
 func (r *rangeDeleteRepo) DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error {
 	r.deletedURIs = append(r.deletedURIs, targetURI)
@@ -169,15 +181,20 @@ func (p *denyKeysPolicyService) Eval(ctx context.Context, req policy.RequestCont
 // recordingDeliveryQueue captures the DeliveryJobs a usecase enqueues and
 // the handlers it registers, keyed by job type.
 type recordingDeliveryQueue struct {
-	jobs     []DeliveryJob
-	handlers map[string]func(ctx context.Context, payload json.RawMessage) error
+	jobs      []DeliveryJob
+	rangeJobs []RangeDeleteJob
+	handlers  map[string]func(ctx context.Context, payload json.RawMessage) error
 }
 
 func (d *recordingDeliveryQueue) Enqueue(ctx context.Context, jobType string, payload any) error {
-	if jobType != JobTypeRecordDelivery {
+	switch jobType {
+	case JobTypeRecordDelivery:
+		d.jobs = append(d.jobs, payload.(DeliveryJob))
+	case JobTypeRecordRangeDelete:
+		d.rangeJobs = append(d.rangeJobs, payload.(RangeDeleteJob))
+	default:
 		return fmt.Errorf("unexpected job type %q", jobType)
 	}
-	d.jobs = append(d.jobs, payload.(DeliveryJob))
 	return nil
 }
 
@@ -273,7 +290,7 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 		t.Fatalf("Commit returned error: %v", err)
 	}
 
-	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: true}) {
+	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: true, limit: rangeDeleteSyncLimit + 1}) {
 		t.Fatalf("unexpected enumeration calls: %+v", repo.queryCalls)
 	}
 
@@ -356,6 +373,107 @@ func TestCommitDeleteRetainKeepsHistory(t *testing.T) {
 	})
 }
 
+// A subtree larger than rangeDeleteSyncLimit is removed one page per
+// transaction: the commit takes the first page and enqueues a
+// RecordRangeDelete job for the rest; each job page re-enqueues the next
+// until the subtree is exhausted, and only the last page flags the delete
+// commit for gc. A retained document in any page keeps the commit.
+func TestCommitRangeDeleteLargeSubtreePagesThroughJobs(t *testing.T) {
+	ccid, priv := newIdentity(t)
+	cfg := &domain.Config{FQDN: "example.com"}
+
+	const extra = 3
+	targets := []concrnt.SignedDocument{subtreeRecord(t, rangeBaseURI)}
+	for i := 0; i < rangeDeleteSyncLimit+extra-1; i++ {
+		targets = append(targets, subtreeRecord(t, fmt.Sprintf("%s/c%05d", rangeBaseURI, i)))
+	}
+	repo := &rangeDeleteRepo{subtree: targets}
+	delivery := &recordingDeliveryQueue{}
+	uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, delivery, &stubKVS{})
+
+	sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+		t.Fatalf("Commit returned error: %v", err)
+	}
+	if len(repo.deletedURIs) != rangeDeleteSyncLimit {
+		t.Fatalf("the commit must delete exactly one page, deleted %d", len(repo.deletedURIs))
+	}
+	if slices.Contains(repo.gcFlagged, documentIDOf(t, sd)) {
+		t.Fatalf("the delete commit must not be flagged before the last page")
+	}
+	if len(delivery.rangeJobs) != 1 {
+		t.Fatalf("one continuation job must be enqueued, got %d", len(delivery.rangeJobs))
+	}
+	job := delivery.rangeJobs[0]
+	if job.AfterURI != *targets[rangeDeleteSyncLimit-1].CCKV || !job.IncludeSelf || job.Base != rangeBaseURI || job.Requester != ccid {
+		t.Fatalf("unexpected job: %+v", job)
+	}
+
+	// the queue hands the payload back to the registered handler
+	payload, _ := json.Marshal(job)
+	if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+		t.Fatalf("job returned error: %v", err)
+	}
+	wantURIs := []string{}
+	for _, target := range targets {
+		wantURIs = append(wantURIs, *target.CCKV)
+	}
+	if !slices.Equal(repo.deletedURIs, wantURIs) {
+		t.Fatalf("after the job every target must be deleted, got %d of %d", len(repo.deletedURIs), len(wantURIs))
+	}
+	if len(delivery.rangeJobs) != 1 {
+		t.Fatalf("the last page must not enqueue another job, got %d", len(delivery.rangeJobs))
+	}
+	if last := repo.gcFlagged[len(repo.gcFlagged)-1]; last != documentIDOf(t, sd) {
+		t.Fatalf("the last page must flag the delete commit, last flagged %s", last)
+	}
+	if len(repo.txs) != 2 || !repo.txs[1].committed {
+		t.Fatalf("the job must commit its own transaction, got %+v", repo.txs)
+	}
+
+	t.Run("a retained document in a later page keeps the delete commit", func(t *testing.T) {
+		retained := subtreeRecord(t, rangeBaseURI+"/zzz")
+		retained.Document = strings.Replace(retained.Document, `"kind":"record"`, `"kind":"record","onUpdate":"retain"`, 1)
+		repo := &rangeDeleteRepo{subtree: append(slices.Clone(targets), retained)}
+		delivery := &recordingDeliveryQueue{}
+		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, delivery, &stubKVS{})
+
+		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+			t.Fatalf("Commit returned error: %v", err)
+		}
+		payload, _ := json.Marshal(delivery.rangeJobs[0])
+		if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+			t.Fatalf("job returned error: %v", err)
+		}
+		if slices.Contains(repo.gcFlagged, documentIDOf(t, sd)) {
+			t.Fatalf("the delete commit must stay when a page retained a document")
+		}
+	})
+
+	t.Run("a denied target in a later page is skipped", func(t *testing.T) {
+		repo := &rangeDeleteRepo{subtree: targets}
+		denied := *targets[len(targets)-1].CCKV
+		delivery := &recordingDeliveryQueue{}
+		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{deny: map[string]bool{denied: true}}, delivery, &stubKVS{})
+
+		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+			t.Fatalf("Commit returned error: %v", err)
+		}
+		payload, _ := json.Marshal(delivery.rangeJobs[0])
+		if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+			t.Fatalf("job returned error: %v", err)
+		}
+		if slices.Contains(repo.deletedURIs, denied) {
+			t.Fatalf("the denied target must survive")
+		}
+		if len(repo.deletedURIs) != len(targets)-1 {
+			t.Fatalf("every other target must be deleted, got %d", len(repo.deletedURIs))
+		}
+	})
+}
+
 // A children-only range delete ("...l1/*") enumerates without includeSelf.
 func TestCommitRangeDeleteChildrenOnly(t *testing.T) {
 	ccid, priv := newIdentity(t)
@@ -368,7 +486,7 @@ func TestCommitRangeDeleteChildrenOnly(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: false}) {
+	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: false, limit: rangeDeleteSyncLimit + 1}) {
 		t.Fatalf("unexpected enumeration calls: %+v", repo.queryCalls)
 	}
 }
