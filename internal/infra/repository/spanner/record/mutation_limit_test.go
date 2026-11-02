@@ -12,8 +12,8 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
-	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/testutil"
+	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 const (

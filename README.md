@@ -75,8 +75,9 @@ go build ./cmd/conctl       # admin CLI (account creation, key generation, v1->v
 go build ./cmd/k8s-elector  # optional Kubernetes sidecar for leader election / peer discovery
 
 go vet ./...
-go test ./...                                    # repository-layer tests spin up Postgres via dockertest (needs a Docker daemon)
+go test ./...                                    # repository-layer tests spin up Postgres and Spanner Omni via dockertest (needs a Docker daemon)
 go test ./policy/... ./chunkline/... ./client/... # pure-logic packages, no Docker required
+CONCRNT_TEST_SPANNER=0 go test ./...             # skip the Spanner suites (they pull a 1.1GB image and take minutes)
 go test ./... -run TestName -v                   # a single test
 ```
 
@@ -200,9 +201,29 @@ backend's package, and every backend passes the same contract suites
 
   The SQLite contract suites run without Docker:
   `go test ./internal/infra/repository/sqlite/... -count=1`.
+- `spanner`: `internal/infra/repository/spanner`, the native
+  `cloud.google.com/go/spanner` client (GoogleSQL, DML in read-write
+  transactions, no GORM). `backends.spanner.mode` picks the target: `cloud`
+  (Cloud Spanner, ambient credentials), `omni` (Spanner Omni at
+  `backends.spanner.endpoint`, plain text) or `emulator`. The database
+  (`backends.spanner.database`, default `concrnt`) must exist; the server
+  applies the numbered DDL batches of `spanner/schema.go` at start. Spanner
+  Omni runs locally from compose:
 
-`backends.aggregate` selects where the count caches live (`postgres` table or
-`redis`); see `MIGRATION.md` for the operational notes.
+  ```sh
+  docker compose --profile spanner up -d spanner-omni redis memcached
+  docker compose exec spanner-omni /google/spanner/bin/spanner databases create concrnt
+  # backends: { database: spanner, spanner: { mode: omni, endpoint: spanner-omni:15000 }, ... }
+  ```
+
+  Omni fixes the instance path to `projects/default/instances/default` and
+  its evaluation license lasts 90 days from the first start of the volume
+  (`spanner deployment describe` shows the expiry). The Spanner suites start
+  an Omni container through dockertest; `CONCRNT_TEST_SPANNER_ENDPOINT=localhost:15000`
+  points them at a running one instead and `CONCRNT_TEST_SPANNER=0` skips them.
+
+`backends.aggregate` selects where the count caches live (`postgres` or
+`spanner` table, or `redis`); see `MIGRATION.md` for the operational notes.
 
 `conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
 `migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,
