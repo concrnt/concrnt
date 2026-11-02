@@ -64,7 +64,10 @@ type Repository interface {
 	// is unused.
 	QueryByParentOrderByKey(ctx context.Context, parent, schema, author string, since, until *string, limit int, order string) ([]QueryRow, error)
 
-	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
+	// QueryRecordSubtree lists the live records under base (base itself too
+	// when includeSelf) in key order, those after afterURI only when it is
+	// set, at most limit when it is positive.
+	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
 	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
@@ -236,6 +239,13 @@ func New(
 				return err
 			}
 			return uc.Deliver(ctx, job)
+		})
+		jobs.RegisterHandler(JobTypeRecordRangeDelete, func(ctx context.Context, payload json.RawMessage) error {
+			job, err := usecase.ParseJobPayload[RangeDeleteJob](payload)
+			if err != nil {
+				return err
+			}
+			return uc.ContinueRangeDelete(ctx, job)
 		})
 	}
 

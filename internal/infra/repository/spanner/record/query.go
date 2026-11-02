@@ -50,7 +50,7 @@ func recordFilters(where []string, params map[string]any, schema, author string,
 // (includeSelf) or lies under base's path subtree (base + "/..."), ordered by
 // URI (byte order) so base leads. Unlike QueryByPrefix's raw prefix match this
 // never picks up sibling keys ("item2" for base "item").
-func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
+func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
@@ -59,7 +59,16 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	if includeSelf {
 		where = "(rk.uri = @base OR " + where + ")"
 	}
-	rows, err := scanRecordRows(ctx, r.client.Single(), joinRecords(false)+"WHERE "+where+" ORDER BY rk.uri ASC", params)
+	if afterURI != "" {
+		where += " AND rk.uri > @after"
+		params["after"] = afterURI
+	}
+	sql := joinRecords(false) + "WHERE " + where + " ORDER BY rk.uri ASC"
+	if limit > 0 {
+		sql += " LIMIT @limit"
+		params["limit"] = int64(limit)
+	}
+	rows, err := scanRecordRows(ctx, r.client.Single(), sql, params)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
