@@ -338,7 +338,7 @@ backends:
 
 ## 5. フェーズ3 — Spanner バックエンド（契約の証明）
 
-フェーズ2完了後に着手。`support-firestore` のコードはトランザクション層の設計（`tx.go` の書き込みバッファ）を手本として読むだけで、Spanner 実装は契約から直接書く。**GORM は使わない**（新規バックエンドの書き方の手本は T2.5 の SQLite）。
+フェーズ2完了後に着手。Spanner 実装は契約から直接書き、書き込みは DML（§3.1）で Postgres 版と同形にする。`support-firestore` の `tx.go`（書き込みバッファ）は DML のない Firestore 向けの設計であり、Spanner では参照しない。**GORM は使わない**（新規バックエンドの書き方の手本は T2.5 の SQLite）。
 
 ### 3.1 方針（決定事項）
 
@@ -358,7 +358,8 @@ backends:
 - **ID**: 契約どおり CDID / URI / ランダム gen のみ（C3）。`record_keys` の主キーは `uri`（Postgres の `bigserial id` に相当するものは持たない）。親参照は `parent_uri`、キー再作成時の子孫切り離しは Firestore 設計と同じ `gen`（ランダム識別子）で表す。`abuse_reports` の主キーは UUID。
 - **ホットスポット対策**: 時刻順 CDID を主キーにする `commits` / `records` / `associations` は単調増加キー。ariake 規模では問題にならないので既定は **シャードなし**。`PRIMARY KEY (shard, id)`（`shard INT64 AS (MOD(ABS(FARM_FINGERPRINT(id)), 16)) STORED`）へ切り替えられるよう、キー組み立てを1箇所（`keys.go`）に閉じる（§9-H）。
 - **コミットのカスケード**: `records` / `acks` / `ackeds` / `associations` は `document_id` が主キーなので `INTERLEAVE IN PARENT commits ON DELETE CASCADE` にする（親キーと同一キーの 1:1 子テーブル）。`DeleteCommitLogs` は `commits` の行削除だけで済む。`entities`（ccid キー）と `record_keys.record_id` は interleave できないので **外部キー + `ON DELETE CASCADE`**。カスケードされた行も **コミットあたり 80,000 ミューテーション上限**に数えられるので、`DeleteCommitLogs` のバッチ、`DeleteRecordByKey` の子孫削除は上限を超えない粒度に分割し、大量削除はジョブキューへ（C4）。
-- **トランザクション内の読み書き**: Spanner の `BufferWrite` は同一トランザクション内の後続の読み取りに **見えない**。Postgres 実装は同一 tx 内で「読む → 書く → 読む」を自然に行っているので、契約に明文化する: **「`RunInTx` のクロージャ内で、自分がそのトランザクションで書いた内容を読めることを前提にしてはならない」**（C4 の追補）。実装は `support-firestore` の `tx.go` と同じく書き込みをバッファし、同一キーへの書き込みは合成（coalesce）し、クロージャ終了時に flush する。条件付き UPSERT（accept-if-newer）は「読む → 比較 → `InsertOrUpdate` をバッファ」で実現し、直列化可能性と ABORTED 再試行が競合を解決する。
+- **書き込みは DML で**（2026-11-02 決定）: `ReadWriteTransaction` 内で `INSERT OR IGNORE` / `INSERT OR UPDATE` / 条件付き `UPDATE ... WHERE created_at < @new` / `DELETE` を `tx.Update` で発行する。DML は同一トランザクション内の後続読み取りに見えるので、Postgres / SQLite と**同じ手順をそのまま写せる**（`RowsAffected` 判定も同形）。契約（C4）の変更は不要。調査の結果、usecase 層は tx 越しに読んでおらず（契約の読み取りは全部コミット済み状態を見る）、read-after-write が要るのは `CreateRecord` / `DeleteRecordByKey` / `CreateAssociation` のバックエンド内部だけだったため。`BufferWrite` によるミューテーション方式は、同一 tx 内で自分の書き込みが読めない制約をバックエンドの外に漏らすので採らない。将来、誰も同一 tx 内で読み返さない文（`CreateCommitLog` の INSERT など）だけをミューテーション化するハイブリッドは可能だが、「ミューテーションにした行をその tx で DML から読まない」規律が要るので、最初は純 DML で揃える。
+- **ロック**: Postgres 版が `SELECT ... FOR UPDATE` している箇所は GoogleSQL の `FOR UPDATE` をそのまま使う。RW トランザクションは読み取り時の共有ロックが書き込みで排他に昇格するときに ABORTED を出しやすいので、先に排他を取って再試行を減らす。
 - **受信時刻**: `commits.c_date` は `allow_commit_timestamp=true` の列に `spanner.CommitTimestamp` を書く。DB 内で単調なので `QueryCommitLogs` の `(c_date, id)` 順が厳密になり、集計層（T2.2）の `AsOf` 比較の競合窓も Spanner では消える。`Inspector.SetCommitCDate` は過去時刻の明示書き込みで実現できる（未来時刻は拒否される）。
 - **配列・JSON**: `distributions` / `prefixes` / `schemas` は `ARRAY<STRING(MAX)>`、`well_known` / `info` は `JSON`。
 - **`QueryByPrefix`**: `STARTS_WITH(uri, @prefix)` は主キー `uri` の範囲走査になる。Firestore の `ancestors` 配列は不要。
@@ -369,7 +370,7 @@ backends:
 
 - `internal/infra/database/spanner.go`: クライアント生成（3モード）。
 - `internal/infra/repository/spanner/`:
-  - `repository.go`（`Repository` 構造体、`New`、`RunInTx`、`recordTx` の書き込みバッファ）
+  - `repository.go`（`Repository` 構造体、`New`、`RunInTx` = `client.ReadWriteTransaction`、`recordTx` は `*spanner.ReadWriteTransaction` の薄い包み）
   - `keys.go`（主キー組み立て、シャード切替の唯一の箇所）
   - `commit.go` / `record.go` / `query.go` / `association.go` / `ack.go` / `entity.go` / `chunkline.go` / `maintenance.go`（`postgres/record` と同じファイル分割）
   - `compute.go`（T2.2 の `Compute*`。`GROUP BY` で実装）
@@ -381,7 +382,7 @@ backends:
 - `internal/testutil/spanner.go`: dockertest で Omni（または §9-G によりエミュレータ）を起動し、`open(t)` ごとに新しいデータベースを作ってスキーマを適用する。Omni の起動が遅い場合はパッケージ単位で1コンテナを共有し、データベースだけテストごとに分ける。
 - `compose.yaml`: `spanner-omni` サービス（profile `spanner`）。README に起動手順。
 - `.github/workflows/test.yml`: Spanner ジョブを追加（§9-G）。
-- `internal/infra/repository/CONTRACT.md`: C4 追補（トランザクション内の read-after-write 禁止）、Spanner 固有の注意（ミューテーション上限、コミットタイムスタンプ）を「バックエンド別ノート」として追記。
+- `internal/infra/repository/CONTRACT.md`: Spanner 固有の注意（DML 方式の理由、ミューテーション上限、コミットタイムスタンプ、`FOR UPDATE`）を「バックエンド別ノート」として追記。契約本文（C4）は変更しない。
 - `MIGRATION.md`: Postgres ↔ Spanner のログ再生手順。
 
 ### 3.3 受け入れ条件
@@ -391,7 +392,7 @@ backends:
 - 形状レジストリに形状を1つ足して DDL を更新しない状態で Spanner のインデックス検査が **失敗する**。
 - Postgres → Spanner → Postgres のログ再生往復で `dump-commitlog` の出力が一致（§4 の SQLite 往復と同じ手順）。
 - 本番バイナリに `repotest` / `testutil` / `dockertest` がリンクされていない（C10）。
-- **契約の修正が必要になった箇所を PR 本文に列挙する**。これがこのフェーズの主目的で、Spanner 側で回避策を書くのではなく、契約（repotest → Postgres → SQLite → Spanner）を直す。想定される発見: read-after-write 前提、カスケード削除の粒度、`Inspector` のタイムスタンプ操作、`QueryByPrefix` の意味論。
+- **契約の修正が必要になった箇所を PR 本文に列挙する**。これがこのフェーズの主目的で、Spanner 側で回避策を書くのではなく、契約（repotest → Postgres → SQLite → Spanner）を直す。想定される発見: カスケード削除の粒度、`Inspector` のタイムスタンプ操作、`QueryByPrefix` の意味論。（read-after-write は調査済みで契約の問題ではないと判明。§3.1 参照）
 
 ---
 
@@ -465,7 +466,6 @@ backends:
 | 初回アクセスの計算コスト（コールドスタート） | `aggregate-invalidate --all` 直後や保存先切り替え直後に `Compute*` が集中 | 計算は 1 ターゲット単位で有界。必要なら人気ターゲットの事前ウォーム（`conctl op aggregate-warm --top N`）を任意で用意。 |
 | （フェーズ3）Spanner Omni が GitHub ランナーで動かない / 重い | 起動タイムアウト、メモリ不足 | §9-G のとおりエミュレータへ退避。`tx_abort_test` は Omni 限定で `-tags omni` にする。 |
 | （フェーズ3）80,000 ミューテーション上限 | 大きなタイムラインの削除や GC バッチが `InvalidArgument` | バッチ粒度を下げ、子孫削除はジョブキューへ。`mutation_limit_test` で固定。 |
-| （フェーズ3）同一 tx 内の read-after-write 前提が usecase に残っている | Spanner で repotest が落ちる | 契約（C4 追補）を直し、Postgres 側も同じ制約で動くことを repotest に足す。回避策を Spanner 側に書かない。 |
 | （フェーズ4）エミュレータ起動で CI が遅い/不安定 | タイムアウト | イメージをキャッシュ、`-run` でスイート分割、最後は Firestore テストを別ジョブに。 |
 | Postgres 起動時マイグレーションの多重実行 | 複数レプリカ同時起動で DDL 競合 | `pg_advisory_xact_lock` + `IF NOT EXISTS` + `schema_migrations` で冪等に。 |
 | 既存 DB への列追加 backfill が長い | `record_keys.redirect` backfill で起動が遅延 | バッチ分割、起動をブロックしないバックグラウンド実行、未 backfill 行は `records` へフォールバック。 |
