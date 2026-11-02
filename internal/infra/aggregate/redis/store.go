@@ -1,5 +1,5 @@
 // Package redis keeps aggregate entries as volatile Redis strings; Apply is
-// an optimistic WATCH / MULTI loop. A Firestore store (phase 3) follows the
+// an optimistic WATCH / MULTI loop. The Firestore store follows the
 // same shape: a transaction for Apply, a key-range query for InvalidateAll.
 package redis
 

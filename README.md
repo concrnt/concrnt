@@ -75,9 +75,9 @@ go build ./cmd/conctl       # admin CLI (account creation, key generation, v1->v
 go build ./cmd/k8s-elector  # optional Kubernetes sidecar for leader election / peer discovery
 
 go vet ./...
-go test ./...                                    # repository-layer tests spin up Postgres and Spanner Omni via dockertest (needs a Docker daemon)
+go test ./...                                    # repository-layer tests spin up Postgres, Spanner Omni and the Firestore emulator via dockertest (needs a Docker daemon)
 go test ./policy/... ./chunkline/... ./client/... # pure-logic packages, no Docker required
-CONCRNT_TEST_SPANNER=0 go test ./...             # skip the Spanner suites (they pull a 1.1GB image and take minutes)
+CONCRNT_TEST_SPANNER=0 CONCRNT_TEST_FIRESTORE=0 go test ./...  # skip the Spanner / Firestore suites (they pull 1GB+ images and take minutes)
 go test ./... -run TestName -v                   # a single test
 ```
 
@@ -221,9 +221,30 @@ backend's package, and every backend passes the same contract suites
   (`spanner deployment describe` shows the expiry). The Spanner suites start
   an Omni container through dockertest; `CONCRNT_TEST_SPANNER_ENDPOINT=localhost:15000`
   points them at a running one instead and `CONCRNT_TEST_SPANNER=0` skips them.
+- `firestore`: `internal/infra/repository/firestore`, the native
+  `cloud.google.com/go/firestore` client (Native mode). A transaction's
+  writes are buffered until the usecase closure returns and laid over its
+  reads, so a method sees what the earlier methods of the same transaction
+  wrote. There is no schema to migrate, but the composite indexes in
+  `deploy/firestore/firestore.indexes.json` (generated from the query shapes
+  in `firestore/indexes.go`, pinned by a test) must be deployed before
+  traffic; `deploy/firestore/README.md` has the setup, the IAM binding and
+  the TTL policy of the count cache. The emulator runs from compose:
+
+  ```sh
+  docker compose --profile firestore up -d firestore-emulator redis memcached
+  # backends: { database: firestore, firestore: { projectID: local, emulatorHost: firestore-emulator:8080 }, ... }
+  ```
+
+  The Firestore suites start an emulator container through dockertest;
+  `CONCRNT_TEST_FIRESTORE_HOST=localhost:8080` points them at a running one
+  instead and `CONCRNT_TEST_FIRESTORE=0` skips them. The emulator does not
+  enforce composite indexes, so a query a new index is missing for only
+  fails in production (the startup probe logs it).
 
 `backends.aggregate` selects where the count caches live (`postgres` or
-`spanner` table, or `redis`); see `MIGRATION.md` for the operational notes.
+`spanner` table, `firestore` collection, or `redis`); see `MIGRATION.md` for
+the operational notes.
 
 `conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
 `migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,

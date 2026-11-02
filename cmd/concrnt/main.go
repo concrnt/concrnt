@@ -13,10 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
+	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
+	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
@@ -66,6 +70,10 @@ import (
 // second by default, so a backend that has not answered by then must
 // already be reported as down inside that window.
 const readinessTimeout = 800 * time.Millisecond
+
+// firestoreReadinessTTL memoizes the Firestore readiness probe between
+// /ready polls.
+const firestoreReadinessTTL = 15 * time.Second
 
 var (
 	version      = "unknown"
@@ -224,8 +232,9 @@ func main() {
 		notificationRepo notification.Repository
 		abuseRepo        abuse.Repository
 		databaseReady    func(ctx context.Context) error
-		db               *gorm.DB         // postgres only; the aggregate store's default home
-		spannerClient    *gspanner.Client // spanner only; same role
+		db               *gorm.DB           // postgres only; the aggregate store's default home
+		spannerClient    *gspanner.Client   // spanner only; same role
+		firestoreClient  *gfirestore.Client // firestore only; same role
 	)
 	switch conf.Backends.Database {
 	case "", "postgres":
@@ -291,8 +300,27 @@ func main() {
 		serverRepo = spannerrepo.NewServerRepository(&domainConfig, sp, cl)
 		notificationRepo = spannerrepo.NewNotificationRepository(sp)
 		abuseRepo = spannerrepo.NewAbuseRepository(sp)
+	case "firestore":
+		fsc, err := database.NewFirestore(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer fsc.Close()
+		// Firestore has no schema to migrate; the composite indexes are
+		// deployed from deploy/firestore and probed here, off the startup
+		// path, so a missing one shows up in the log before users hit it
+		go fsrepo.VerifyIndexes(context.WithoutCancel(ctx), fsc)
+		prometheus.MustRegister(fsrepo.Collectors()...)
+
+		firestoreClient = fsc
+		databaseReady = fsrepo.NewReadiness(fsc, firestoreReadinessTTL).Check
+		recordRepo = fsrecord.New(fsc, cl, domainConfig)
+		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
+		serverRepo = fsrepo.NewServerRepository(&domainConfig, fsc, cl)
+		notificationRepo = fsrepo.NewNotificationRepository(fsc)
+		abuseRepo = fsrepo.NewAbuseRepository(fsc)
 	default:
-		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner)")
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner, firestore)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -314,6 +342,11 @@ func main() {
 			panic("backends.aggregate.store spanner needs the spanner database")
 		}
 		aggregateStore = aggspanner.New(spannerClient)
+	case "firestore":
+		if firestoreClient == nil {
+			panic("backends.aggregate.store firestore needs the firestore database")
+		}
+		aggregateStore = aggfirestore.New(firestoreClient)
 	case "redis":
 		aggregateStore = aggredis.New(redis)
 	case "":
@@ -322,11 +355,13 @@ func main() {
 			aggregateStore = aggpostgres.New(db)
 		case spannerClient != nil:
 			aggregateStore = aggspanner.New(spannerClient)
+		case firestoreClient != nil:
+			aggregateStore = aggfirestore.New(firestoreClient)
 		default:
 			aggregateStore = aggredis.New(redis)
 		}
 	default:
-		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, redis)")
+		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 

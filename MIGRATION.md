@@ -16,9 +16,12 @@ dropping it is always safe and never needs a log replay.
   log). Drifted entries are dropped and rebuild on demand. A redis store
   may show transient drift from concurrent writers; it converges within
   `backends.aggregate.ttl`.
-- **Switching the store** (`backends.aggregate.store: postgres | spanner | redis`)
+- **Switching the store** (`backends.aggregate.store: postgres | spanner | firestore | redis`)
   needs no migration: the new store starts cold and fills on demand. The
-  old table (`aggregate_entries`, Postgres or Spanner) can be truncated.
+  old table (`aggregate_entries`, Postgres, Spanner or Firestore) can be
+  truncated. On Firestore expired entries are only removed by the TTL
+  policy on `expiresAt` (`deploy/firestore/README.md`); until it is
+  enabled they stay on disk, ignored.
 - Existing databases get no pre-computed counts; the first read of each
   target computes it (one `GROUP BY` over that target's associations).
 
@@ -36,7 +39,7 @@ conctl op dump-commitlog source            # -> source.commits.jsonl, source.met
 conctl op dump-subscriptions source.subscriptions.jsonl
 
 # 2. start the target server on the new backend (backends.database: sqlite,
-#    postgres or spanner, an empty store), then replay into it; conctl's own
+#    postgres, spanner or firestore, an empty store), then replay into it; conctl's own
 #    config must point at the target backend too, it restores the entity
 #    metas directly
 CONCRNT_CONFIG=/etc/concrnt/target conctl op import-commitlog \
@@ -78,6 +81,17 @@ Notes:
 - On Spanner the database itself must exist before the server starts
   (`spanner databases create concrnt` on Omni, the console or `gcloud` on
   Cloud Spanner); the server creates and migrates the tables.
+- On Firestore the composite indexes must be deployed before the replay
+  (`deploy/firestore/README.md`); the emulator needs none. Sequential
+  document ids (commit ids are time-ordered) cap the sustained write rate
+  around 500 commits/s, so a large replay runs at that pace at best. The
+  emulator is far slower and degrades as the database grows (a 219k-commit
+  devnet dump landed 24k commits in 85 minutes, the last batches at 4
+  minutes per 400 lines): rehearse a migration against a real database.
 - The round trip Postgres → SQLite → Postgres was verified this way on a
   218k-commit devnet dump; see the phase 2 pull request for the numbers.
   Postgres → Spanner (Omni) → Postgres: see the phase 3 pull request.
+  Postgres → Firestore (emulator) → Postgres was verified on the first
+  23,911 commits / 167 metas of that dump (the emulator's pace, see above):
+  the Firestore dump is a subset of the source and the Postgres dump
+  replayed from it is identical, line for line; see the phase 4 pull request.

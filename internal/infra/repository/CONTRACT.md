@@ -16,8 +16,8 @@ the contract's meaning never depends on it.
 | C1 | No joins assumed | Every read method must be satisfiable as "one collection, equality filters, at most one range condition, an ordering" or as a get by id(s). Fields a query needs live on the key side, denormalised. |
 | C2 | Aggregates are caches | Counts are derived values recomputable from the primary data. Request paths read them through the aggregate layer (`internal/usecase/aggregate`); the repository only exposes the expensive `Compute*` recomputation, which nothing but the aggregate layer and `conctl op aggregate-verify` may call. A write adjusts an existing cache entry or recomputes; it never trusts an increment for correctness. |
 | C3 | No auto-increment in the contract | Contract identifiers are CDIDs, URI hashes and client-generated random ids. A backend's serial ids never leak out. |
-| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. The read methods take no `tx` and return **committed** state: inside `fn` they do not see what `fn` has written so far (on Postgres and SQLite they run on another connection, on Spanner as a single-use read), so a usecase never relies on reading its own uncommitted writes. Whether a backend's own write methods see their earlier statements in the same transaction is the backend's business. Keep one transaction's writes bounded (Firestore caps at 500 writes, Spanner at 80,000 mutations including index entries and cascaded rows); a range delete removes 500 targets in the commit and the rest page by page in `RecordRangeDelete` jobs. |
-| C5 | Indexes are the backend's own | The method table below names the access path (the C1 shape) each method issues; that table is the only cross-backend description. Each backend declares its indexes in its own schema (the gorm tags in `postgres/models.go` and `sqlite/models.go`, the DDL in `spanner/schema.go`) and pins the resulting index set in a test (`pg_indexes` / `sqlite_master` / `INFORMATION_SCHEMA.INDEXES`), so a path added here lands in every backend's schema and test. Models, tables and index definitions are never shared between backends. |
+| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. The read methods take no `tx` and return **committed** state: inside `fn` they do not see what `fn` has written so far (on Postgres and SQLite they run on another connection, on Spanner as a single-use read), so a usecase never relies on reading its own uncommitted writes. Whether a backend's own write methods see their earlier statements in the same transaction is the backend's business. Keep one transaction's writes bounded (Spanner caps at 80,000 mutations including index entries and cascaded rows, Firestore at 10 MiB per commit; Firestore's former 500-write cap is gone); a range delete removes 500 targets in the commit and the rest page by page in `RecordRangeDelete` jobs. |
+| C5 | Indexes are the backend's own | The method table below names the access path (the C1 shape) each method issues; that table is the only cross-backend description. Each backend declares its indexes in its own schema (the gorm tags in `postgres/models.go` and `sqlite/models.go`, the DDL in `spanner/schema.go`, the shape registry in `firestore/indexes.go` that generates `deploy/firestore/firestore.indexes.json`) and pins the resulting index set in a test (`pg_indexes` / `sqlite_master` / `INFORMATION_SCHEMA.INDEXES` / the generated file), so a path added here lands in every backend's schema and test. Models, tables and index definitions are never shared between backends. |
 | C6 | Uniqueness is explicit | Contract-level uniqueness (association `unique`, ack `(from, to, schema)`) is "a second write of the same key is a no-op / rejected", verified by repotest, however the backend enforces it. |
 | C7 | repotest defines the contract | A backend that does not pass `repotest` does not implement the contract. Change repotest before changing the contract. |
 | C8 | Migration is log replay | `conctl op dump-commitlog` / `import-commitlog` work on every backend; no backend copies another's tables. |
@@ -203,6 +203,48 @@ have to think about. None of it changes the contract's meaning.
   instance path; the evaluation license runs 90 days from the first start
   of a data directory.
 
+### Firestore (`internal/infra/repository/firestore`)
+
+- A Firestore transaction must issue every read before its first write and
+  never sees its own writes, so `RunInTx` hands the closure a handle that
+  buffers the writes (coalesced per document) and lays them over the reads
+  it serves; the writes are flushed when the closure returns. Point reads
+  and batch reads in the closure therefore see the closure's earlier
+  writes, queries see the committed state minus the pending deletes
+  (no method needs more). The SDK re-runs the closure on ABORTED: that is
+  the `RunInTx` retry. Reads outside a transaction are plain strong reads
+  (C4).
+- One top-level collection per table; URI-keyed documents use a hash of
+  the URI as id (ids may not contain `/`) and carry the URI as a field.
+  `record_keys` link to their parent by `parentURI` (the owner root
+  `cckv://<owner>` for top-level keys, which is how the owner-root listings
+  of `QueryByParent*` work) and carry every strict ancestor in
+  `ancestors`, the field `QueryByPrefix` matches with `array-contains`
+  (the last path segment of a prefix is filtered client-side). A prefix
+  without an owner and a path has no indexed form and is rejected.
+- Placeholder keys hold none of the record fields: a query that orders by
+  `recordCreatedAt` or filters on `schema` / `author` leaves them out by
+  itself, which is the `IS NOT NULL` of the SQL backends.
+  `QueryRecordSubtree` orders by `uri` then `recordCreatedAt` only for that
+  reason.
+- No cascading deletes: a record delete removes the record, its key and the
+  associations targeting the key in the transaction; `DeleteCommitLogs`
+  fans out through a BulkWriter outside any transaction (idempotent, so a
+  partial run is finished by re-running). A key with tens of thousands of
+  associations hits the 10 MiB commit cap, the same ceiling Spanner has.
+- `cDate` is a server timestamp set at commit; it is receipt time, not a
+  strict commit sequence (as on Postgres). Timestamps have microsecond
+  precision.
+- Composite indexes are not inferred: `firestore/indexes.go` registers
+  every query shape, generates `deploy/firestore/firestore.indexes.json`
+  (pinned by `indexes_test.go`, `-args -update-indexes` regenerates) and
+  probes each shape at server start. The emulator enforces none of them,
+  so a shape added without an index only fails in production. A query with
+  two optional equalities (`GetAssociatedRecords` with schema and variant)
+  relies on Firestore merging two single-equality indexes.
+- Time-ordered document ids (CDIDs) cap sustained writes to `commits` /
+  `records` / `associations` around 500 per second.
+
 ## Changing the contract
 
 1. Change (or add) the suite in `repotest` first; the expected behaviour is
@@ -222,6 +264,7 @@ have to think about. None of it changes the contract's meaning.
 go test ./internal/infra/repository/postgres/... -run Suite -count=1   # Postgres via dockertest
 go test ./internal/infra/repository/sqlite/... -run Suite -count=1     # SQLite on a temp file, no Docker
 go test ./internal/infra/repository/spanner/... -run Suite -count=1    # Spanner Omni via dockertest (CONCRNT_TEST_SPANNER_ENDPOINT reuses a running one)
+go test ./internal/infra/repository/firestore/... -run Suite -count=1  # Firestore emulator via dockertest (CONCRNT_TEST_FIRESTORE_HOST reuses a running one)
 ```
 
 `repotest` must not import a backend package:
