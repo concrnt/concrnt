@@ -84,8 +84,14 @@ Notes:
 - On Firestore the composite indexes must be deployed before the replay
   (`deploy/firestore/README.md`); the emulator needs none. Sequential
   document ids (commit ids are time-ordered) cap the sustained write rate
-  around 500 commits/s, so a large replay runs at that pace at best.
+  around 500 commits/s, so a large replay runs at that pace at best. The
+  emulator is far slower and degrades as the database grows (a 219k-commit
+  devnet dump landed 24k commits in 85 minutes, the last batches at 4
+  minutes per 400 lines): rehearse a migration against a real database.
 - The round trip Postgres → SQLite → Postgres was verified this way on a
   218k-commit devnet dump; see the phase 2 pull request for the numbers.
   Postgres → Spanner (Omni) → Postgres: see the phase 3 pull request.
-  Postgres → Firestore (emulator) → Postgres: see the phase 4 pull request.
+  Postgres → Firestore (emulator) → Postgres was verified on the first
+  23,911 commits / 167 metas of that dump (the emulator's pace, see above):
+  the Firestore dump is a subset of the source and the Postgres dump
+  replayed from it is identical, line for line; see the phase 4 pull request.
