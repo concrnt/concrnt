@@ -26,7 +26,25 @@ type RecordRepository struct {
 }
 
 type recordTx struct {
-	tx *gorm.DB
+	tx   *gorm.DB
+	done bool // slot released (Commit or Rollback ran)
+}
+
+// MaxConcurrentTx caps the transactions one process runs at once. A
+// transaction pins one pooled connection and the reads issued inside it go
+// through r.db, i.e. a second connection of the same pool; with
+// MaxConcurrentTx >= pool size every transaction can be left waiting for a
+// connection another transaction holds. Half the pool (database.MaxOpenConns)
+// keeps one free connection per transaction.
+const MaxConcurrentTx = 8
+
+var txSlots = make(chan struct{}, MaxConcurrentTx)
+
+func (tx *recordTx) release() {
+	if !tx.done {
+		tx.done = true
+		<-txSlots
+	}
 }
 
 func NewRecordRepository(db *gorm.DB) record.Repository {
@@ -34,18 +52,26 @@ func NewRecordRepository(db *gorm.DB) record.Repository {
 }
 
 func (r *RecordRepository) BeginTx(ctx context.Context) (record.RepositoryTx, error) {
+	select {
+	case txSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	tx := r.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
+		<-txSlots
 		return nil, tx.Error
 	}
 	return &recordTx{tx: tx}, nil
 }
 
 func (tx *recordTx) Commit(ctx context.Context) error {
+	defer tx.release()
 	return tx.tx.WithContext(ctx).Commit().Error
 }
 
 func (tx *recordTx) Rollback(ctx context.Context) error {
+	defer tx.release()
 	return tx.tx.WithContext(ctx).Rollback().Error
 }
 
