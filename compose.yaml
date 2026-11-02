@@ -14,7 +14,19 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      # Spanner Omni, the local target of backends.database: spanner (profile
+      memcached:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./_etc:/etc/concrnt/:ro
+    networks:
+      - external
+      - internal
+    extra_hosts:
+      - "host.docker.internal:172.29.253.172"
+
+  # Spanner Omni, the local target of backends.database: spanner (profile
   # spanner, so it only runs when asked for). The evaluation license it
   # starts with lasts 90 days from the first start of the volume; create
   # the database once with
@@ -32,18 +44,6 @@ services:
     networks:
       - internal
       - external
-
-  memcached:
-        condition: service_healthy
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./_etc:/etc/concrnt/:ro
-    networks:
-      - external
-      - internal
-    extra_hosts:
-      - "host.docker.internal:172.29.253.172"
 
   web:
     restart: always
