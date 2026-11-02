@@ -13,7 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
+	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
@@ -273,9 +274,25 @@ func main() {
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
-	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, db, redis)
-	if err != nil {
-		panic("failed to open aggregate store: " + err.Error())
+	// the count cache store, built here like the repositories: "" means the
+	// store matching the record database
+	var aggregateStore aggregate.Store
+	switch conf.Backends.Aggregate.Store {
+	case "postgres":
+		if db == nil {
+			panic("backends.aggregate.store postgres needs the postgres database")
+		}
+		aggregateStore = aggpostgres.New(db)
+	case "redis":
+		aggregateStore = aggredis.New(redis)
+	case "":
+		if db != nil {
+			aggregateStore = aggpostgres.New(db)
+		} else {
+			aggregateStore = aggredis.New(redis)
+		}
+	default:
+		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, redis)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 

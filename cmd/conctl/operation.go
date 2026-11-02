@@ -9,7 +9,8 @@ import (
 
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
-	aggregatestore "github.com/concrnt/concrnt/internal/infra/aggregate"
+	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
@@ -110,10 +111,25 @@ func newOperationContext() (*operationContext, error) {
 	}
 
 	rdb := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
-	aggregateStore, err := aggregatestore.Open(conf.Backends.Aggregate.Store, op.DB, rdb)
-	if err != nil {
+	var aggregateStore aggregate.Store
+	switch conf.Backends.Aggregate.Store {
+	case "postgres":
+		if op.DB == nil {
+			op.Close()
+			return nil, fmt.Errorf("backends.aggregate.store postgres needs the postgres database")
+		}
+		aggregateStore = aggpostgres.New(op.DB)
+	case "redis":
+		aggregateStore = aggredis.New(rdb)
+	case "":
+		if op.DB != nil {
+			aggregateStore = aggpostgres.New(op.DB)
+		} else {
+			aggregateStore = aggredis.New(rdb)
+		}
+	default:
 		op.Close()
-		return nil, err
+		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, redis)", conf.Backends.Aggregate.Store)
 	}
 	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 	return op, nil
