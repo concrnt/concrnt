@@ -1264,3 +1264,52 @@ func TestVerifyWithProofTypesDocumentDirect(t *testing.T) {
 		t.Fatal("an ecrecover proof must be rejected when only document-direct is allowed")
 	}
 }
+
+// an ack has no key and names the acked entity in associate, but its ccfs
+// identity is held by the author's server (CIP-3 §3.4), unlike an association
+// whose ccfs owner is the associate's owner; a reference to an ack must
+// therefore accept the author as the href owner
+func TestVerifyDocumentReferenceAckHrefOwnedByAuthor(t *testing.T) {
+	authorCCID, authorPriv := newTestIdentity(t)
+	targetCCID, _ := newTestIdentity(t)
+
+	associate := "cckv://" + targetCCID
+	ackSD := signDocument(t, Document[struct{}]{
+		Kind:      "ack",
+		Associate: &associate,
+		Author:    authorCCID,
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}, authorPriv)
+
+	hash := GetHash([]byte(ackSD.Document))
+	var hash10 [10]byte
+	copy(hash10[:], hash[:10])
+	ackURI := CCURI{
+		Scheme: "ccfs",
+		Owner:  authorCCID,
+		Type:   CCFSTypeConcrnt,
+		CDID:   cdid.New(hash10, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)).String(),
+	}.String()
+
+	refDoc := Document[schemas.Reference]{
+		Kind:      "record",
+		Key:       "cckv://" + authorCCID + "/ref",
+		Value:     schemas.Reference{Href: ackURI},
+		Author:    authorCCID,
+		Schema:    schemas.ReferenceURL,
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}
+	refDocBytes, err := json.Marshal(refDoc)
+	if err != nil {
+		t.Fatalf("marshal reference document: %v", err)
+	}
+	sd := SignedDocument{
+		Document: string(refDocBytes),
+		Proof:    Proof{Type: ProofTypeDocumentReference, Href: &ackURI},
+	}
+
+	resolver := mapResolver{ackURI: ackSD}
+	if err := sd.Verify(context.Background(), resolver); err != nil {
+		t.Fatalf("Verify returned error for a reference to an ack: %v", err)
+	}
+}

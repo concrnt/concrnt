@@ -273,6 +273,10 @@ func (sd *SignedDocument) verify(ctx context.Context, resolver DocumentResolver,
 				return errors.New("referenced document cdid does not match proof href")
 			}
 
+			// the ccfs owner is whoever's server holds the document: the key
+			// owner for keyed records, the associate's owner for associations
+			// (CIP-3 §3.3) and the author for everything else, acks included
+			// (CIP-3 §3.4)
 			expectedOwner := targetDoc.Author
 			if targetDoc.Key != "" {
 				targetKey, err := ParseCCURI(targetDoc.Key)
@@ -280,7 +284,7 @@ func (sd *SignedDocument) verify(ctx context.Context, resolver DocumentResolver,
 					return errors.Join(errors.New("referenced document key is not a valid cc uri"), err)
 				}
 				expectedOwner = targetKey.Owner
-			} else if targetDoc.Associate != nil {
+			} else if targetDoc.Kind == "association" && targetDoc.Associate != nil {
 				targetAssociate, err := ParseCCURI(*targetDoc.Associate)
 				if err != nil {
 					return errors.Join(errors.New("referenced document associate is not a valid cc uri"), err)
