@@ -91,10 +91,12 @@ type Cluster struct {
 }
 
 type Backends struct {
-	// Database selects the record store: "postgres" (default) or "sqlite".
+	// Database selects the record store: "postgres" (default), "sqlite" or
+	// "spanner".
 	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
 	SQLite        SQLite    `yaml:"sqlite"`
+	Spanner       Spanner   `yaml:"spanner"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
 	RedisAddr     string    `yaml:"redisAddr"`
 	RedisDB       int       `yaml:"redisDB"`
@@ -117,10 +119,42 @@ func (b Backends) SQLitePath() string {
 	return b.SQLite.Path
 }
 
+// Spanner configures the spanner record store.
+type Spanner struct {
+	// Mode is "cloud" (default; Cloud Spanner with the ambient credentials),
+	// "omni" (Spanner Omni at Endpoint, plain text) or "emulator" (the
+	// Cloud Spanner emulator at Endpoint).
+	Mode string `yaml:"mode"`
+	// Endpoint is the host:port of the omni / emulator server.
+	Endpoint string `yaml:"endpoint"`
+	// Project and Instance name the database's instance; Spanner Omni
+	// fixes both to "default", which is the default here.
+	Project  string `yaml:"project"`
+	Instance string `yaml:"instance"`
+	// Database is the database name (default concrnt). It must exist
+	// (conctl / the Omni CLI create it); the server creates its schema.
+	Database string `yaml:"database"`
+}
+
+// SpannerDatabasePath is the full database resource name.
+func (b Backends) SpannerDatabasePath() string {
+	project, instance, db := b.Spanner.Project, b.Spanner.Instance, b.Spanner.Database
+	if project == "" {
+		project = "default"
+	}
+	if instance == "" {
+		instance = "default"
+	}
+	if db == "" {
+		db = "concrnt"
+	}
+	return "projects/" + project + "/instances/" + instance + "/databases/" + db
+}
+
 // Aggregate configures the count cache (internal/usecase/aggregate).
 type Aggregate struct {
-	// Store is "postgres" (a table in the record database) or "redis";
-	// empty means the store matching the record database.
+	// Store is "postgres" (a table in the record database), "spanner" (same)
+	// or "redis"; empty means the store matching the record database.
 	Store string `yaml:"store"`
 	// TTL is how long a computed value is served before it is recomputed
 	// (default 24h); MaxDeltas how many writes an entry absorbs before it is
