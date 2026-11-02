@@ -12,6 +12,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/policy"
@@ -38,12 +39,21 @@ type Repository interface {
 	// Read
 	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
+	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
+	// that resolves to nothing is absent from the map, not an error.
+	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
-	GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
+
+	// Compute* recount from the primary data (C2). They are the aggregate
+	// layer's cache miss path and the verification tool's reference; request
+	// handlers go through the aggregate layer instead (aggregates.go).
+	ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
+	ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
+	// ComputeAssociationCountsByVariant orders the variants by the createdAt
+	// of their earliest association.
+	ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -57,13 +67,15 @@ type Repository interface {
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
+	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
+	// for several cckv URIs at once (one fetch of the union of their
+	// ancestor chains); every input URI has an entry.
+	GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error)
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
 	// QueryCommitLogs pages the commit log by server receipt time (c_date,
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
 	// that c_date. owner "" means no owner filter.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-
-	GetDistributions(ctx context.Context, uri string) ([]string, error)
 
 	// Delete
 	// MarkCommitLogGcCandidate flags a commit log for `conctl op gc-commitlog`
@@ -184,6 +196,10 @@ type Usecase struct {
 	jobs   usecase.JobQueue
 	kvs    usecase.KVS
 	cache  *cache.Cache
+	// agg is the count cache; nil (offline tooling, tests) reads counts
+	// straight from repo.Compute*
+	agg  *aggregate.Usecase
+	aggs aggregates
 }
 
 func New(
@@ -209,6 +225,7 @@ func New(
 		kvs:    kvs,
 		cache:  cache.New(10*time.Minute, 15*time.Minute),
 	}
+	uc.aggs = newAggregates(repo)
 
 	// this usecase owns the delivery job type: it both enqueues DeliveryJobs
 	// and interprets them, so the queue itself stays agnostic
@@ -223,6 +240,12 @@ func New(
 	}
 
 	return uc
+}
+
+// SetAggregates routes the count reads and writes through the aggregate
+// cache agg.
+func (uc *Usecase) SetAggregates(agg *aggregate.Usecase) {
+	uc.agg = agg
 }
 
 // resolver returns uc.client as a DocumentResolver, or a nil interface when

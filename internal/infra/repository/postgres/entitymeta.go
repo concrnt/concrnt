@@ -8,7 +8,6 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase"
 )
 
@@ -26,7 +25,7 @@ func (r *EntityMetaRepository) SaveMeta(ctx context.Context, meta domain.EntityM
 	ctx, span := tracer.Start(ctx, "Repository.Register")
 	defer span.End()
 
-	modelMeta := models.EntityMeta{
+	modelMeta := EntityMeta{
 		ID:      meta.ID,
 		Inviter: meta.Inviter,
 		Info:    meta.Info,
@@ -45,7 +44,7 @@ func (r *EntityMetaRepository) GetMeta(ctx context.Context, ccid string) (*domai
 	ctx, span := tracer.Start(ctx, "Repository.GetMeta")
 	defer span.End()
 
-	var meta models.EntityMeta
+	var meta EntityMeta
 	err := r.db.Where("id = ?", ccid).Take(&meta).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -67,7 +66,7 @@ func (r *EntityMetaRepository) UpdateMetaInfo(ctx context.Context, ccid string, 
 	ctx, span := tracer.Start(ctx, "Repository.UpdateMetaInfo")
 	defer span.End()
 
-	result := r.db.WithContext(ctx).Model(&models.EntityMeta{}).Where("id = ?", ccid).Update("info", info)
+	result := r.db.WithContext(ctx).Model(&EntityMeta{}).Where("id = ?", ccid).Update("info", info)
 	if result.Error != nil {
 		span.RecordError(result.Error)
 		return result.Error
@@ -82,7 +81,7 @@ func (r *EntityMetaRepository) DeleteMeta(ctx context.Context, ccid string) erro
 	ctx, span := tracer.Start(ctx, "Repository.DeleteMeta")
 	defer span.End()
 
-	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&models.EntityMeta{}).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&EntityMeta{}).Error; err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -93,7 +92,7 @@ func (r *EntityMetaRepository) ListMetas(ctx context.Context, owner string) ([]d
 	ctx, span := tracer.Start(ctx, "Repository.ListMetas")
 	defer span.End()
 
-	var metas []models.EntityMeta
+	var metas []EntityMeta
 	q := r.db.WithContext(ctx)
 	if owner != "" {
 		q = q.Where("id = ?", owner)

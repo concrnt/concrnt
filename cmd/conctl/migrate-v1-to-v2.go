@@ -17,7 +17,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	cdidv2 "github.com/concrnt/concrnt/cdid"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	pgrepo "github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/jwt"
 	cdidv1 "github.com/concrnt/concrnt/legacy/cdid"
 	"github.com/concrnt/concrnt/legacy/core"
@@ -358,9 +358,9 @@ func transferMetas(fromDB, toDB *gorm.DB) {
 		Find(&v1metas)
 	fmt.Println("total metas: ", len(v1metas))
 
-	var v2metas []models.EntityMeta
+	var v2metas []pgrepo.EntityMeta
 	for _, v1meta := range v1metas {
-		v2meta := models.EntityMeta{
+		v2meta := pgrepo.EntityMeta{
 			ID:      v1meta.ID,
 			Inviter: v1meta.Inviter,
 			Info:    v1meta.Info,
@@ -383,12 +383,12 @@ func transferMetas(fromDB, toDB *gorm.DB) {
 	var localEntities []core.Entity
 	fromDB.Where("domain in ?", []string{fromFQDN, fromCSID}).Find(&localEntities)
 
-	var supplemented []models.EntityMeta
+	var supplemented []pgrepo.EntityMeta
 	for _, entity := range localEntities {
 		if metaExists[entity.ID] || slices.Contains(ignoreIDs, entity.ID) {
 			continue
 		}
-		supplemented = append(supplemented, models.EntityMeta{
+		supplemented = append(supplemented, pgrepo.EntityMeta{
 			ID:   entity.ID,
 			Info: `{"note":"automatically activated by v1-to-v2 migration (entity had no meta in v1)"}`,
 		})
@@ -876,7 +876,7 @@ func convertRecord(
 
 				mappingKey, ok := mappingCache[associateKey]
 				if !ok {
-					var recordKey models.RecordKey
+					var recordKey pgrepo.RecordKey
 					err = destDB.
 						Preload("Record").
 						Preload("Record.Document").

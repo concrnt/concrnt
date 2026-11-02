@@ -13,8 +13,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 )
 
 // legacyProofTypeAckReference is the proof type the v1.11.0-beta builds gave
@@ -50,6 +49,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 		"is a no-op. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
+		if err := op.RequirePostgres(); err != nil {
+			return err
+		}
 		stats, err := repairAnchoredAcks(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairAnchoredAcksDryRun)
 		if err != nil {
 			return err
@@ -62,6 +64,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 			verb, stats.Holdings, stats.RestoredAcks, stats.RemovedRows, stats.Orphans, stats.StaleMirrors, stats.NullOwners)
 		if repairAnchoredAcksDryRun {
 			fmt.Fprintln(os.Stderr, "schema migration (ackeds table, entities.created_at, acks foreign key) is applied by the real run")
+		}
+		if !repairAnchoredAcksDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
 		}
 		return nil
 	}),
@@ -81,7 +86,7 @@ type repairAnchoredAcksStats struct {
 	NullOwners   int // commit_logs.owner NULL rows set to ''
 }
 
-// anchoredAck is the beta-era acks row shape (models.Ack plus the two anchors).
+// anchoredAck is the beta-era acks row shape (postgres.Ack plus the two anchors).
 type anchoredAck struct {
 	From          string `gorm:"column:from"`
 	To            string `gorm:"column:to"`
@@ -99,8 +104,8 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	var stats repairAnchoredAcksStats
 	isLocal := localEntityChecker(ctx, db, fqdn)
 
-	loadCommit := func(id string) (*models.CommitLog, error) {
-		var log models.CommitLog
+	loadCommit := func(id string) (*postgres.CommitLog, error) {
+		var log postgres.CommitLog
 		err := db.WithContext(ctx).Where("id = ?", id).Take(&log).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -110,7 +115,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 		}
 		return &log, nil
 	}
-	parseSigned := func(log *models.CommitLog) (concrnt.SignedDocument, error) {
+	parseSigned := func(log *postgres.CommitLog) (concrnt.SignedDocument, error) {
 		var proof concrnt.Proof
 		if err := json.Unmarshal([]byte(log.Proof), &proof); err != nil {
 			return concrnt.SignedDocument{}, fmt.Errorf("commit %s: unparseable proof: %w", log.ID, err)
@@ -121,9 +126,9 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	// Step 1: split every double-anchored row into the acks / ackeds sides.
 	regenerated := map[string]bool{} // acked commit ids written (or rewritten in place)
 	if db.Migrator().HasColumn("acks", "ack_commit_id") {
-		hasAckeds := db.Migrator().HasTable(&models.Acked{})
+		hasAckeds := db.Migrator().HasTable(&postgres.Acked{})
 		if !dryRun && !hasAckeds {
-			if err := db.WithContext(ctx).AutoMigrate(&models.Acked{}); err != nil {
+			if err := db.WithContext(ctx).AutoMigrate(&postgres.Acked{}); err != nil {
 				return stats, fmt.Errorf("create ackeds: %w", err)
 			}
 			hasAckeds = true
@@ -197,7 +202,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 					}
 					writeHolding = true
 					if hasAckeds {
-						var existing models.Acked
+						var existing postgres.Acked
 						err := db.WithContext(ctx).Where(`"from" = ? AND "to" = ? AND schema = ?`, row.From, row.To, row.Schema).Take(&existing).Error
 						if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 							return err
@@ -234,7 +239,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 						if err := tx.Clauses(clause.OnConflict{
 							Columns:   []clause.Column{{Name: "id"}},
 							DoUpdates: clause.Assignments(map[string]any{"proof": string(proofBytes), "owner": row.To}),
-						}).Create(&models.CommitLog{
+						}).Create(&postgres.CommitLog{
 							ID:       ackedID,
 							IP:       ip,
 							Document: acked.Document,
@@ -247,7 +252,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 							Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
 							DoUpdates: clause.Assignments(map[string]any{"valid": row.Valid, "document_id": ackedID, "created_at": row.CreatedAt}),
 							Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("ackeds.created_at < excluded.created_at")}},
-						}).Create(&models.Acked{
+						}).Create(&postgres.Acked{
 							From:       row.From,
 							To:         row.To,
 							Schema:     row.Schema,
@@ -263,7 +268,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 						if err != nil {
 							return err
 						}
-						if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&models.CommitLog{
+						if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&postgres.CommitLog{
 							ID:       row.DocumentID,
 							IP:       ip,
 							Document: original.Document,
@@ -300,7 +305,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	// it must not survive into dumps: delete it outright. A mirror step 1
 	// rewrote in place is skipped only for the dry run's count — the real
 	// run has already changed its proof type.
-	var stale []models.CommitLog
+	var stale []postgres.CommitLog
 	if err := db.WithContext(ctx).Select("id", "proof").Where("proof LIKE ?", "%"+legacyProofTypeAckReference+"%").FindInBatches(&stale, 500, func(tx *gorm.DB, batch int) error {
 		ids := []string{}
 		for _, log := range stale {
@@ -314,7 +319,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 		if dryRun || len(ids) == 0 {
 			return nil
 		}
-		return db.WithContext(ctx).Where("id IN ?", ids).Delete(&models.CommitLog{}).Error
+		return db.WithContext(ctx).Where("id IN ?", ids).Delete(&postgres.CommitLog{}).Error
 	}).Error; err != nil {
 		return stats, fmt.Errorf("stale mirror sweep: %w", err)
 	}
@@ -322,7 +327,7 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	// Step 4: pass-through commits used to carry a NULL owner; '' is the
 	// current spelling.
 	var nullOwners int64
-	if err := db.WithContext(ctx).Model(&models.CommitLog{}).Where("owner IS NULL").Count(&nullOwners).Error; err != nil {
+	if err := db.WithContext(ctx).Model(&postgres.CommitLog{}).Where("owner IS NULL").Count(&nullOwners).Error; err != nil {
 		return stats, fmt.Errorf("null owner count: %w", err)
 	}
 	stats.NullOwners = int(nullOwners)
@@ -333,9 +338,14 @@ func repairAnchoredAcks(ctx context.Context, db *gorm.DB, fqdn string, dryRun bo
 	}
 
 	// Step 5: the rest of the schema (ackeds indexes, entities.created_at, the
-	// acks foreign key the split just made satisfiable).
+	// acks foreign key the split just made satisfiable). The baseline step may
+	// already be recorded as applied, so the tables are brought up to date
+	// directly before the remaining numbered steps run.
 	if !dryRun {
-		if err := database.MigratePostgres(db.WithContext(ctx)); err != nil {
+		if err := postgres.AutoMigrateTables(db.WithContext(ctx)); err != nil {
+			return stats, fmt.Errorf("schema baseline: %w", err)
+		}
+		if err := postgres.Migrate(ctx, db); err != nil {
 			return stats, fmt.Errorf("schema migration: %w", err)
 		}
 	}

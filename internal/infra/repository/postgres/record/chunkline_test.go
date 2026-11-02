@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
 )
@@ -44,7 +44,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	// window start. The window-coverage guard must ignore this diverged
 	// column, or the oldest record in the window gets dropped.
 	backdated := time.Unix(18*600, 0).UTC()
-	require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "div-record-01").Update("created_at", backdated).Error)
+	require.NoError(t, db.Model(&postgres.Record{}).Where("document_id = ?", "div-record-01").Update("created_at", backdated).Error)
 
 	body, err := chunklineRepo.LoadLocalBody(ctx, parentURI, 20)
 	require.NoError(t, err)

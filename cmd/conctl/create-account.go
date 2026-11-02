@@ -6,9 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
-	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
-
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt"
@@ -83,9 +80,9 @@ var createAccountCmd = &cobra.Command{
 		// 登録制限は適用しない
 		op.GlobalConfig.Registration = "open"
 
-		recordRepo := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
-		metaRepo := postgres.NewEntityMetaRepository(op.DB)
-		serverUC := server.New(postgres.NewServerRepository(&op.GlobalConfig, op.DB, op.Client), &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
+		recordRepo := op.Record
+		metaRepo := op.EntityMeta
+		serverUC := server.New(op.Server, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
 		recordUC := record.New(recordRepo, metaRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
 		residenceUC := residence.New(recordRepo, metaRepo, recordUC, &op.GlobalConfig)
 

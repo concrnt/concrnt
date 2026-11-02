@@ -2,15 +2,13 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -23,7 +21,7 @@ func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, d
 		return false, err
 	}
 
-	ack := models.Ack{
+	ack := postgres.Ack{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -69,7 +67,7 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 		return false, err
 	}
 
-	ack := models.Acked{
+	ack := postgres.Acked{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -110,10 +108,9 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckRecords")
 	defer span.End()
 
-	var acks []models.Ack
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
-		Preload("Document").
+		Model(&postgres.Ack{}).
+		Joins("JOIN commit_logs c ON c.id = acks.document_id").
 		Where("acks.from = ?", from).
 		Where("acks.valid = ?", true)
 
@@ -138,44 +135,23 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 		query = query.Limit(limit)
 	}
 
-	err := query.Find(&acks).Error
-	if err != nil {
+	// CIP-3 §3.4: the ack's ccfs identity is held by the acker's server
+	var acks []commitRow
+	if err := query.Select(`acks.document_id AS document_id, acks."from" AS owner, acks.created_at AS created_at, c.document AS document, c.proof AS proof`).Scan(&acks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	rows := make([]ucrecord.QueryRow, len(acks))
-	for i, ack := range acks {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(ack.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		ccfs := concrnt.ComposeCCFSURI(ack.From, concrnt.CCFSTypeConcrnt, ack.DocumentID)
-
-		rows[i] = ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCFS:     &ccfs,
-				Document: ack.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: ack.CreatedAt,
-		}
-	}
-
-	return rows, nil
+	return commitRows(acks)
 }
 
 func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckedRecords")
 	defer span.End()
 
-	var acked []models.Acked
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
-		Preload("Document").
+		Model(&postgres.Acked{}).
+		Joins("JOIN commit_logs c ON c.id = ackeds.document_id").
 		Where("ackeds.to = ?", to).
 		Where("ackeds.valid = ?", true)
 
@@ -200,36 +176,15 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 		query = query.Limit(limit)
 	}
 
-	err := query.Find(&acked).Error
-	if err != nil {
+	// CIP-3 §3.4: an acked's ccfs identity is held by the associate owner's
+	// server
+	var acked []commitRow
+	if err := query.Select(`ackeds.document_id AS document_id, ackeds."to" AS owner, ackeds.created_at AS created_at, c.document AS document, c.proof AS proof`).Scan(&acked).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	rows := make([]ucrecord.QueryRow, len(acked))
-	for i, ack := range acked {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(ack.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		// CIP-3 §3.4: an acked's ccfs identity is held by the associate
-		// owner's server
-		ccfs := concrnt.ComposeCCFSURI(ack.To, concrnt.CCFSTypeConcrnt, ack.DocumentID)
-
-		rows[i] = ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCFS:     &ccfs,
-				Document: ack.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: ack.CreatedAt,
-		}
-	}
-
-	return rows, nil
+	return commitRows(acked)
 }
 
 func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
@@ -259,7 +214,7 @@ func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
+		Model(&postgres.Ack{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("acks.from = ?", from)
@@ -294,7 +249,7 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
+		Model(&postgres.Acked{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("ackeds.to = ?", to)
@@ -317,8 +272,8 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 	return counts, nil
 }
 
-func (r *Repository) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecordCounts")
+func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
 	if from != "" {

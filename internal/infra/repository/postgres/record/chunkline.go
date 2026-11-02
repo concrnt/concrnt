@@ -9,7 +9,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/chunkline"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 )
 
 const (
@@ -27,9 +27,9 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	}
 
 	var firstChunk *int64
-	firstCollectionMember := models.RecordKey{}
+	firstCollectionMember := postgres.RecordKey{}
 	err = r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&postgres.RecordKey{}).
 		Where("record_keys.parent_id = ?", recordKey.ID).
 		Where("record_keys.record_created_at IS NOT NULL").
 		Order("record_keys.record_created_at ASC").
@@ -113,14 +113,12 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		return nil, err
 	}
 
-	var members []models.RecordKey
+	var members []postgres.RecordKey
 	err = r.db.WithContext(ctx).
 		Where("parent_id = ?", parentRecordKey.ID).
 		Where("record_created_at < ?", chunkDate).
 		Order("record_created_at DESC").
 		Limit(defaultChunkSize).
-		Preload("Record").
-		Preload("Record.Document").
 		Find(&members).Error
 	if err != nil {
 		span.RecordError(err)
@@ -136,8 +134,6 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 			Where("record_created_at < ?", chunkDate).
 			Where("record_created_at >= ?", prevChunkDate).
 			Order("record_created_at DESC").
-			Preload("Record").
-			Preload("Record.Document").
 			Find(&members).Error
 		if err != nil {
 			span.RecordError(err)
@@ -145,27 +141,19 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		}
 	}
 
+	// every field a body item needs is on the key row (redirect and
+	// record_created_at are denormalised there), so no record is read
 	bodyItems := make([]chunkline.BodyItem, 0, len(members))
-
 	for _, member := range members {
-
 		href := member.URI
-		contentType := "application/concrnt.document+json"
-		if member.Record.Redirect != nil {
-			href = *member.Record.Redirect
+		if member.Redirect != nil {
+			href = *member.Redirect
 		}
-
-		timestamp := member.Record.CreatedAt
-		if member.RecordCreatedAt != nil {
-			timestamp = *member.RecordCreatedAt
-		}
-
-		item := chunkline.BodyItem{
-			Timestamp:   timestamp,
+		bodyItems = append(bodyItems, chunkline.BodyItem{
+			Timestamp:   *member.RecordCreatedAt,
 			Href:        href,
-			ContentType: contentType,
-		}
-		bodyItems = append(bodyItems, item)
+			ContentType: "application/concrnt.document+json",
+		})
 	}
 
 	return bodyItems, nil

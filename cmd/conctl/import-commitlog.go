@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
-
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt"
@@ -92,7 +90,7 @@ var importCommitlogCmd = &cobra.Command{
 		// 1. Restore entity metas first (directly against the database) so local
 		//    entity commits pass their registration check on the server.
 		if metasPath != "" {
-			metaRepo := postgres.NewEntityMetaRepository(op.DB)
+			metaRepo := op.EntityMeta
 			f, err := os.Open(metasPath)
 			if err != nil {
 				return fmt.Errorf("failed to open metas file: %w", err)

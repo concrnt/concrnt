@@ -14,7 +14,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -46,7 +46,7 @@ func (r *Repository) CreateRecord(
 	// key, an equal or older one is a no-op. Deciding under the row lock
 	// closes the read-then-write race between concurrent commits, same as
 	// CreateEntity's conditional upsert.
-	var oldRecordKey models.RecordKey
+	var oldRecordKey postgres.RecordKey
 	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", key).
 		Take(&oldRecordKey).Error
@@ -58,7 +58,7 @@ func (r *Repository) CreateRecord(
 		return false, nil
 	}
 
-	record := models.Record{
+	record := postgres.Record{
 		DocumentID:    documentID,
 		Owner:         owner,
 		Author:        author,
@@ -90,11 +90,12 @@ func (r *Repository) CreateRecord(
 	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
 
 	// RecordKeyを作る
-	rk := models.RecordKey{
+	rk := postgres.RecordKey{
 		URI:             key,
 		ParentID:        pid,
 		RecordID:        &documentID,
 		RecordCreatedAt: &createdAt,
+		Redirect:        redirect,
 		CleanOnUpdate:   cleanOnUpdate,
 	}
 
@@ -105,7 +106,7 @@ func (r *Repository) CreateRecord(
 	// writes to parent placeholder rows (RecordID nil) working.
 	result := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "clean_on_update": cleanOnUpdate}),
+		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "redirect": redirect, "clean_on_update": cleanOnUpdate}),
 		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
 	}).Create(&rk)
 	if result.Error != nil {
@@ -118,13 +119,13 @@ func (r *Repository) CreateRecord(
 
 	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
 	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if err := db.Model(&models.CommitLog{}).
+		if err := db.Model(&postgres.CommitLog{}).
 			Where("id = ?", oldRecordKey.RecordID).
 			Update("gc_candidate", true).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
-		if err := db.Delete(&models.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
+		if err := db.Delete(&postgres.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
@@ -149,10 +150,9 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var rk models.RecordKey
+		var rk postgres.RecordKey
 		err = r.db.WithContext(ctx).
-			Joins("JOIN records r ON r.document_id = record_keys.record_id").
-			Where("r.document_id = ?", parsed.CDID).
+			Where("record_id = ?", parsed.CDID).
 			Take(&rk).Error
 		if err != nil {
 			span.RecordError(err)
@@ -161,13 +161,50 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		cckv = rk.URI
 	}
 
+	stacks, err := r.policiesFor(ctx, []string{cckv})
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return stacks[cckv], nil
+}
+
+// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies for
+// several cckv URIs in one statement: the union of their ancestor chains is
+// fetched at once and each stack assembled from it.
+func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetHierarchicalRecordPoliciesMulti")
+	defer span.End()
+
+	for _, uri := range uris {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		if parsed.Scheme != "cckv" {
+			err := fmt.Errorf("policy stacks are keyed by cckv, got %s", uri)
+			span.RecordError(err)
+			return nil, err
+		}
+	}
+	stacks, err := r.policiesFor(ctx, uris)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return stacks, nil
+}
+
+// hierarchyOf lists the ancestor chain of a cckv URI, root first, the URI
+// itself last.
+func hierarchyOf(cckv string) ([]string, error) {
 	hierarchy := []string{}
 	currentURI := cckv
 	for {
 		hierarchy = append([]string{currentURI}, hierarchy...)
 		parentURI, err := url.JoinPath(currentURI, "..")
 		if err != nil {
-			span.RecordError(err)
 			return nil, err
 		}
 		if parentURI == currentURI {
@@ -175,23 +212,49 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		}
 		currentURI = parentURI
 	}
+	return hierarchy, nil
+}
+
+// policiesFor builds the CIP-12 §5.3 policy stack (root first, the resource
+// itself last) of every cckv URI with one query over the union of their
+// ancestor chains.
+func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[string][]concrnt.Policy, error) {
+	hierarchies := make(map[string][]string, len(cckvs))
+	wanted := map[string]bool{}
+	for _, cckv := range cckvs {
+		if _, ok := hierarchies[cckv]; ok {
+			continue
+		}
+		hierarchy, err := hierarchyOf(cckv)
+		if err != nil {
+			return nil, err
+		}
+		hierarchies[cckv] = hierarchy
+		for _, uri := range hierarchy {
+			wanted[uri] = true
+		}
+	}
+	uris := make([]string, 0, len(wanted))
+	for uri := range wanted {
+		uris = append(uris, uri)
+	}
 
 	type tuple struct {
 		Uri           string         `gorm:"column:uri"`
 		Policy        *string        `gorm:"column:policy"`
 		Distributions pq.StringArray `gorm:"column:distributions;type:text[]"`
 	}
-
 	var entries []tuple
-	err = r.db.WithContext(ctx).
-		Model(&models.Record{}).
-		Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
-		Joins("JOIN record_keys rk ON rk.record_id = records.document_id").
-		Where("rk.uri IN ?", hierarchy).
-		Find(&entries).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	if len(uris) > 0 {
+		err := r.db.WithContext(ctx).
+			Model(&postgres.Record{}).
+			Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
+			Joins("JOIN record_keys rk ON rk.record_id = records.document_id").
+			Where("rk.uri IN ?", uris).
+			Find(&entries).Error
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// A level with no policy of its own still matters when it distributes: its
@@ -205,35 +268,31 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	}
 
 	// CIP-12 §5.3: layers are emitted root-first, the target resource itself
-	// last (hierarchy is already built [root, ..., leaf]). With the evaluator's
-	// strong=first-wins / weak=last-wins folding this makes strong conclusions
-	// prefer the outer (global-side) layers and weak conclusions the resource
-	// itself.
-	policies := []concrnt.Policy{}
-	for _, uri := range hierarchy {
-		if t, ok := tupleMap[uri]; ok {
+	// last. With the evaluator's strong=first-wins / weak=last-wins folding
+	// this makes strong conclusions prefer the outer (global-side) layers and
+	// weak conclusions the resource itself.
+	stacks := make(map[string][]concrnt.Policy, len(hierarchies))
+	for cckv, hierarchy := range hierarchies {
+		policies := []concrnt.Policy{}
+		for _, uri := range hierarchy {
+			t, ok := tupleMap[uri]
+			if !ok {
+				continue
+			}
 			var policyDoc concrnt.Policy
 			if t.Policy != nil {
-				err := json.Unmarshal([]byte(*t.Policy), &policyDoc)
-				if err != nil {
-					span.RecordError(err)
+				if err := json.Unmarshal([]byte(*t.Policy), &policyDoc); err != nil {
 					return nil, err
 				}
 			}
-
 			policyDoc.Source = uri
-			// convert pq.StringArray to []string
-			virtualParents := []string{}
-			for _, dist := range t.Distributions {
-				virtualParents = append(virtualParents, dist)
-			}
+			virtualParents := append([]string{}, t.Distributions...)
 			policyDoc.VirtualParents = &virtualParents
-
 			policies = append(policies, policyDoc)
 		}
+		stacks[cckv] = policies
 	}
-
-	return policies, nil
+	return stacks, nil
 }
 
 func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
@@ -248,79 +307,133 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 
 	switch parsed.Scheme {
 	case "cckv":
-		var recordKey models.RecordKey
-		err = r.db.WithContext(ctx).
-			Preload("Record").
-			Preload("Record.Document").
-			Where("uri = ?", uri).
-			Take(&recordKey).Error
+		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).Where("record_keys.uri = ?", uri))
 		if err != nil {
-			span.RecordError(errors.Join(errors.New("failed to query recordkey from cckv"), err))
-			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-		}
-
-		if recordKey.RecordID == nil {
-			err := fmt.Errorf("record key found but record is nil for uri: %s", uri)
 			span.RecordError(err)
-			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-		}
-
-		var proof concrnt.Proof
-		err = json.Unmarshal([]byte(recordKey.Record.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(errors.Join(errors.New("failed to unmarshal proof from recordkey"), err))
 			return nil, err
 		}
-
-		ccfs := concrnt.ComposeCCFSURI(parsed.Owner, concrnt.CCFSTypeConcrnt, *recordKey.RecordID)
-
-		return &concrnt.SignedDocument{
-			CCKV:     &uri,
-			CCFS:     &ccfs,
-			Document: recordKey.Record.Document.Document,
-			Proof:    proof,
-		}, nil
+		if len(rows) == 0 {
+			return nil, domain.NotFoundError{Resource: uri}
+		}
+		sd, err := rows[0].signedDocument()
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		return &sd, nil
 
 	case "ccfs":
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var commitLog models.CommitLog
-		err = r.db.WithContext(ctx).
-			Where("id = ?", parsed.CDID).
-			Take(&commitLog).Error
+		sds, err := r.signedDocumentsByID(ctx, []string{parsed.CDID})
 		if err != nil {
-			span.RecordError(errors.Join(errors.New("failed to query commitlog from ccfs"), err))
-			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-		}
-
-		var cckv *string = nil
-		var recordKey models.RecordKey
-		err = r.db.WithContext(ctx).
-			Where("record_id = ?", commitLog.ID).
-			Take(&recordKey).Error
-		if err == nil {
-			cckv = &recordKey.URI
-		}
-
-		var proof concrnt.Proof
-		err = json.Unmarshal([]byte(commitLog.Proof), &proof)
-		if err != nil {
-			span.RecordError(errors.Join(errors.New("failed to unmarshal proof from commitlog"), err))
+			span.RecordError(err)
 			return nil, err
 		}
-
-		return &concrnt.SignedDocument{
-			CCFS:     &uri,
-			CCKV:     cckv,
-			Document: commitLog.Document,
-			Proof:    proof,
-		}, nil
+		sd, ok := sds[parsed.CDID]
+		if !ok {
+			return nil, domain.NotFoundError{Resource: uri}
+		}
+		sd.CCFS = &uri
+		return &sd, nil
 	default:
 		err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
 		span.RecordError(err)
 		return nil, err
 	}
+}
+
+// GetSignedDocuments fetches several documents in one statement per URI
+// scheme; URIs that resolve to nothing are left out of the map.
+func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetSignedDocuments")
+	defer span.End()
+
+	keys := []string{}
+	ids := []string{}
+	idOf := map[string]string{} // ccfs uri -> commit id
+	for _, uri := range uris {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		switch parsed.Scheme {
+		case "cckv":
+			keys = append(keys, uri)
+		case "ccfs":
+			if parsed.Type == concrnt.CCFSTypeConcrnt {
+				ids = append(ids, parsed.CDID)
+				idOf[uri] = parsed.CDID
+			}
+		default:
+			err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
+			span.RecordError(err)
+			return nil, err
+		}
+	}
+
+	out := make(map[string]*concrnt.SignedDocument, len(uris))
+	if len(keys) > 0 {
+		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).Where("record_keys.uri IN ?", keys))
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		for _, row := range rows {
+			sd, err := row.signedDocument()
+			if err != nil {
+				span.RecordError(err)
+				return nil, err
+			}
+			out[row.URI] = &sd
+		}
+	}
+	if len(ids) > 0 {
+		sds, err := r.signedDocumentsByID(ctx, ids)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		for uri, id := range idOf {
+			if sd, ok := sds[id]; ok {
+				uri := uri
+				sd.CCFS = &uri
+				out[uri] = &sd
+			}
+		}
+	}
+	return out, nil
+}
+
+// signedDocumentsByID reads commit logs by id, each with the key currently
+// pointing at it (if any), in one statement.
+func (r *Repository) signedDocumentsByID(ctx context.Context, ids []string) (map[string]concrnt.SignedDocument, error) {
+	var rows []struct {
+		ID       string
+		Document string
+		Proof    string
+		URI      *string
+	}
+	err := r.db.WithContext(ctx).
+		Model(&postgres.CommitLog{}).
+		Select("commit_logs.id AS id, commit_logs.document AS document, commit_logs.proof AS proof, rk.uri AS uri").
+		Joins("LEFT JOIN record_keys rk ON rk.record_id = commit_logs.id").
+		Where("commit_logs.id IN ?", ids).
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]concrnt.SignedDocument, len(rows))
+	for _, row := range rows {
+		var proof concrnt.Proof
+		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
+			return nil, errors.Join(errors.New("failed to unmarshal proof from commitlog"), err)
+		}
+		out[row.ID] = concrnt.SignedDocument{CCKV: row.URI, Document: row.Document, Proof: proof}
+	}
+	return out, nil
 }
 
 func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
@@ -333,8 +446,8 @@ func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.Reposito
 		return err
 	}
 
-	q := db.Model(&models.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
-	return db.Where("document_id = (?)", q).Delete(&models.Record{}).Error
+	q := db.Model(&postgres.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
+	return db.Where("document_id = (?)", q).Delete(&postgres.Record{}).Error
 }
 
 func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
@@ -347,49 +460,49 @@ func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.R
 		return err
 	}
 
-	return db.Delete(&models.Record{}, "document_id = ?", documentID).Error
+	return db.Delete(&postgres.Record{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
 
-	var recordKey models.RecordKey
-	err := r.db.WithContext(ctx).
-		Preload("Record").
-		Where("uri = ?", keyURI).
-		Take(&recordKey).Error
-	if err != nil {
-		span.RecordError(err)
+	var row struct {
+		Redirect        *string
+		RecordCreatedAt *time.Time
+		ParentURI       *string
+	}
+	res := r.db.WithContext(ctx).
+		Table("record_keys AS rk").
+		Select("rk.redirect AS redirect, rk.record_created_at AS record_created_at, p.uri AS parent_uri").
+		Joins("LEFT JOIN record_keys p ON p.id = rk.parent_id").
+		Where("rk.uri = ?", keyURI).
+		Scan(&row)
+	if res.Error != nil {
+		span.RecordError(res.Error)
+		return "", "", res.Error
+	}
+	if res.RowsAffected == 0 {
 		return "", "", domain.NotFoundError{Resource: keyURI}
 	}
 
 	// only rows with a parent and a record_created_at appear in chunkline bodies
-	if recordKey.ParentID == nil || recordKey.RecordCreatedAt == nil {
+	if row.ParentURI == nil || row.RecordCreatedAt == nil {
 		return "", "", nil
-	}
-
-	var parent models.RecordKey
-	err = r.db.WithContext(ctx).
-		Where("id = ?", *recordKey.ParentID).
-		Take(&parent).Error
-	if err != nil {
-		span.RecordError(err)
-		return "", "", err
 	}
 
 	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
 	// (which is what BodyItem.ID() returns): the redirect target for
 	// reference records, the record key URI otherwise
-	itemID := recordKey.URI
-	if recordKey.Record.Redirect != nil {
-		itemID = *recordKey.Record.Redirect
+	itemID := keyURI
+	if row.Redirect != nil {
+		itemID = *row.Redirect
 	}
 
-	return parent.URI, itemID, nil
+	return *row.ParentURI, itemID, nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
 	defer span.End()
 
@@ -423,7 +536,7 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 				pid = &parentID.ID
 			}
 
-			newRecordKey := models.RecordKey{
+			newRecordKey := postgres.RecordKey{
 				URI:      parentURI,
 				RecordID: nil,
 				ParentID: pid,
@@ -454,11 +567,11 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	return parentRK, nil
 }
 
-func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetRecordKeyByURI")
 	defer span.End()
 
-	var recordKey models.RecordKey
+	var recordKey postgres.RecordKey
 	err := db.WithContext(ctx).
 		Where("uri = ?", uri).
 		Take(&recordKey).Error
@@ -468,46 +581,4 @@ func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*models.Re
 	}
 
 	return &recordKey, nil
-}
-
-func (r *Repository) GetDistributions(ctx context.Context, uri string) ([]string, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetDistributions")
-	defer span.End()
-
-	parsed, err := concrnt.ParseCCURI(uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	switch parsed.Scheme {
-	case "cckv":
-		var recordKey models.RecordKey
-		err = r.db.WithContext(ctx).Preload("Record").
-			Preload("Record.Document").
-			Where("uri = ?", uri).
-			Take(&recordKey).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-		}
-		return recordKey.Record.Distributions, nil
-	case "ccfs":
-		if parsed.Type != concrnt.CCFSTypeConcrnt {
-			return nil, domain.NotFoundError{Resource: uri}
-		}
-		var record models.Record
-		err = r.db.WithContext(ctx).
-			Where("document_id = ?", parsed.CDID).
-			Take(&record).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-		}
-		return record.Distributions, nil
-	default:
-		err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
-		span.RecordError(err)
-		return nil, err
-	}
 }

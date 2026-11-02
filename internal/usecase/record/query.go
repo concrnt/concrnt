@@ -3,10 +3,13 @@ package record
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/utils"
 )
 
@@ -53,7 +56,26 @@ func (uc *Usecase) GetAcknowledgeRecords(ctx context.Context, from, to, schema s
 }
 
 func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	return uc.repo.GetAcknowledgeRecordCounts(ctx, from, to, schema)
+	if uc.agg == nil {
+		return uc.repo.ComputeAcknowledgeCounts(ctx, from, to, schema)
+	}
+	if from == "" && to == "" {
+		return nil, errors.New("either 'from' or 'to' must be specified")
+	}
+	// one entry per side holds every schema; the schema filter is applied
+	// on the way out
+	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.acks, ackTarget(from, to))
+	if err != nil {
+		return nil, err
+	}
+	if schema == "" {
+		return counts, nil
+	}
+	filtered := map[string]int64{}
+	if n, ok := counts[schema]; ok {
+		filtered[schema] = n
+	}
+	return filtered, nil
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {
@@ -66,11 +88,21 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	return uc.repo.GetAssociatedRecordCountsBySchema(ctx, targetURI)
+	if uc.agg == nil {
+		return uc.repo.ComputeAssociationCountsBySchema(ctx, targetURI)
+	}
+	return aggregate.Get(ctx, uc.agg, uc.aggs.bySchema, targetURI)
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	return uc.repo.GetAssociatedRecordCountsByVariant(ctx, targetURI, schema)
+	if uc.agg == nil {
+		return uc.repo.ComputeAssociationCountsByVariant(ctx, targetURI, schema)
+	}
+	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.byVariant, variantTarget(targetURI, schema))
+	if err != nil {
+		return nil, err
+	}
+	return counts.ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a
@@ -113,20 +145,39 @@ func (uc *Usecase) Query(ctx context.Context, p QueryParams) (concrnt.QueryResul
 
 	items, prev, next := paginateWindow(rows, p.Limit, orderBy)
 
-	filtered := make([]concrnt.SignedDocument, 0, len(items))
-	for _, sd := range items {
+	// one policy fetch for the whole page: the rows' stacks are assembled
+	// from the union of their ancestor chains
+	docs := make([]concrnt.Document[any], len(items))
+	roots := make([]string, len(items))
+	for i, sd := range items {
 		if sd.CCKV == nil {
 			return concrnt.QueryResult{}, errors.New("queried record has no cckv")
 		}
+		doc, root, err := readAccessSubject(*sd.CCKV, sd)
+		if err != nil {
+			return concrnt.QueryResult{}, err
+		}
+		docs[i], roots[i] = doc, root
+	}
+	stacks := map[string][]concrnt.Policy{}
+	if len(roots) > 0 {
+		stacks, err = uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, roots)
+		if err != nil {
+			slog.Warn("query: policy stacks unavailable, evaluating without them", slog.String("error", err.Error()))
+			stacks = map[string][]concrnt.Policy{}
+		}
+	}
 
-		err := uc.checkReadAccess(ctx, *sd.CCKV, sd)
+	requester, _ := ctx.Value(interop.RequesterCtxKey).(domain.Entity)
+	filtered := make([]concrnt.SignedDocument, 0, len(items))
+	for i, sd := range items {
+		err := uc.evalReadAccess(ctx, *sd.CCKV, docs[i], stacks[roots[i]], requester)
 		if err != nil {
 			if errors.Is(err, domain.ErrPermissionDenied) {
 				continue
 			}
 			return concrnt.QueryResult{}, err
 		}
-
 		filtered = append(filtered, sd)
 	}
 

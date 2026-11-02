@@ -7,7 +7,7 @@ import (
 
 	"gorm.io/gorm"
 
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 )
 
@@ -35,7 +35,7 @@ func take(query *gorm.DB, dest any) (bool, error) {
 }
 
 func (i *inspector) Commit(ctx context.Context, id string) (*repotest.CommitState, error) {
-	var commit models.CommitLog
+	var commit postgres.CommitLog
 	found, err := take(i.db.WithContext(ctx).Where("id = ?", id), &commit)
 	if err != nil || !found {
 		return nil, err
@@ -51,11 +51,11 @@ func (i *inspector) Commit(ctx context.Context, id string) (*repotest.CommitStat
 }
 
 func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Time) error {
-	return i.db.WithContext(ctx).Model(&models.CommitLog{}).Where("id = ?", id).Update("c_date", cDate).Error
+	return i.db.WithContext(ctx).Model(&postgres.CommitLog{}).Where("id = ?", id).Update("c_date", cDate).Error
 }
 
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
-	var rec models.Record
+	var rec postgres.Record
 	found, err := take(i.db.WithContext(ctx).Where("document_id = ?", documentID), &rec)
 	if err != nil || !found {
 		return nil, err
@@ -70,7 +70,7 @@ func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.Re
 }
 
 func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeyState, error) {
-	var key models.RecordKey
+	var key postgres.RecordKey
 	found, err := take(i.db.WithContext(ctx).Where("uri = ?", uri), &key)
 	if err != nil || !found {
 		return nil, err
@@ -78,11 +78,12 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 	return &repotest.KeyState{
 		RecordID:        key.RecordID,
 		RecordCreatedAt: key.RecordCreatedAt,
+		Redirect:        key.Redirect,
 	}, nil
 }
 
 func (i *inspector) Entity(ctx context.Context, ccid string) (*repotest.EntityState, error) {
-	var entity models.Entity
+	var entity postgres.Entity
 	found, err := take(i.db.WithContext(ctx).Where("id = ?", ccid), &entity)
 	if err != nil || !found {
 		return nil, err
@@ -95,7 +96,7 @@ func (i *inspector) Entity(ctx context.Context, ccid string) (*repotest.EntitySt
 }
 
 func (i *inspector) Association(ctx context.Context, documentID string) (*repotest.AssociationState, error) {
-	var assoc models.Association
+	var assoc postgres.Association
 	found, err := take(i.db.WithContext(ctx).Where("document_id = ?", documentID), &assoc)
 	if err != nil || !found {
 		return nil, err
@@ -110,12 +111,12 @@ func (i *inspector) Association(ctx context.Context, documentID string) (*repote
 
 func (i *inspector) AssociationCountByUnique(ctx context.Context, unique string) (int64, error) {
 	var count int64
-	err := i.db.WithContext(ctx).Model(&models.Association{}).Where(`"unique" = ?`, unique).Count(&count).Error
+	err := i.db.WithContext(ctx).Model(&postgres.Association{}).Where(`"unique" = ?`, unique).Count(&count).Error
 	return count, err
 }
 
 func (i *inspector) Ack(ctx context.Context, from, to, schema string) (*repotest.AckState, error) {
-	var ack models.Ack
+	var ack postgres.Ack
 	found, err := take(i.db.WithContext(ctx).Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema), &ack)
 	if err != nil || !found {
 		return nil, err
@@ -128,7 +129,7 @@ func (i *inspector) Ack(ctx context.Context, from, to, schema string) (*repotest
 }
 
 func (i *inspector) Acked(ctx context.Context, from, to, schema string) (*repotest.AckState, error) {
-	var acked models.Acked
+	var acked postgres.Acked
 	found, err := take(i.db.WithContext(ctx).Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema), &acked)
 	if err != nil || !found {
 		return nil, err
@@ -142,6 +143,12 @@ func (i *inspector) Acked(ctx context.Context, from, to, schema string) (*repote
 
 func (i *inspector) AckCount(ctx context.Context) (int64, error) {
 	var count int64
-	err := i.db.WithContext(ctx).Model(&models.Ack{}).Count(&count).Error
+	err := i.db.WithContext(ctx).Model(&postgres.Ack{}).Count(&count).Error
+	return count, err
+}
+
+func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
+	var count int64
+	err := i.db.WithContext(ctx).Model(&postgres.AbuseReport{}).Count(&count).Error
 	return count, err
 }

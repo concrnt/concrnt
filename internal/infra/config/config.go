@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"time"
 
 	"github.com/go-yaml/yaml"
 
@@ -90,11 +91,42 @@ type Cluster struct {
 }
 
 type Backends struct {
-	PostgresDsn   string `yaml:"postgresDsn"`
-	GatewayAddr   string `yaml:"gatewayAddr"`
-	RedisAddr     string `yaml:"redisAddr"`
-	RedisDB       int    `yaml:"redisDB"`
-	MemcachedAddr string `yaml:"memcachedAddr"`
+	// Database selects the record store: "postgres" (default) or "sqlite".
+	Database      string    `yaml:"database"`
+	PostgresDsn   string    `yaml:"postgresDsn"`
+	SQLite        SQLite    `yaml:"sqlite"`
+	GatewayAddr   string    `yaml:"gatewayAddr"`
+	RedisAddr     string    `yaml:"redisAddr"`
+	RedisDB       int       `yaml:"redisDB"`
+	MemcachedAddr string    `yaml:"memcachedAddr"`
+	Aggregate     Aggregate `yaml:"aggregate"`
+}
+
+// SQLite configures the sqlite record store.
+type SQLite struct {
+	// Path is the database file (default concrnt.db in the working
+	// directory); ":memory:" is an ephemeral file removed on exit.
+	Path string `yaml:"path"`
+}
+
+// SQLitePath is the configured database file or its default.
+func (b Backends) SQLitePath() string {
+	if b.SQLite.Path == "" {
+		return "concrnt.db"
+	}
+	return b.SQLite.Path
+}
+
+// Aggregate configures the count cache (internal/usecase/aggregate).
+type Aggregate struct {
+	// Store is "postgres" (a table in the record database) or "redis";
+	// empty means the store matching the record database.
+	Store string `yaml:"store"`
+	// TTL is how long a computed value is served before it is recomputed
+	// (default 24h); MaxDeltas how many writes an entry absorbs before it is
+	// recomputed (default 10000).
+	TTL       time.Duration `yaml:"ttl"`
+	MaxDeltas int           `yaml:"maxDeltas"`
 }
 
 type Observability struct {

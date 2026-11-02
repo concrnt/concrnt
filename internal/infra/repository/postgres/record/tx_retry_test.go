@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -23,7 +23,7 @@ func TestRunInTxRetriesDeadlock(t *testing.T) {
 	ctx := context.Background()
 
 	for _, uri := range []string{"cckv://con1dead/a", "cckv://con1dead/b"} {
-		require.NoError(t, db.Create(&models.RecordKey{URI: uri}).Error)
+		require.NoError(t, db.Create(&postgres.RecordKey{URI: uri}).Error)
 	}
 
 	lock := func(tx record.RepositoryTx, uri string) error {

@@ -7,9 +7,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
-	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
-
 	"github.com/spf13/cobra"
 
 	"github.com/concrnt/concrnt"
@@ -110,7 +107,7 @@ var dumpCommitlogCmd = &cobra.Command{
 		// Entity metas carry local-entity registration state (inviter/info) that
 		// is not part of the commit log, and import must restore them before
 		// replaying entity commits. Time filters don't apply to meta; --owner does.
-		metas, err := postgres.NewEntityMetaRepository(op.DB).ListMetas(ctx, dumpCommitlogOwner)
+		metas, err := op.EntityMeta.ListMetas(ctx, dumpCommitlogOwner)
 		if err != nil {
 			return fmt.Errorf("failed to query entity meta: %w", err)
 		}
@@ -129,7 +126,7 @@ var dumpCommitlogCmd = &cobra.Command{
 
 		// Page through commit logs by id (time-kind CDIDs order by their
 		// embedded timestamp).
-		recordRepo := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
+		recordRepo := op.Record
 		cursor := lowerBound
 		first := true
 		total := 0

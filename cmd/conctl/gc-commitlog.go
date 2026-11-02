@@ -1,12 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
-
-	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 
 	"github.com/spf13/cobra"
 
@@ -87,7 +86,7 @@ var gcCommitlogCmd = &cobra.Command{
 		// keeping the match strictly older-than. Hash-based ids ('x'-prefixed)
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
-		maint := pgrecord.New(op.DB, op.Client, op.GlobalConfig)
+		maint := op.Record
 
 		if gcCommitlogDryRun {
 			count, err := maint.CountGcCandidates(ctx, cutoff)
@@ -129,7 +128,7 @@ var gcCommitlogCmd = &cobra.Command{
 				fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 			}
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
-			return nil
+			return dropAggregatesAfterGc(ctx, op, total)
 		}
 
 		s3client, err := objectstore.NewS3(ctx, gcCommitlogS3PathStyle)
@@ -194,8 +193,22 @@ var gcCommitlogCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "deleted %d commit logs so far...\n", total)
 		}
 		fmt.Fprintf(os.Stderr, "deleted %d commit logs\n", total)
-		return nil
+		return dropAggregatesAfterGc(ctx, op, total)
 	}),
+}
+
+// dropAggregatesAfterGc empties the count caches once gc removed anything:
+// the cascade may have taken associations and acks with it, and a cascade
+// has no delta form (C2). They rebuild on demand.
+func dropAggregatesAfterGc(ctx context.Context, op *operationContext, deleted int) error {
+	if deleted == 0 {
+		return nil
+	}
+	if err := op.Aggregate.InvalidateAll(ctx, ""); err != nil {
+		return fmt.Errorf("failed to drop the aggregate caches: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "dropped the aggregate caches; counts rebuild on their next read\n")
+	return nil
 }
 
 func init() {

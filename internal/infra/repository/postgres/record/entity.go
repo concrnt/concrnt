@@ -11,7 +11,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -33,7 +33,7 @@ func (r *Repository) CreateEntity(
 		return false, err
 	}
 
-	modelEntity := models.Entity{
+	modelEntity := postgres.Entity{
 		ID:         ccid,
 		Alias:      alias,
 		Domain:     domain,
@@ -66,7 +66,7 @@ func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner
 	defer span.End()
 
 	err := r.db.WithContext(ctx).
-		Model(&models.CommitLog{}).
+		Model(&postgres.CommitLog{}).
 		Where("owner = ?", owner).
 		Where("NOT gc_candidate").
 		Update("gc_candidate", true).Error
@@ -82,7 +82,7 @@ func (r *Repository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByCCID")
 	defer span.End()
 
-	entity, err := gorm.G[models.Entity](r.db).
+	entity, err := gorm.G[postgres.Entity](r.db).
 		Joins(clause.Has("Document"), nil).
 		Where("entities.id = ?", ccid).
 		Take(ctx)
@@ -118,7 +118,7 @@ func (r *Repository) GetEntityByAlias(ctx context.Context, alias string) (*domai
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByAlias")
 	defer span.End()
 
-	entity, err := gorm.G[models.Entity](r.db).
+	entity, err := gorm.G[postgres.Entity](r.db).
 		Joins(clause.Has("Document"), nil).
 		Where("entities.alias = ?", alias).
 		Take(ctx)
