@@ -28,19 +28,30 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
-  # database is the record store: postgres (the default) or sqlite. sqlite
-  # keeps everything in one file (sqlite.path, default ./concrnt.db) and
-  # needs no database server; redis and memcached are still required.
+  # database is the record store: postgres (the default), sqlite or spanner.
+  # sqlite keeps everything in one file (sqlite.path, default ./concrnt.db)
+  # and needs no database server; redis and memcached are still required.
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # sqlite:
   #   path: /var/lib/concrnt/concrnt.db
+  # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),
+  # Spanner Omni (mode omni, plain text at endpoint; `docker compose
+  # --profile spanner up` runs one) or the emulator (mode emulator). the
+  # database must exist; the server creates and migrates its schema.
+  # spanner:
+  #   mode: omni
+  #   endpoint: spanner-omni:15000
+  #   project: default      # omni fixes project and instance to "default"
+  #   instance: default
+  #   database: concrnt
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
   # aggregate is the cache of counts (association counts, ack counts).
-  # store: postgres (a table in the record database) or redis; the default
-  # is postgres when database is postgres, redis otherwise.
+  # store: postgres or spanner (a table in the record database) or redis;
+  # the default is the record database when it is postgres or spanner,
+  # redis otherwise.
   # the cache is never the source of truth: `conctl op aggregate-invalidate
   # --all` drops it and every count is recomputed on its next read.
   # aggregate:

@@ -13,10 +13,14 @@ import (
 	"syscall"
 	"time"
 
+	gspanner "cloud.google.com/go/spanner"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	spannerrecord "github.com/concrnt/concrnt/internal/infra/repository/spanner/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -220,7 +224,8 @@ func main() {
 		notificationRepo notification.Repository
 		abuseRepo        abuse.Repository
 		databaseReady    func(ctx context.Context) error
-		db               *gorm.DB // postgres only; the aggregate store's default home
+		db               *gorm.DB         // postgres only; the aggregate store's default home
+		spannerClient    *gspanner.Client // spanner only; same role
 	)
 	switch conf.Backends.Database {
 	case "", "postgres":
@@ -265,8 +270,29 @@ func main() {
 		serverRepo = sqlite.NewServerRepository(&domainConfig, lite.DB, cl)
 		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
 		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
+	case "spanner":
+		sp, admin, err := database.NewSpanner(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer sp.Close()
+		defer admin.Close()
+		if err := spannerrepo.Migrate(ctx, admin, sp); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+
+		spannerClient = sp
+		databaseReady = func(ctx context.Context) error {
+			_, err := sp.Single().Query(ctx, gspanner.Statement{SQL: "SELECT 1"}).Next()
+			return err
+		}
+		recordRepo = spannerrecord.New(sp, cl, domainConfig)
+		entityMetaRepo = spannerrepo.NewEntityMetaRepository(sp)
+		serverRepo = spannerrepo.NewServerRepository(&domainConfig, sp, cl)
+		notificationRepo = spannerrepo.NewNotificationRepository(sp)
+		abuseRepo = spannerrepo.NewAbuseRepository(sp)
 	default:
-		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite)")
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -283,16 +309,24 @@ func main() {
 			panic("backends.aggregate.store postgres needs the postgres database")
 		}
 		aggregateStore = aggpostgres.New(db)
+	case "spanner":
+		if spannerClient == nil {
+			panic("backends.aggregate.store spanner needs the spanner database")
+		}
+		aggregateStore = aggspanner.New(spannerClient)
 	case "redis":
 		aggregateStore = aggredis.New(redis)
 	case "":
-		if db != nil {
+		switch {
+		case db != nil:
 			aggregateStore = aggpostgres.New(db)
-		} else {
+		case spannerClient != nil:
+			aggregateStore = aggspanner.New(spannerClient)
+		default:
 			aggregateStore = aggredis.New(redis)
 		}
 	default:
-		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, redis)")
+		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, redis)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 

@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
+	gspanner "cloud.google.com/go/spanner"
 	"github.com/spf13/cobra"
 	"gorm.io/gorm"
 
@@ -11,10 +13,13 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	spannerrecord "github.com/concrnt/concrnt/internal/infra/repository/spanner/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -30,6 +35,7 @@ type operationContext struct {
 	// DB is the Postgres connection; nil on any other backend. Commands
 	// that speak SQL directly check RequirePostgres first.
 	DB           *gorm.DB
+	spanner      *gspanner.Client // spanner only; the aggregate store's default home
 	Client       *client.Client
 	Aggregate    *aggregate.Usecase
 	Record       record.Repository
@@ -106,8 +112,22 @@ func newOperationContext() (*operationContext, error) {
 		op.Server = sqlite.NewServerRepository(&globalConfig, lite.DB, cl)
 		op.Notification = sqlite.NewNotificationRepository(lite.DB)
 		op.close = lite.Close
+	case "spanner":
+		sp, admin, err := database.NewSpanner(context.Background(), conf.Backends)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect database: %w", err)
+		}
+		op.spanner = sp
+		op.Record = spannerrecord.New(sp, cl, globalConfig)
+		op.EntityMeta = spannerrepo.NewEntityMetaRepository(sp)
+		op.Server = spannerrepo.NewServerRepository(&globalConfig, sp, cl)
+		op.Notification = spannerrepo.NewNotificationRepository(sp)
+		op.close = func() error {
+			sp.Close()
+			return admin.Close()
+		}
 	default:
-		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite)", conf.Backends.Database)
+		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite, spanner)", conf.Backends.Database)
 	}
 
 	rdb := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
@@ -119,17 +139,26 @@ func newOperationContext() (*operationContext, error) {
 			return nil, fmt.Errorf("backends.aggregate.store postgres needs the postgres database")
 		}
 		aggregateStore = aggpostgres.New(op.DB)
+	case "spanner":
+		if op.spanner == nil {
+			op.Close()
+			return nil, fmt.Errorf("backends.aggregate.store spanner needs the spanner database")
+		}
+		aggregateStore = aggspanner.New(op.spanner)
 	case "redis":
 		aggregateStore = aggredis.New(rdb)
 	case "":
-		if op.DB != nil {
+		switch {
+		case op.DB != nil:
 			aggregateStore = aggpostgres.New(op.DB)
-		} else {
+		case op.spanner != nil:
+			aggregateStore = aggspanner.New(op.spanner)
+		default:
 			aggregateStore = aggredis.New(rdb)
 		}
 	default:
 		op.Close()
-		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, redis)", conf.Backends.Aggregate.Store)
+		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, redis)", conf.Backends.Aggregate.Store)
 	}
 	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 	return op, nil
