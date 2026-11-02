@@ -281,6 +281,8 @@ backends:
 
 ### T2.3 クエリ形状レジストリをバックエンド中立化し、インデックス検証を各バックエンドに（C5）
 
+> 実績（#115）: 中立パッケージの形状レジストリは作られず、代わりに `CONTRACT.md` のメソッド表にアクセスパスを記述し、各バックエンドが自分のスキーマでインデックスを宣言して `pg_indexes` / `sqlite_master` で集合を固定する形になった。C5 の文言もそれに合わせて変更済み。以下は当初案として残す。
+
 設計
 - `support-firestore` の `internal/infra/repository/firestore/shapes.go` にある `queryShape` 定義を手本に、`internal/infra/repository/shapes/shapes.go` を新設し、**論理フィールド名**（`parent`, `recordCreatedAt`, `schema` …）で宣言する。各バックエンドは論理名 → 物理列/フィールド名のマップを持つ。
 - Postgres: 各形状に対し「等価列 + 範囲列（並び順）」を前置一致で含むインデックスが `pg_indexes` に存在することをテストで検証する（`postgres_test.go` にある手書き検査を一般化）。GORM タグのインデックス定義は **形状から導出できるものに限り削除し、`shapes` から DDL を生成**する（`postgres/indexes.go`: 起動時に `CREATE INDEX IF NOT EXISTS` を発行）。形状に表れない内部インデックス（PK、unique）はモデルタグに残す。
@@ -306,7 +308,7 @@ backends:
 ### T2.5 SQLite バックエンド（移植性の強制力、Docker 不要のテスト）
 
 設計
-- `internal/infra/repository/sqlite/`。**GORM を使わず** `database/sql` + `modernc.org/sqlite`（pure Go、cgo 不要）。これを「GORM に依存しない新規バックエンドの書き方」の参照実装とする。
+- `internal/infra/repository/sqlite/`。（実績: フェーズ2 #115 では **GORM + `github.com/ncruces/go-sqlite3/gormlite`**（pure Go / wasm、cgo 不要）で実装された。計画当初の「GORM なし」は撤回。§9-D のルール参照。）
 - 単一ライタ前提（`_journal_mode=WAL`, `busy_timeout`）。`RunInTx` は `BEGIN IMMEDIATE` で直列化し、`SQLITE_BUSY` でリトライ。
 - `backends.database: sqlite`, `backends.sqlite.path`。`:memory:` を許可（テスト用）。
 - `suite_test.go` は repotest 4 スイートを実行。Docker 不要。
@@ -338,7 +340,7 @@ backends:
 
 ## 5. フェーズ3 — Spanner バックエンド（契約の証明）
 
-フェーズ2完了後に着手。Spanner 実装は契約から直接書き、書き込みは DML（§3.1）で Postgres 版と同形にする。`support-firestore` の `tx.go`（書き込みバッファ）は DML のない Firestore 向けの設計であり、Spanner では参照しない。**GORM は使わない**（新規バックエンドの書き方の手本は T2.5 の SQLite）。
+フェーズ2完了後に着手。Spanner 実装は契約から直接書き、**GORM は使わず** `cloud.google.com/go/spanner` のネイティブクライアントを用いる（理由は §9-D）。書き込みは DML（§3.1）で Postgres 版と同形にする。`support-firestore` の `tx.go`（書き込みバッファ）は DML のない Firestore 向けの設計であり、Spanner では参照しない。**GORM は使わない**（新規バックエンドの書き方の手本は T2.5 の SQLite）。
 
 ### 3.1 方針（決定事項）
 
@@ -364,7 +366,7 @@ backends:
 - **配列・JSON**: `distributions` / `prefixes` / `schemas` は `ARRAY<STRING(MAX)>`、`well_known` / `info` は `JSON`。
 - **`QueryByPrefix`**: `STARTS_WITH(uri, @prefix)` は主キー `uri` の範囲走査になる。Firestore の `ancestors` 配列は不要。
 - **スキーマ適用**: `internal/infra/repository/spanner/schema/*.sql`（番号付き DDL バッチ）を `UpdateDatabaseDdl` で適用し、適用済み番号を `schema_migrations` に記録。起動時に未適用分だけ流す。DDL はトランザクショナルでないので各バッチは冪等に書く（`CREATE TABLE IF NOT EXISTS` 相当は `INFORMATION_SCHEMA` を見て判定）。
-- **インデックス**: T2.3 の形状レジストリから `CREATE INDEX` を生成する（`parent_uri, record_created_at DESC, record_id` は `NULL_FILTERED` でプレースホルダを除外 = Postgres の部分インデックス、`associations.unique` と acks の `(from,to,schema)` は `UNIQUE NULL_FILTERED`）。テストは `INFORMATION_SCHEMA.INDEXES` / `INDEX_COLUMNS` と比較する。
+- **インデックス**: マージ済み C5（「インデックスは各バックエンド自身のもの」）に従い、`schema/*.sql` に手書きで宣言し、`CONTRACT.md` のメソッド表（アクセスパス）を1行ずつ満たすことを確認する。`parent_uri, record_created_at DESC, record_id` は `NULL_FILTERED` でプレースホルダを除外（= Postgres の部分インデックス）、`associations.unique` と acks の `(from,to,schema)` は `UNIQUE NULL_FILTERED`。インデックス集合は `INFORMATION_SCHEMA.INDEXES` / `INDEX_COLUMNS` を読むテストで固定する（Postgres の `pg_indexes`、SQLite の `sqlite_master` と同じやり方）。
 
 ### 3.2 成果物
 
@@ -378,7 +380,7 @@ backends:
   - `schema/0001_core.sql` …、`migrate.go`
   - `inspect_test.go`（C10）、`suite_test.go`（repotest 6 スイート）、`tx_abort_test.go`（同一キーへ競合する2つの `RunInTx` が両方完走し、片側だけ再試行されることを Omni で検証）、`mutation_limit_test.go`（子 2 万件のタイムラインに対する `DeleteRecordByKey` がジョブキュー経由で上限を超えずに完了）
 - `internal/infra/aggregate/spanner/`: `AggregateStore` 実装（テーブル `aggregates(key, value, as_of, deltas, expires_at)`、`Apply` は RW tx の read-modify-write なので Postgres 実装と同じく厳密、TTL は `ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`）。`storetest` を通す。
-- `internal/infra/repository/repository.go`: `spanner` ケース。
+- `cmd/concrnt/main.go` と `cmd/conctl/operation.go` の `backends.database` の `switch` に `spanner` ケースを追加（マージ済みフェーズ2で `repository.Set` は廃止され、各バックエンドのコンストラクタを直接呼ぶ形になっている）。
 - `internal/testutil/spanner.go`: dockertest で Omni（または §9-G によりエミュレータ）を起動し、`open(t)` ごとに新しいデータベースを作ってスキーマを適用する。Omni の起動が遅い場合はパッケージ単位で1コンテナを共有し、データベースだけテストごとに分ける。
 - `compose.yaml`: `spanner-omni` サービス（profile `spanner`）。README に起動手順。
 - `.github/workflows/test.yml`: Spanner ジョブを追加（§9-G）。
@@ -389,7 +391,7 @@ backends:
 
 - repotest 6 スイートと `storetest` が Spanner Omni 上で緑。
 - `tx_abort_test` と `mutation_limit_test` が緑。
-- 形状レジストリに形状を1つ足して DDL を更新しない状態で Spanner のインデックス検査が **失敗する**。
+- `schema/*.sql` からインデックスを1つ外した状態で、固定テストが **失敗する**。
 - Postgres → Spanner → Postgres のログ再生往復で `dump-commitlog` の出力が一致（§4 の SQLite 往復と同じ手順）。
 - 本番バイナリに `repotest` / `testutil` / `dockertest` がリンクされていない（C10）。
 - **契約の修正が必要になった箇所を PR 本文に列挙する**。これがこのフェーズの主目的で、Spanner 側で回避策を書くのではなく、契約（repotest → Postgres → SQLite → Spanner）を直す。想定される発見: カスケード削除の粒度、`Inspector` のタイムスタンプ操作、`QueryByPrefix` の意味論。（read-after-write は調査済みで契約の問題ではないと判明。§3.1 参照）
@@ -478,7 +480,7 @@ backends:
 - **A2. Redis / memcached（将来 Firestore）ストアでの結果整合を許容するか（Spanner 実装は RW tx で厳密）** — 推奨: 許容する。集計はキャッシュであり、TTL で収束する。厳密性が必要になった時点で Postgres 実装相当のロック付きストアを選ぶ。
 - **B. Postgres の `record_keys.id`（bigserial）を gen 文字列に置換するか** — 推奨: **フェーズ2ではやらない**。契約に漏れていない限り内部実装の自由（C3）。Spanner/CRDB バックエンドを書く段で、その実装側が独自に gen を持てばよい。
 - **C. SQLite バックエンド（T2.5）をフェーズ2に含めるか** — 推奨: 含める。Docker なしで契約テストが回ることの価値が大きく、GORM 非依存バックエンドの雛形にもなる。
-- **D. Postgres 実装の GORM 継続** — 推奨: 継続。書き換えコストに対して得るものが少ない。新規バックエンドは `database/sql` 直で書く（T2.5 が手本）。
+- **D. GORM の使い分け**（2026-11-02 更新） — ルール: **GORM のダイアレクトが契約の書き込み経路（条件付き UPSERT `ON CONFLICT ... DO UPDATE ... WHERE`、`FOR UPDATE` 行ロック）をそのまま表現できるバックエンドは GORM、できないものはネイティブクライアント**。Postgres と SQLite（フェーズ2で `ncruces/go-sqlite3` の gormlite 採用、計画の「GORM なし」から変更）は前者。Spanner と Firestore は後者。`go-gorm-spanner` は `clause.OnConflict` と `clause.Locking` が非対応で、AutoMigrate が interleave テーブルを作れないため、GORM を通しても書き込みは生 SQL になり層が増えるだけ。
 - **E. `QueryByPrefix` の Postgres 実装を `ancestors` 方式に合わせるか** — 推奨: 合わせない。`LIKE` は Postgres では速く、契約は意味論のみを規定する。
 - **G. （フェーズ3）CI で Spanner Omni を使うか、エミュレータにするか** — 推奨: ローカルは Omni、CI は **Omni を試して GitHub ランナーで安定しなければエミュレータ**。Omni はホストネットワーク前提の手順しか公式に出ておらず、ライセンス条件（CI での利用可否）と GA / Preview の扱いも情報が割れている（公式ドキュメントは本セッションから取得不可）。着手時に `docs.cloud.google.com/spanner-omni/` の overview / setup / license を確認し、結果を本書に追記する。エミュレータは RW トランザクションを1つしか許さないので、`tx_abort_test` は Omni でのみ意味を持つ。
 - **H. （フェーズ3）時刻順キーのシャード化** — 推奨: 既定オフ。`keys.go` に切替点だけ用意する。
