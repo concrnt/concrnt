@@ -91,12 +91,13 @@ type Cluster struct {
 }
 
 type Backends struct {
-	// Database selects the record store: "postgres" (default), "sqlite" or
-	// "spanner".
+	// Database selects the record store: "postgres" (default), "sqlite",
+	// "spanner" or "firestore".
 	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
 	SQLite        SQLite    `yaml:"sqlite"`
 	Spanner       Spanner   `yaml:"spanner"`
+	Firestore     Firestore `yaml:"firestore"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
 	RedisAddr     string    `yaml:"redisAddr"`
 	RedisDB       int       `yaml:"redisDB"`
@@ -134,6 +135,18 @@ type Spanner struct {
 	// Database is the database name (default concrnt). It must exist
 	// (conctl / the Omni CLI create it); the server creates its schema.
 	Database string `yaml:"database"`
+}
+
+// Firestore configures the firestore record store.
+type Firestore struct {
+	// ProjectID is the Google Cloud project; empty means detect it from the
+	// environment (metadata server, ADC).
+	ProjectID string `yaml:"projectID"`
+	// DatabaseID is the Firestore database (default "(default)").
+	DatabaseID string `yaml:"databaseID"`
+	// EmulatorHost is the host:port of a Firestore emulator; it sets
+	// FIRESTORE_EMULATOR_HOST (which can also be set directly).
+	EmulatorHost string `yaml:"emulatorHost"`
 }
 
 // SpannerDatabasePath is the full database resource name.
