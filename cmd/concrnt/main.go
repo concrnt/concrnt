@@ -420,6 +420,7 @@ func main() {
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
+	recordUC.SetEntityCache(mc)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := recordRepo

@@ -256,6 +256,11 @@ the operational notes.
 `import-commitlog`, `gc-commitlog`, `dump-/import-subscriptions`,
 `aggregate-*`) work on every backend.
 
+Entities are cached in memcached (`entity:<ccid>`, 60 s) for every backend.
+Entity commits invalidate the entry, but `conctl` edits of the `entities`
+table (a changed `tag`, `delete-user`, `gc-commitlog`) do not reach the
+cache and take effect within that TTL.
+
 ### Migration
 
 `conctl migrate v1-to-v2` (backed by `legacy/`) exports a v1 identity's full log and
