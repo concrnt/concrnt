@@ -23,7 +23,7 @@ func (r *Repository) QueryByPrefix(
 	// the prefix is a literal (CONTRACT.md): its LIKE metacharacters are
 	// escaped so "it_em" cannot match "items"
 	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).
-		Where(`uri LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
+		Where(uriPrefixMatch, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
@@ -60,6 +60,12 @@ func (r *Repository) QueryByPrefix(
 // can't over-match when embedded in a pattern.
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
+// uriPrefixMatch is a prefix LIKE on record_keys.uri. A btree serves LIKE
+// 'x%' only under the "C" collation, so the match is forced to it and the
+// (uri COLLATE "C") indexes apply; under the database's default collation
+// it scans the whole table.
+const uriPrefixMatch = `record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`
+
 // QueryRecordSubtree returns every live record whose key is base itself
 // (includeSelf) or lies under base's path subtree (base + "/..."), ordered by
 // URI (byte order) so base leads. Unlike QueryByPrefix's raw prefix match this never picks
@@ -73,9 +79,12 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		// the OR hides the LIKE prefix from the planner, so the scan is bounded
+		// explicitly: base and base/... both sort in [base, base+"0") ('/' < '0')
+		query = query.Where(`record_keys.uri COLLATE "C" >= ? AND record_keys.uri COLLATE "C" < ? AND (record_keys.uri = ? OR `+uriPrefixMatch+`)`,
+			base, base+"0", base, subtreePattern)
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where(uriPrefixMatch, subtreePattern)
 	}
 
 	if afterURI != "" {
@@ -126,7 +135,7 @@ func (r *Repository) QueryByParent(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
@@ -185,7 +194,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}

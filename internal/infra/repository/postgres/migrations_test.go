@@ -92,6 +92,7 @@ var expectedIndexes = []indexRow{
 	{"record_keys", "idx_record_keys_parent_id_record_id", "CREATE INDEX idx_record_keys_parent_id_record_id ON public.record_keys USING btree (parent_id, record_id)"},
 	{"record_keys", "idx_record_keys_parent_id_uri", "CREATE INDEX idx_record_keys_parent_id_uri ON public.record_keys USING btree (parent_id, uri COLLATE \"C\")"},
 	{"record_keys", "idx_record_keys_record_id", "CREATE UNIQUE INDEX idx_record_keys_record_id ON public.record_keys USING btree (record_id)"},
+	{"record_keys", "idx_record_keys_uri_c", "CREATE INDEX idx_record_keys_uri_c ON public.record_keys USING btree (uri COLLATE \"C\")"},
 	{"record_keys", "record_keys_pkey", "CREATE UNIQUE INDEX record_keys_pkey ON public.record_keys USING btree (id)"},
 	{"record_keys", "uni_record_keys_uri", "CREATE UNIQUE INDEX uni_record_keys_uri ON public.record_keys USING btree (uri)"},
 	{"records", "idx_records_author_created_at_document_id", "CREATE INDEX idx_records_author_created_at_document_id ON public.records USING btree (author, created_at, document_id)"},

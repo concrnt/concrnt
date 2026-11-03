@@ -44,8 +44,9 @@ type CommitLog struct {
 //     record.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
 //     GetChunklineManifest/LookupLocalItrs/LoadLocalBody, and association target
-//     lookups. Prefix scans (QueryByPrefix, QueryRecordSubtree, the parent_id IS
-//     NULL branch of QueryByParent*) also walk it with LIKE.
+//     lookups. Its default collation cannot serve LIKE 'x%'.
+//   - idx_record_keys_uri_c (uri COLLATE "C"): prefix scans; used by
+//     record.Repository.QueryByPrefix and QueryRecordSubtree.
 //   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup
 //     and record joins; used by record.Repository.GetHierarchicalRecordPolicies,
 //     policiesFor and signedDocumentsByID.
@@ -58,12 +59,13 @@ type CommitLog struct {
 //     LookupLocalItrs, and LoadLocalBody.
 //   - idx_record_keys_parent_id_uri (parent_id, uri COLLATE "C"): key-ordered
 //     child listing including placeholder keys (no record_created_at
-//     predicate); used by record.Repository.QueryByParentOrderByKey.
+//     predicate); used by record.Repository.QueryByParentOrderByKey, and the
+//     owner-root (parent_id IS NULL + uri prefix) branch of QueryByParent*.
 type RecordKey struct {
 	ID       int64  `json:"id" gorm:"primaryKey;autoIncrement"`
 	ParentID *int64 `json:"parentID" gorm:"index:idx_record_keys_parent_id_record_id,priority:1;index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
 	// key order is byte order (CONTRACT.md "Key order"), hence COLLATE "C"
-	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\""`
+	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\";index:idx_record_keys_uri_c,collate:\"C\""`
 	RecordID        *string    `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_id_record_id,priority:2;index:idx_record_keys_parent_created_at_record_id,priority:3"`
 	Record          Record     `json:"record" gorm:"foreignKey:RecordID;references:DocumentID;constraint:OnDelete:CASCADE;"`
 	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone;index:idx_record_keys_parent_created_at_record_id,priority:2,sort:desc"`
