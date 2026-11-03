@@ -1264,73 +1264,89 @@ func TestEventNestedReferencesMarkedForAnonymous(t *testing.T) {
 
 // The associated event is likewise flagged (action association:read), while
 // the delivery payload — the signed document remote servers must verify —
-// stays complete and unflagged.
+// stays complete and unflagged. A local channel gets the event straight from
+// the signal, a remote one through a delivery job.
 func TestAssociatedEventMarkedForAnonymous(t *testing.T) {
-	ccid, priv := newIdentity(t)
-	cfg := &domain.Config{FQDN: "example.com"}
+	for _, ownerDomain := range []string{"example.com", "remote.example.net"} {
+		t.Run(ownerDomain, func(t *testing.T) {
+			ccid, priv := newIdentity(t)
+			cfg := &domain.Config{FQDN: "example.com"}
 
-	target := concrnt.CCURI{Scheme: "cckv", Owner: ccid, Key: "posts/1"}.String()
-	targetSD := signedRecord(t, ccid, priv, time.Now().Add(-time.Minute))
+			target := concrnt.CCURI{Scheme: "cckv", Owner: ccid, Key: "posts/1"}.String()
+			targetSD := signedRecord(t, ccid, priv, time.Now().Add(-time.Minute))
 
-	assocSD := signTestDocument(t, concrnt.Document[any]{
-		Kind:      "association",
-		Associate: &target,
-		Value:     map[string]any{"messageId": "m1"},
-		Author:    ccid,
-		Schema:    "https://example.com/a/reply.json",
-		CreatedAt: time.Now(),
-	}, priv)
-	assocSD.References = map[string]concrnt.SignedDocument{target: targetSD}
+			assocSD := signTestDocument(t, concrnt.Document[any]{
+				Kind:      "association",
+				Associate: &target,
+				Value:     map[string]any{"messageId": "m1"},
+				Author:    ccid,
+				Schema:    "https://example.com/a/reply.json",
+				CreatedAt: time.Now(),
+			}, priv)
+			assocSD.References = map[string]concrnt.SignedDocument{target: targetSD}
 
-	pol := &anonymousDenyPolicyService{}
-	delivery := &recordingDeliveryQueue{}
-	uc := New(
-		withEntities{&associationRecordingRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN, SignedDocument: &concrnt.SignedDocument{Document: "{}"}}}},
-		nil,
-		newTestServerUsecase(cfg),
-		cfg,
-		nil,
-		nopSignalService{},
-		pol,
-		delivery,
-		nil,
-	)
+			pol := &anonymousDenyPolicyService{}
+			delivery := &recordingDeliveryQueue{}
+			signal := &recordingSignalService{}
+			uc := New(
+				withEntities{&associationRecordingRepo{}, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: ownerDomain, SignedDocument: &concrnt.SignedDocument{Document: "{}"}}}},
+				nil,
+				newTestServerUsecase(cfg),
+				cfg,
+				nil,
+				signal,
+				pol,
+				delivery,
+				nil,
+			)
 
-	if _, err := uc.Commit(context.Background(), "127.0.0.1", assocSD, domain.CommitModeExecute); err != nil {
-		t.Fatalf("Commit returned error: %v", err)
-	}
-	if len(delivery.jobs) == 0 {
-		t.Fatal("expected at least one delivery job")
-	}
-	for _, job := range delivery.jobs {
-		if job.Event == nil {
-			continue
-		}
-		if len(job.Event.References) == 0 {
-			t.Fatal("event documents must stay on the event for internal consumers")
-		}
-		for _, ref := range job.Event.References {
-			if ref.IsPublic == nil || *ref.IsPublic {
-				t.Fatalf("anonymous-unreadable association must be flagged isPublic=false, got %+v", ref.IsPublic)
+			if _, err := uc.Commit(context.Background(), "127.0.0.1", assocSD, domain.CommitModeExecute); err != nil {
+				t.Fatalf("Commit returned error: %v", err)
 			}
-		}
-		if len(job.Event.PublicView().References) != 0 {
-			t.Fatal("the public view must drop the protected association document")
-		}
-		if len(job.Payload.References) == 0 {
-			t.Fatal("delivery payload references must stay complete")
-		}
-		if job.Payload.IsPublic != nil {
-			t.Fatal("delivery payload must not carry internal flags")
-		}
-		for _, ref := range job.Payload.References {
-			if ref.IsPublic != nil {
-				t.Fatal("delivery payload references must not carry internal flags")
+
+			events := slices.Clone(signal.events)
+			for _, job := range delivery.jobs {
+				if job.Event != nil {
+					events = append(events, *job.Event)
+				}
 			}
-		}
-	}
-	if !slices.Contains(pol.actions, "association:read") {
-		t.Fatalf("expected an association:read evaluation, got %v", pol.actions)
+			local := ownerDomain == cfg.FQDN
+			if local && (len(signal.events) == 0 || len(delivery.jobs) != 0) {
+				t.Fatalf("a local channel must be published directly: %d published, %d queued", len(signal.events), len(delivery.jobs))
+			}
+			if !local && (len(signal.events) != 0 || len(delivery.jobs) == 0) {
+				t.Fatalf("a remote channel must be queued: %d published, %d queued", len(signal.events), len(delivery.jobs))
+			}
+			for _, event := range events {
+				if len(event.References) == 0 {
+					t.Fatal("event documents must stay on the event for internal consumers")
+				}
+				for _, ref := range event.References {
+					if ref.IsPublic == nil || *ref.IsPublic {
+						t.Fatalf("anonymous-unreadable association must be flagged isPublic=false, got %+v", ref.IsPublic)
+					}
+				}
+				if len(event.PublicView().References) != 0 {
+					t.Fatal("the public view must drop the protected association document")
+				}
+			}
+			for _, job := range delivery.jobs {
+				if len(job.Payload.References) == 0 {
+					t.Fatal("delivery payload references must stay complete")
+				}
+				if job.Payload.IsPublic != nil {
+					t.Fatal("delivery payload must not carry internal flags")
+				}
+				for _, ref := range job.Payload.References {
+					if ref.IsPublic != nil {
+						t.Fatal("delivery payload references must not carry internal flags")
+					}
+				}
+			}
+			if !slices.Contains(pol.actions, "association:read") {
+				t.Fatalf("expected an association:read evaluation, got %v", pol.actions)
+			}
+		})
 	}
 }
 
