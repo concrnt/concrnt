@@ -109,7 +109,7 @@ type Backends struct {
 
 // Postgres sizes the connection pool of one process.
 type Postgres struct {
-	// MaxOpenConns is the pool size (default 48).
+	// MaxOpenConns is the pool size (default 64).
 	MaxOpenConns int `yaml:"maxOpenConns"`
 	// MaxConcurrentTx caps the transactions running at once (default and
 	// upper bound maxOpenConns/2).
@@ -117,7 +117,7 @@ type Postgres struct {
 }
 
 const (
-	DefaultPostgresMaxOpenConns = 48
+	DefaultPostgresMaxOpenConns = 64
 	DefaultJobQueueConcurrency  = 16
 )
 

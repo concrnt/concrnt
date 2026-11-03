@@ -181,7 +181,7 @@ backend's package, and every backend passes the same contract suites
 - `postgres` (default): `internal/infra/repository/postgres`, GORM over
   `backends.postgresDsn`. Schema changes are numbered steps in
   `postgres/migrations.go`, applied at server start. Each replica opens up
-  to `backends.postgres.maxOpenConns` connections (default 48) and runs at
+  to `backends.postgres.maxOpenConns` connections (default 64) and runs at
   most `maxConcurrentTx` transactions at once (default and cap: half the
   pool), so keep replicas × maxOpenConns (+ conctl and exporters) under the
   server's `max_connections` (`SHOW max_connections`; Cloud SQL sizes it

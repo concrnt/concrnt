@@ -13,13 +13,13 @@ func TestPostgresWithDefaults(t *testing.T) {
 		want    Postgres
 		clamped bool
 	}{
-		{"unset", Postgres{}, Postgres{MaxOpenConns: 48, MaxConcurrentTx: 24}, false},
+		{"unset", Postgres{}, Postgres{MaxOpenConns: 64, MaxConcurrentTx: 32}, false},
 		{"pool only", Postgres{MaxOpenConns: 20}, Postgres{MaxOpenConns: 20, MaxConcurrentTx: 10}, false},
 		{"both within bound", Postgres{MaxOpenConns: 32, MaxConcurrentTx: 8}, Postgres{MaxOpenConns: 32, MaxConcurrentTx: 8}, false},
 		{"tx at bound", Postgres{MaxOpenConns: 32, MaxConcurrentTx: 16}, Postgres{MaxOpenConns: 32, MaxConcurrentTx: 16}, false},
 		{"tx above pool", Postgres{MaxOpenConns: 16, MaxConcurrentTx: 64}, Postgres{MaxOpenConns: 16, MaxConcurrentTx: 8}, true},
 		{"tx above half", Postgres{MaxOpenConns: 16, MaxConcurrentTx: 9}, Postgres{MaxOpenConns: 16, MaxConcurrentTx: 8}, true},
-		{"tx above default pool", Postgres{MaxConcurrentTx: 30}, Postgres{MaxOpenConns: 48, MaxConcurrentTx: 24}, true},
+		{"tx above default pool", Postgres{MaxConcurrentTx: 40}, Postgres{MaxOpenConns: 64, MaxConcurrentTx: 32}, true},
 		{"pool of one", Postgres{MaxOpenConns: 1}, Postgres{MaxOpenConns: 2, MaxConcurrentTx: 1}, true},
 	}
 	for _, c := range cases {

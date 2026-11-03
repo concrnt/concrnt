@@ -39,8 +39,8 @@ backends:
   # transaction's reads take a second connection, so maxConcurrentTx is
   # capped at maxOpenConns/2 (a larger value is lowered with a warning).
   # postgres:
-  #   maxOpenConns: 48      # default 48
-  #   maxConcurrentTx: 24   # default maxOpenConns/2
+  #   maxOpenConns: 64      # default 64
+  #   maxConcurrentTx: 32   # default maxOpenConns/2
   # sqlite:
   #   path: /var/lib/concrnt/concrnt.db
   # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),

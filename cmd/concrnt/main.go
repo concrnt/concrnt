@@ -545,7 +545,7 @@ func main() {
 		abuseUC,
 		subscriptionUC,
 	)
-	api := e.Group("", authMiddleware.IdentifyIdentity, authMiddleware.IdentifyIdentity)
+	api := e.Group("", authMiddleware.IdentifyIdentity)
 
 	if conf.Integrations.CaptchaSecret != "" {
 		validator, err := recaptcha.NewWithSecert(conf.Integrations.CaptchaSecret)
