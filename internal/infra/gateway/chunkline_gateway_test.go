@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/testutil"
+	ucchunkline "github.com/concrnt/concrnt/internal/usecase/chunkline"
+	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
 )
 
@@ -515,5 +519,90 @@ func TestQueryDescendingStaticManifestHost(t *testing.T) {
 	}
 	if !cl.IsOnline(domain) {
 		t.Fatal("static host must stay online")
+	}
+}
+
+// localChunklineRepo serves the chunkline views of one timeline the way the
+// record stores do.
+type localChunklineRepo struct {
+	ucrecord.Repository
+	timeline string
+	items    []chunkline.BodyItem
+	calls    atomic.Int32
+}
+
+func (l *localChunklineRepo) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+	l.calls.Add(1)
+	safeURI := url.QueryEscape(uri)
+	return &chunkline.Manifest{
+		Version:   "1.0",
+		ChunkSize: 600,
+		Descending: &chunkline.Endpoint{
+			Iterator: "/api/v2/chunkline/itr/{chunk}?uri=" + safeURI,
+			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
+		},
+		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
+	}, nil
+}
+
+func (l *localChunklineRepo) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
+	l.calls.Add(1)
+	result := map[string]int64{}
+	for _, uri := range uris {
+		if uri == l.timeline {
+			result[uri] = chunkID
+		}
+	}
+	return result, nil
+}
+
+func (l *localChunklineRepo) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
+	l.calls.Add(1)
+	if uri != l.timeline {
+		return nil, nil
+	}
+	return l.items, nil
+}
+
+// This server's own timelines are read from the store: every request the
+// client sends to this server's own domain would be the loopback through
+// /api/v2/batch the 3000 DAU load test choked on.
+func TestQueryDescendingLocalTimelineSkipsHTTP(t *testing.T) {
+	const self = "self.example.test"
+	timeline := "cckv://" + self + "/home"
+	mc, cleanup := testutil.CreateMC()
+	t.Cleanup(cleanup)
+
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpRequests.Add(1)
+		http.Error(w, "unexpected request "+r.URL.String(), http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	cl := client.New(self)
+	cl.AddHostRemapping(self, server.URL)
+
+	now := time.Now()
+	repo := &localChunklineRepo{timeline: timeline, items: []chunkline.BodyItem{
+		{Timestamp: now.Add(-time.Second), Href: timeline + "/newest"},
+		{Timestamp: now.Add(-2 * time.Second), Href: timeline + "/older"},
+	}}
+	r := &resolver{mc: mc, client: cl, demand: noDemand{}, fqdn: self, local: ucchunkline.New(repo, nil, nil, nil)}
+
+	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, now, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Href != timeline+"/newest" || items[1].Href != timeline+"/older" {
+		t.Fatalf("unexpected items: %+v", items)
+	}
+	if repo.calls.Load() < 3 {
+		t.Fatalf("manifest, iterator and body must come from the store, got %d calls", repo.calls.Load())
+	}
+
+	// the removed-items refresh runs in the background
+	time.Sleep(200 * time.Millisecond)
+	if n := httpRequests.Load(); n != 0 {
+		t.Fatalf("%d HTTP requests reached this server's own API", n)
 	}
 }

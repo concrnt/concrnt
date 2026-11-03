@@ -19,6 +19,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
+	ucchunkline "github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/worker"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -68,6 +69,14 @@ func NewChunklineGateway(
 	}
 }
 
+// SetLocal makes the timelines of fqdn (this server) read from local, the
+// chunkline usecase behind this server's own chunkline API, instead of
+// through that API over HTTP.
+func (g *ChunklineGateway) SetLocal(fqdn string, local *ucchunkline.Usecase) {
+	g.r.fqdn = fqdn
+	g.r.local = local
+}
+
 // StartWorker registers the resolver's cache keep-alive demand on the
 // subscriber, hooks cache purging into the subscription open/close edges, and
 // starts the cache updater. Run this only on the replica that runs the
@@ -101,6 +110,43 @@ type resolver struct {
 	demand SubscriptionDemand
 	pubsub worker.PubSub
 	open   OpenSubscriptions // set by StartWorker on the leader; nil elsewhere
+	fqdn   string
+	local  *ucchunkline.Usecase // nil: every timeline goes over HTTP
+}
+
+func (r *resolver) fetchManifest(ctx context.Context, timeline string) (chunkline.Manifest, error) {
+	if r.local != nil && strings.HasPrefix(timeline, "cckv://") {
+		if host, err := r.client.ResolveResourceHost(ctx, timeline); err == nil && host == r.fqdn {
+			originFetches.WithLabelValues("manifest", "local").Inc()
+			manifest, err := r.local.GetChunklineManifest(ctx, timeline)
+			if err != nil {
+				return chunkline.Manifest{}, err
+			}
+			return *manifest, nil
+		}
+	}
+	originFetches.WithLabelValues("manifest", "http").Inc()
+	var manifest chunkline.Manifest
+	err := r.client.GetResource(ctx, timeline, "application/chunkline+json", nil, &manifest)
+	return manifest, err
+}
+
+// localCall recognises an endpoint of this server's own chunkline API (as
+// GetChunklineManifest renders them), so it is answered without HTTP.
+func (r *resolver) localCall(endpoint *url.URL, kind string) (chunkID int64, uri string, ok bool) {
+	if r.local == nil || endpoint.Host != r.fqdn {
+		return 0, "", false
+	}
+	uri = endpoint.Query().Get("uri")
+	rest, found := strings.CutPrefix(endpoint.Path, "/api/v2/chunkline/"+kind)
+	if !found || uri == "" {
+		return 0, "", false
+	}
+	if kind == "removed" {
+		return 0, uri, rest == ""
+	}
+	chunkID, err := strconv.ParseInt(strings.TrimPrefix(rest, "/"), 10, 64)
+	return chunkID, uri, err == nil && strings.HasPrefix(rest, "/")
 }
 
 func manifestCacheKey(timeline string) string {
@@ -144,8 +190,7 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 		span.RecordError(fmt.Errorf("failed to get manifest from cache for %s: %w", timeline, err))
 	}
 
-	var manifest chunkline.Manifest
-	err = r.client.GetResource(ctx, timeline, "application/chunkline+json", nil, &manifest)
+	manifest, err := r.fetchManifest(ctx, timeline)
 	if err != nil {
 		span.RecordError(fmt.Errorf("failed to fetch chunkline manifest for %s: %w", timeline, err))
 		return chunkline.Manifest{}, err
@@ -220,8 +265,7 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 	}
 
 	for _, tl := range remaining {
-		var manifest chunkline.Manifest
-		err := r.client.GetResource(ctx, tl, "application/chunkline+json", nil, &manifest)
+		manifest, err := r.fetchManifest(ctx, tl)
 		if err != nil {
 			span.RecordError(fmt.Errorf("failed to fetch chunkline manifest for %s: %w", tl, err))
 			continue
@@ -325,6 +369,7 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 		}
 
 		requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query url
+		fetched := make(map[string][]string)
 
 		for _, tl := range stale {
 			manifest, ok := manifests[tl]
@@ -365,6 +410,17 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 				endpoint.Host = host
 			}
 
+			if _, uri, ok := r.localCall(endpoint, "removed"); ok {
+				originFetches.WithLabelValues("removed", "local").Inc()
+				ids, err := r.local.GetLocalRemovedItems(ctx, uri)
+				if err != nil {
+					slog.Error("chunkline removed: local lookup failed", slog.String("timeline", tl), slog.String("error", err.Error()))
+					continue
+				}
+				fetched[tl] = ids
+				continue
+			}
+
 			domain := endpoint.Host
 			if _, exists := requestsByDomain[domain]; !exists {
 				requestsByDomain[domain] = make(map[string]string)
@@ -372,34 +428,34 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 			requestsByDomain[domain][tl] = endpoint.String()
 		}
 
-		if len(requestsByDomain) == 0 {
-			return
+		if len(requestsByDomain) > 0 {
+			responces, err := r.client.BatchGet(ctx, requestsByDomain)
+			if err != nil {
+				slog.Error("chunkline removed: batch request failed", slog.String("error", err.Error()))
+			}
+			for _, requests := range requestsByDomain {
+				originFetches.WithLabelValues("removed", "http").Add(float64(len(requests)))
+			}
+			for tl, resp := range responces {
+				if resp.StatusCode != http.StatusOK {
+					slog.Error("chunkline removed: non-200 response", slog.String("timeline", tl), slog.Int("status", resp.StatusCode))
+					continue
+				}
+				bytes, err := io.ReadAll(resp.Body)
+				if err != nil {
+					slog.Error("chunkline removed: failed to read response body", slog.String("timeline", tl), slog.String("error", err.Error()))
+					continue
+				}
+				var ids []string
+				if err := json.Unmarshal(bytes, &ids); err != nil {
+					slog.Error("chunkline removed: failed to unmarshal response", slog.String("timeline", tl), slog.String("error", err.Error()))
+					continue
+				}
+				fetched[tl] = ids
+			}
 		}
 
-		responces, err := r.client.BatchGet(ctx, requestsByDomain)
-		if err != nil {
-			slog.Error("chunkline removed: batch request failed", slog.String("error", err.Error()))
-			return
-		}
-
-		for tl, resp := range responces {
-			if resp.StatusCode != http.StatusOK {
-				slog.Error("chunkline removed: non-200 response", slog.String("timeline", tl), slog.Int("status", resp.StatusCode))
-				continue
-			}
-
-			bytes, err := io.ReadAll(resp.Body)
-			if err != nil {
-				slog.Error("chunkline removed: failed to read response body", slog.String("timeline", tl), slog.String("error", err.Error()))
-				continue
-			}
-
-			var ids []string
-			err = json.Unmarshal(bytes, &ids)
-			if err != nil {
-				slog.Error("chunkline removed: failed to unmarshal response", slog.String("timeline", tl), slog.String("error", err.Error()))
-				continue
-			}
+		for tl, ids := range fetched {
 			if ids == nil {
 				ids = []string{}
 			}
@@ -489,6 +545,9 @@ func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, unti
 
 	requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query path
 
+	type localLookup struct{ timeline, uri string }
+	localLookups := make(map[int64][]localLookup) // chunk -> lookups
+
 	remainings := make(map[string]int64)
 
 	for tl, chunkID := range queries {
@@ -544,47 +603,79 @@ func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, unti
 			endpoint.Host = host
 		}
 
+		remainings[tl] = chunkID
+		if localChunk, uri, ok := r.localCall(endpoint, "itr"); ok {
+			localLookups[localChunk] = append(localLookups[localChunk], localLookup{timeline: tl, uri: uri})
+			continue
+		}
+
 		domain := endpoint.Host
 		if _, exists := requestsByDomain[domain]; !exists {
 			requestsByDomain[domain] = make(map[string]string)
 		}
 		requestsByDomain[domain][tl] = endpoint.String()
-		remainings[tl] = chunkID
 	}
 
-	if len(requestsByDomain) == 0 {
+	if len(remainings) == 0 {
 		return results, nil // all results were cached
 	}
 
-	responces, err := r.client.BatchGet(ctx, requestsByDomain)
-	if err != nil {
-		span.RecordError(fmt.Errorf("batch request for iterators failed: %w", err))
-		return results, nil // return what we have from cache
+	fetched := make(map[string]string, len(remainings)) // timeline -> iterator as served
+
+	for chunkID, lookups := range localLookups {
+		originFetches.WithLabelValues("itr", "local").Add(float64(len(lookups)))
+		uris := make([]string, len(lookups))
+		for i, lookup := range lookups {
+			uris[i] = lookup.uri
+		}
+		itrs, err := r.local.LookupLocalItrs(ctx, uris, chunkID)
+		if err != nil {
+			span.RecordError(fmt.Errorf("local iterator lookup failed: %w", err))
+			continue
+		}
+		for _, lookup := range lookups {
+			if itr, ok := itrs[lookup.uri]; ok {
+				fetched[lookup.timeline] = strconv.FormatInt(itr, 10)
+			}
+		}
+	}
+
+	if len(requestsByDomain) > 0 {
+		responces, err := r.client.BatchGet(ctx, requestsByDomain)
+		if err != nil {
+			span.RecordError(fmt.Errorf("batch request for iterators failed: %w", err))
+		}
+		for _, requests := range requestsByDomain {
+			originFetches.WithLabelValues("itr", "http").Add(float64(len(requests)))
+			for tl := range requests {
+				resp, ok := responces[tl]
+				if !ok {
+					span.RecordError(fmt.Errorf("missing response for timeline %s", tl))
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					span.RecordError(fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode))
+					continue
+				}
+				bytes, err := io.ReadAll(resp.Body)
+				if err != nil {
+					span.RecordError(fmt.Errorf("failed to read response body for timeline %s: %w", tl, err))
+					continue
+				}
+				fetched[tl] = string(bytes)
+			}
+		}
 	}
 
 	currentSubscriptions := r.demand.CurrentSubscriptions()
 
 	for tl, chunkID := range remainings {
-		resp, ok := responces[tl]
+		raw, ok := fetched[tl]
 		if !ok {
-			err := fmt.Errorf("missing response for timeline %s", tl)
-			span.RecordError(err)
 			continue
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			err := fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode)
-			span.RecordError(err)
-			continue
-		}
-
-		bytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			span.RecordError(fmt.Errorf("failed to read response body for timeline %s: %w", tl, err))
-			continue
-		}
-
-		iterator := strings.TrimSpace(string(bytes))
+		iterator := strings.TrimSpace(raw)
 		// Older servers report "no iterator" as a 200 "0" instead of a 404.
 		// Chunk 0 is the 1970 epoch bucket and can never be a real iterator,
 		// so drop it (and empty bodies) before use and before caching.
@@ -646,6 +737,7 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 	}
 
 	requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query path
+	fetched := make(map[string][]chunkline.BodyItem)
 
 	remaining := make(map[string]string)
 
@@ -729,45 +821,65 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 			endpoint.Host = host
 		}
 
+		remaining[tl] = itr
+		if localChunk, uri, ok := r.localCall(endpoint, "body"); ok {
+			originFetches.WithLabelValues("body", "local").Inc()
+			items, err := r.local.LoadLocalBody(ctx, uri, localChunk)
+			if err != nil {
+				span.RecordError(fmt.Errorf("failed to load local chunk body for timeline %s: %w", tl, err))
+				continue
+			}
+			fetched[tl] = items
+			continue
+		}
+
 		domain := endpoint.Host
 		if _, exists := requestsByDomain[domain]; !exists {
 			requestsByDomain[domain] = make(map[string]string)
 		}
 		requestsByDomain[domain][tl] = endpoint.String()
-		remaining[tl] = itr
 	}
 
-	if len(requestsByDomain) == 0 {
+	if len(remaining) == 0 {
 		return results, nil // all results were cached
 	}
 
-	responses, err := r.client.BatchGet(ctx, requestsByDomain)
-	if err != nil {
-		span.RecordError(fmt.Errorf("batch request for chunk bodies failed: %w", err))
-		return results, nil // return what we have from cache
+	if len(requestsByDomain) > 0 {
+		responses, err := r.client.BatchGet(ctx, requestsByDomain)
+		if err != nil {
+			span.RecordError(fmt.Errorf("batch request for chunk bodies failed: %w", err))
+		}
+		for _, requests := range requestsByDomain {
+			originFetches.WithLabelValues("body", "http").Add(float64(len(requests)))
+			for tl := range requests {
+				resp, ok := responses[tl]
+				if !ok {
+					span.RecordError(fmt.Errorf("missing response for timeline %s", tl))
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					span.RecordError(fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode))
+					continue
+				}
+				var items []chunkline.BodyItem
+				if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+					span.RecordError(fmt.Errorf("failed to decode chunk body for timeline %s: %w", tl, err))
+					continue
+				}
+				fetched[tl] = items
+			}
+		}
 	}
 
 	currentSubscriptions := r.demand.CurrentSubscriptions()
 
 	for tl, itr := range remaining {
-		resp, ok := responses[tl]
+		items, ok := fetched[tl]
 		if !ok {
-			err := fmt.Errorf("missing response for timeline %s", tl)
-			span.RecordError(err)
 			continue
 		}
-
-		if resp.StatusCode != http.StatusOK {
-			err := fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode)
-			span.RecordError(err)
-			continue
-		}
-
-		var items []chunkline.BodyItem
-		err = json.NewDecoder(resp.Body).Decode(&items)
-		if err != nil {
-			span.RecordError(fmt.Errorf("failed to decode chunk body for timeline %s: %w", tl, err))
-			continue
+		if items == nil {
+			items = []chunkline.BodyItem{} // the cached form is the array's inside; "null" has none
 		}
 
 		chunkID, err := strconv.ParseInt(itr, 10, 64)

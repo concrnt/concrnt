@@ -200,7 +200,13 @@ func (c *Client) healthCheckDomain(ctx context.Context, domain string) error {
 	return json.NewDecoder(resp.Body).Decode(&wkc)
 }
 
+// markOffline backs off from domain. This server's own domain is never
+// marked: a request to itself only times out under load, and backing off
+// would fail every local resource until the next health check.
 func (c *Client) markOffline(domain string) {
+	if domain == c.defaultResolver {
+		return
+	}
 	c.onlineMu.Lock()
 	defer c.onlineMu.Unlock()
 	if since, ok := c.plainHosts[domain]; ok && time.Since(since) < plainHostTTL {
@@ -211,6 +217,10 @@ func (c *Client) markOffline(domain string) {
 
 func (c *Client) markOfflineIfTimeout(domain string, action string, err error) {
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		if domain == c.defaultResolver {
+			slog.Warn("Request to this server timed out while "+action, "error", err)
+			return
+		}
 		slog.Warn("Mark domain "+domain+" as offline while "+action, "error", err)
 		c.markOffline(domain)
 	}
