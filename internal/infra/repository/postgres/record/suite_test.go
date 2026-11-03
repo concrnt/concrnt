@@ -17,7 +17,7 @@ func openBackend(t *testing.T) repotest.Backend {
 	t.Cleanup(cleanup)
 	cl, _ := repotest.PeerClient(t)
 	return repotest.Backend{
-		Record:       New(db, nil, domain.Config{}),
+		Record:       New(db, nil, domain.Config{}, 8),
 		EntityMeta:   postgres.NewEntityMetaRepository(db),
 		Server:       postgres.NewServerRepository(&domain.Config{FQDN: "local.example"}, db, cl),
 		Notification: postgres.NewNotificationRepository(db),

@@ -235,10 +235,21 @@ func main() {
 		db               *gorm.DB           // postgres only; the aggregate store's default home
 		spannerClient    *gspanner.Client   // spanner only; same role
 		firestoreClient  *gfirestore.Client // firestore only; same role
+		// logged as one line once the job queue is sized
+		concurrencySettings []any
 	)
 	switch conf.Backends.Database {
 	case "", "postgres":
-		pg, err := database.NewPostgres(conf.Backends.PostgresDsn)
+		pool, clamped := conf.Backends.Postgres.WithDefaults()
+		if clamped {
+			slog.Warn("backends.postgres: maxConcurrentTx lowered to half of maxOpenConns (a transaction's reads take a second connection)",
+				slog.Int("configuredMaxOpenConns", conf.Backends.Postgres.MaxOpenConns),
+				slog.Int("configuredMaxConcurrentTx", conf.Backends.Postgres.MaxConcurrentTx),
+				slog.Int("maxOpenConns", pool.MaxOpenConns),
+				slog.Int("maxConcurrentTx", pool.MaxConcurrentTx))
+		}
+		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", pool.MaxOpenConns), slog.Int("postgresMaxConcurrentTx", pool.MaxConcurrentTx))
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, pool.MaxOpenConns)
 		if err != nil {
 			panic("failed to connect database: " + err.Error())
 		}
@@ -256,7 +267,7 @@ func main() {
 
 		db = pg
 		databaseReady = sqlDB.PingContext
-		recordRepo = pgrecord.New(pg, cl, domainConfig)
+		recordRepo = pgrecord.New(pg, cl, domainConfig, pool.MaxConcurrentTx)
 		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
 		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
 		notificationRepo = postgres.NewNotificationRepository(pg)
@@ -394,7 +405,9 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog))
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	slog.Info("concurrency settings", append(concurrencySettings, slog.Int("jobQueueConsumers", jobQueueConcurrency))...)
+	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
 		service.GlobalParameters{

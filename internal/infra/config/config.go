@@ -95,6 +95,7 @@ type Backends struct {
 	// "spanner" or "firestore".
 	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
+	Postgres      Postgres  `yaml:"postgres"`
 	SQLite        SQLite    `yaml:"sqlite"`
 	Spanner       Spanner   `yaml:"spanner"`
 	Firestore     Firestore `yaml:"firestore"`
@@ -103,6 +104,58 @@ type Backends struct {
 	RedisDB       int       `yaml:"redisDB"`
 	MemcachedAddr string    `yaml:"memcachedAddr"`
 	Aggregate     Aggregate `yaml:"aggregate"`
+	JobQueue      JobQueue  `yaml:"jobqueue"`
+}
+
+// Postgres sizes the connection pool of one process.
+type Postgres struct {
+	// MaxOpenConns is the pool size (default 48).
+	MaxOpenConns int `yaml:"maxOpenConns"`
+	// MaxConcurrentTx caps the transactions running at once (default and
+	// upper bound maxOpenConns/2).
+	MaxConcurrentTx int `yaml:"maxConcurrentTx"`
+}
+
+const (
+	DefaultPostgresMaxOpenConns = 48
+	DefaultJobQueueConcurrency  = 16
+)
+
+// WithDefaults fills the unset values and caps MaxConcurrentTx at half the
+// pool: a transaction's reads take a second connection (CONTRACT.md C4), so
+// more transactions than that can leave every one waiting for a connection
+// another holds. clamped reports that a configured value was lowered.
+func (p Postgres) WithDefaults() (resolved Postgres, clamped bool) {
+	if p.MaxOpenConns <= 0 {
+		p.MaxOpenConns = DefaultPostgresMaxOpenConns
+	}
+	if p.MaxOpenConns < 2 {
+		p.MaxOpenConns = 2
+		clamped = true
+	}
+	limit := p.MaxOpenConns / 2
+	if p.MaxConcurrentTx <= 0 {
+		p.MaxConcurrentTx = limit
+	}
+	if p.MaxConcurrentTx > limit {
+		p.MaxConcurrentTx = limit
+		clamped = true
+	}
+	return p, clamped
+}
+
+// JobQueue configures the background job consumers of one process.
+type JobQueue struct {
+	// Concurrency is the number of consumer goroutines (default 16).
+	Concurrency int `yaml:"concurrency"`
+}
+
+// ConcurrencyOrDefault is Concurrency, or its default when unset.
+func (j JobQueue) ConcurrencyOrDefault() int {
+	if j.Concurrency <= 0 {
+		return DefaultJobQueueConcurrency
+	}
+	return j.Concurrency
 }
 
 // SQLite configures the sqlite record store.

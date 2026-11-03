@@ -14,10 +14,11 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
-
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections. Transactions hold
+// one connection while their reads take another (CONTRACT.md C4), so the
+// record repository must run at most maxOpenConns/2 of them at once
+// (config.Postgres.WithDefaults).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -50,13 +51,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// Transactions hold one connection each while the reads issued inside
-	// them take another one from this same pool (CONTRACT.md C4), so the
-	// pool must be larger than the number of transactions allowed to run at
-	// once (record.MaxConcurrentTx); otherwise MaxConcurrentTx concurrent
-	// commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 

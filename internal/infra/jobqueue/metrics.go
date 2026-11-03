@@ -47,6 +47,13 @@ var (
 		Buckets:   []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30},
 	}, []string{"type"})
 
+	consumers = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "concrnt",
+		Subsystem: "jobqueue",
+		Name:      "consumers",
+		Help:      "Consumer goroutines draining the queue on this replica.",
+	})
+
 	// the backlog lives in Redis and is shared by every replica, so each
 	// replica reports the same numbers; aggregate with max, not sum
 	backlog = promauto.NewGaugeVec(prometheus.GaugeOpts{

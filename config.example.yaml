@@ -34,6 +34,13 @@ backends:
   # and needs no database server; redis and memcached are still required.
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # postgres sizes the connection pool of each replica. replicas x
+  # maxOpenConns must stay under the server's max_connections. a
+  # transaction's reads take a second connection, so maxConcurrentTx is
+  # capped at maxOpenConns/2 (a larger value is lowered with a warning).
+  # postgres:
+  #   maxOpenConns: 48      # default 48
+  #   maxConcurrentTx: 24   # default maxOpenConns/2
   # sqlite:
   #   path: /var/lib/concrnt/concrnt.db
   # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),
@@ -67,6 +74,10 @@ backends:
   #   store: postgres
   #   ttl: 24h
   #   maxDeltas: 10000
+  # jobqueue runs the background jobs (federation delivery, realtime
+  # events); concurrency is the consumer goroutines per replica.
+  # jobqueue:
+  #   concurrency: 16       # default 16
 
 observability:
   enableTrace: true

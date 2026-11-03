@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
@@ -21,10 +23,18 @@ type Repository struct {
 	db     *gorm.DB
 	client *client.Client
 	config domain.Config
+	// txSlots caps the transactions running at once. A transaction pins one
+	// pooled connection and the reads fn issues take a second one (C4:
+	// reads return committed state), so the cap must stay at half the pool
+	// or every transaction can wait for a connection another one holds.
+	txSlots chan struct{}
 }
 
-func New(db *gorm.DB, cl *client.Client, config domain.Config) ucrecord.Repository {
-	return &Repository{db: db, client: cl, config: config}
+// New builds the repository over db, whose pool must hold at least
+// 2*maxConcurrentTx connections.
+func New(db *gorm.DB, cl *client.Client, config domain.Config, maxConcurrentTx int) ucrecord.Repository {
+	txSlotCapacity.Set(float64(maxConcurrentTx))
+	return &Repository{db: db, client: cl, config: config, txSlots: make(chan struct{}, maxConcurrentTx)}
 }
 
 var tracer = otel.Tracer("repository")
@@ -39,17 +49,29 @@ const (
 	txMaxAttempts  = 8
 	txBackoffStart = 10 * time.Millisecond
 	txBackoffMax   = 500 * time.Millisecond
-
-	// MaxConcurrentTx caps the transactions one process runs at once. A
-	// transaction pins one pooled connection and the reads fn issues take
-	// a second one from the same pool (C4: reads return committed state),
-	// so with MaxConcurrentTx >= pool size every transaction can be left
-	// waiting for a connection another transaction holds. Half the pool
-	// (database.MaxOpenConns) keeps one free connection per transaction.
-	MaxConcurrentTx = 8
 )
 
-var txSlots = make(chan struct{}, MaxConcurrentTx)
+var (
+	txSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+		Namespace: "concrnt",
+		Subsystem: "record",
+		Name:      "tx_slot_wait_seconds",
+		Help:      "Time a transaction waited for one of the maxConcurrentTx slots.",
+		Buckets:   []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+	})
+	txSlotsInUse = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "concrnt",
+		Subsystem: "record",
+		Name:      "tx_slots_in_use",
+		Help:      "Transactions currently holding a slot.",
+	})
+	txSlotCapacity = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "concrnt",
+		Subsystem: "record",
+		Name:      "tx_slots",
+		Help:      "Configured maxConcurrentTx.",
+	})
+)
 
 // isRetryableTxError reports serialization_failure / deadlock_detected, the
 // two outcomes Postgres asks the client to retry from scratch.
@@ -59,9 +81,15 @@ func isRetryableTxError(err error) bool {
 }
 
 func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.RepositoryTx) error) error {
+	waitStart := time.Now()
 	select {
-	case txSlots <- struct{}{}:
-		defer func() { <-txSlots }()
+	case r.txSlots <- struct{}{}:
+		txSlotWait.Observe(time.Since(waitStart).Seconds())
+		txSlotsInUse.Inc()
+		defer func() {
+			txSlotsInUse.Dec()
+			<-r.txSlots
+		}()
 	case <-ctx.Done():
 		return ctx.Err()
 	}

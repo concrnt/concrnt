@@ -19,7 +19,7 @@ import (
 func TestRunInTxRetriesDeadlock(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	defer cleanup()
-	repo := New(db, nil, domain.Config{})
+	repo := New(db, nil, domain.Config{}, 8)
 	ctx := context.Background()
 
 	for _, uri := range []string{"cckv://con1dead/a", "cckv://con1dead/b"} {
