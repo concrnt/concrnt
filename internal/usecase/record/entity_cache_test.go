@@ -214,11 +214,48 @@ func TestEntityCommitInvalidatesSharedCache(t *testing.T) {
 	if _, err := writer.Commit(ctx, "127.0.0.1", entityDocAt(t, party, moved, storedAt.Add(time.Minute)), domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
+	if entity, err := writer.GetEntity(ctx, uri); err != nil || entity.Domain != moved {
+		t.Fatalf("the committing replica still serves %+v, %v", entity, err)
+	}
+	// the other replica keeps its in-process copy for entityLocalTTL
+	if entity, err := reader.GetEntity(ctx, uri); err != nil || entity.Domain != remoteEntityHost {
+		t.Fatalf("the reading replica's local copy = %+v, %v", entity, err)
+	}
+	reader.cache.Flush()
 	entity, err := reader.GetEntity(ctx, uri)
 	if err != nil {
 		t.Fatalf("GetEntity: %v", err)
 	}
 	if entity.Domain != moved {
 		t.Fatalf("domain after the entity commit = %q, want %q", entity.Domain, moved)
+	}
+}
+
+// The in-process copy answers repeated lookups without memcached.
+func TestGetEntityLocalCopySkipsSharedCache(t *testing.T) {
+	cfg := &domain.Config{FQDN: "example.com"}
+	party := newAckParty(t, remoteEntityHost)
+	repo := newEntityStoreRepo()
+	cache := newFakeEntityCache()
+	uc := newEntityCacheUsecase(cfg, repo, cache)
+	ctx := context.Background()
+	uri := concrnt.CCURI{Scheme: "cckv", Owner: party.ccid}.String()
+
+	if _, err := uc.Commit(ctx, "127.0.0.1", entityDocAt(t, party, remoteEntityHost, time.Now().Add(-time.Hour).UTC().Truncate(time.Second)), domain.CommitModeExecute); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if _, err := uc.GetEntity(ctx, uri); err != nil {
+		t.Fatalf("GetEntity: %v", err)
+	}
+	if err := cache.Delete(entityCacheKey(party.ccid)); err != nil {
+		t.Fatalf("the lookup did not populate the shared cache: %v", err)
+	}
+	lookups := repo.lookupCount()
+	entity, err := uc.GetEntity(ctx, uri)
+	if err != nil {
+		t.Fatalf("GetEntity: %v", err)
+	}
+	if entity.Domain != remoteEntityHost || repo.lookupCount() != lookups || len(cache.items) != 0 {
+		t.Fatalf("the second lookup left the process: %+v, lookups %d -> %d, shared %v", entity, lookups, repo.lookupCount(), cache.items)
 	}
 }

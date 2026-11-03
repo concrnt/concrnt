@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
@@ -30,6 +31,11 @@ const (
 	bodyCacheTTL     = 60 * 60 * 24 * 2 // 2 days
 	removedCacheTTL  = 60 * 60 * 24 * 2 // 2 days, matches the origin's advertisement window
 	removedFreshTTL  = 60               // throttles origin refresh to ~1/min/timeline
+
+	// manifestLocalTTL is the in-process copy of a manifest in front of
+	// memcached; a manifest only ever gains a FirstChunk, so a stale copy
+	// costs nothing but an extra "before first chunk" miss
+	manifestLocalTTL = 5 * time.Second
 )
 
 // purgeReplayDelay must exceed the workers' aggregate-subscription cache TTL
@@ -58,10 +64,11 @@ func NewChunklineGateway(
 	pubsub worker.PubSub,
 ) *ChunklineGateway {
 	r := &resolver{
-		client: cl,
-		mc:     mc,
-		demand: demand,
-		pubsub: pubsub,
+		client:    cl,
+		mc:        mc,
+		demand:    demand,
+		pubsub:    pubsub,
+		manifests: cache.New(manifestLocalTTL, time.Minute),
 	}
 	return &ChunklineGateway{
 		resolver: chunkline.NewClient(r),
@@ -112,6 +119,25 @@ type resolver struct {
 	open   OpenSubscriptions // set by StartWorker on the leader; nil elsewhere
 	fqdn   string
 	local  *ucchunkline.Usecase // nil: every timeline goes over HTTP
+
+	manifests *cache.Cache // nil in tests that build the resolver by hand
+}
+
+func (r *resolver) localManifest(timeline string) (chunkline.Manifest, bool) {
+	if r.manifests == nil {
+		return chunkline.Manifest{}, false
+	}
+	x, found := r.manifests.Get(manifestCacheKey(timeline))
+	if !found {
+		return chunkline.Manifest{}, false
+	}
+	return x.(chunkline.Manifest), true
+}
+
+func (r *resolver) keepManifest(timeline string, manifest chunkline.Manifest) {
+	if r.manifests != nil {
+		r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
+	}
 }
 
 func (r *resolver) fetchManifest(ctx context.Context, timeline string) (chunkline.Manifest, error) {
@@ -173,6 +199,10 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 	ctx, span := tracer.Start(ctx, "ChunklineResolver.resolveTimeline")
 	defer span.End()
 
+	if manifest, found := r.localManifest(timeline); found {
+		return manifest, nil
+	}
+
 	cacheKey := manifestCacheKey(timeline)
 	item, err := r.mc.Get(cacheKey)
 	if err == nil {
@@ -184,6 +214,7 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 			// ChunkSize <= 0 means an invalid manifest cached before this
 			// validation existed — treat it as a miss so it can't reach a
 			// Time2Chunk division (the 7-day TTL is too long to wait out)
+			r.keepManifest(timeline, manifest)
 			return manifest, nil
 		}
 	} else if !errors.Is(err, memcache.ErrCacheMiss) {
@@ -206,6 +237,7 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 		span.RecordError(err)
 		return chunkline.Manifest{}, err
 	}
+	r.keepManifest(timeline, manifest)
 
 	bytes, err := json.Marshal(manifest)
 	if err != nil {
@@ -229,22 +261,32 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 	ctx, span := tracer.Start(ctx, "ChunklineResolver.ResolveTimelines")
 	defer span.End()
 
-	keys := make([]string, len(timelines))
-	for i, tl := range timelines {
-		keys[i] = manifestCacheKey(tl)
-	}
-
-	cacheItems, err := r.mc.GetMulti(keys)
-	if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
-		span.RecordError(fmt.Errorf("failed to get manifests from cache: %w", err))
-	}
-
 	result := make(map[string]chunkline.Manifest)
+	keys := make([]string, 0, len(timelines))
+	for _, tl := range timelines {
+		if manifest, found := r.localManifest(tl); found {
+			result[tl] = manifest
+			continue
+		}
+		keys = append(keys, manifestCacheKey(tl))
+	}
+
+	var cacheItems map[string]*memcache.Item
+	if len(keys) > 0 {
+		var err error
+		cacheItems, err = r.mc.GetMulti(keys)
+		if err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+			span.RecordError(fmt.Errorf("failed to get manifests from cache: %w", err))
+		}
+	}
+
 	remaining := []string{}
 
-	for i, tl := range timelines {
-		cacheKey := keys[i]
-		if item, found := cacheItems[cacheKey]; found {
+	for _, tl := range timelines {
+		if _, done := result[tl]; done {
+			continue
+		}
+		if item, found := cacheItems[manifestCacheKey(tl)]; found {
 			var manifest chunkline.Manifest
 			err := json.Unmarshal(item.Value, &manifest)
 			if err != nil {
@@ -259,6 +301,7 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 				continue
 			}
 			result[tl] = manifest
+			r.keepManifest(tl, manifest)
 		} else {
 			remaining = append(remaining, tl)
 		}
@@ -278,6 +321,7 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 			continue
 		}
 		result[tl] = manifest
+		r.keepManifest(tl, manifest)
 
 		bytes, err := json.Marshal(manifest)
 		if err != nil {

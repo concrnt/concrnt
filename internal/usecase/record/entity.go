@@ -107,6 +107,7 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 
 	return &commitApplyResult{result: &sd, postProcesses: []PostProcessAction{
 		func(ctx context.Context) error {
+			uc.cache.Delete(entityCacheKey(entity.Author))
 			if uc.entityCache == nil {
 				return nil
 			}
@@ -223,10 +224,15 @@ type EntityCache interface {
 // stays invisible.
 const entityCacheTTL = 60
 
+// entityLocalTTL is the in-process copy in front of memcached: a session
+// authenticates with the same entity on every request, and a commit on
+// another replica reaches this one after at most this long.
+const entityLocalTTL = 5 * time.Second
+
 var entityCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "concrnt",
 	Name:      "entity_cache_requests_total",
-	Help:      "Entity lookups by ccid against the entity cache, by result (hit, miss, error: the cache was unreachable).",
+	Help:      "Entity lookups by ccid against the entity cache, by result (local: the in-process copy, hit, miss, error: the cache was unreachable).",
 }, []string{"result"})
 
 // SetEntityCache caches the entity lookups by ccid in c.
@@ -252,6 +258,12 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 		return uc.repo.GetEntityByCCID(ctx, ccid)
 	}
 
+	if x, found := uc.cache.Get(entityCacheKey(ccid)); found {
+		entityCacheRequests.WithLabelValues("local").Inc()
+		entity := x.(domain.Entity)
+		return &entity, nil
+	}
+
 	result := "miss"
 	item, err := uc.entityCache.Get(entityCacheKey(ccid))
 	if err == nil {
@@ -259,6 +271,7 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 		if json.Unmarshal(item.Value, &cached) == nil {
 			entityCacheRequests.WithLabelValues("hit").Inc()
 			cached.Entity.SignedDocument = cached.SignedDocument
+			uc.cache.Set(entityCacheKey(ccid), cached.Entity, entityLocalTTL)
 			return &cached.Entity, nil
 		}
 	} else if !errors.Is(err, memcache.ErrCacheMiss) {
@@ -270,6 +283,7 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 	if err != nil {
 		return nil, err
 	}
+	uc.cache.Set(entityCacheKey(ccid), *entity, entityLocalTTL)
 	value, err := json.Marshal(cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument})
 	if err == nil && result == "miss" {
 		_ = uc.entityCache.Set(&memcache.Item{Key: entityCacheKey(ccid), Value: value, Expiration: entityCacheTTL})

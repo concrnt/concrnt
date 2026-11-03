@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
@@ -604,5 +605,29 @@ func TestQueryDescendingLocalTimelineSkipsHTTP(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := httpRequests.Load(); n != 0 {
 		t.Fatalf("%d HTTP requests reached this server's own API", n)
+	}
+}
+
+// A manifest read once is answered from the in-process copy afterwards,
+// so timeline queries do not pay a memcached round trip per request.
+func TestResolveTimelinesLocalCopySkipsMemcached(t *testing.T) {
+	r, manifest := newTestResolver(t)
+	r.manifests = cache.New(manifestLocalTTL, time.Minute)
+	ctx := context.Background()
+
+	got, err := r.ResolveTimelines(ctx, []string{testTimeline})
+	if err != nil || got[testTimeline].ChunkSize != manifest.ChunkSize {
+		t.Fatalf("ResolveTimelines = %+v, %v", got, err)
+	}
+	if err := r.mc.Delete(manifestCacheKey(testTimeline)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.ResolveTimelines(ctx, []string{testTimeline})
+	if err != nil || got[testTimeline].ChunkSize != manifest.ChunkSize {
+		t.Fatalf("second ResolveTimelines = %+v, %v (memcached entry deleted)", got, err)
+	}
+	single, err := r.resolveTimeline(ctx, testTimeline)
+	if err != nil || single.ChunkSize != manifest.ChunkSize {
+		t.Fatalf("resolveTimeline = %+v, %v", single, err)
 	}
 }
