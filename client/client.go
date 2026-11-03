@@ -38,16 +38,28 @@ const (
 )
 
 type Client struct {
-	client     *http.Client
-	cache      *cache.Cache
-	lastFailed map[string]time.Time
-	failCount  map[string]int
+	client          *http.Client
+	cache           *cache.Cache
+	lastFailed      map[string]time.Time
+	failCount       map[string]int
 	plainHosts      map[string]time.Time
 	onlineMu        sync.RWMutex
 	userAgent       string
 	defaultResolver string
 	remappings      map[string]*url.URL
 	transport       http.RoundTripper
+	localResolver   LocalResolver
+}
+
+// LocalResolver answers a cckv URI from the store of the server this client
+// runs in: the signed document and true when the owner lives on this server,
+// false when the URI has to be fetched over HTTP. It lets a server read its
+// own documents (the auth middleware's subkey documents, routing lookups)
+// without calling its own resolve endpoint.
+type LocalResolver func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error)
+
+func (c *Client) SetLocalResolver(fn LocalResolver) {
+	c.localResolver = fn
 }
 
 func New(defaultResolver string) *Client {
@@ -565,6 +577,32 @@ func (c *Client) GetResource(ctx context.Context, uri string, accept string, opt
 		err := errors.Join(fmt.Errorf("invalid cc uri %s", uri), err)
 		span.RecordError(err)
 		return err
+	}
+
+	// a routing hint other than this server means the caller wants that
+	// server's copy (e.g. the entity recheck by hint), not the local one
+	if c.localResolver != nil && parsed.Scheme == "cckv" && accept == "application/json" && (opts.Resolver == "" || opts.Resolver == c.defaultResolver) {
+		sd, found, err := c.localResolver(ctx, uri)
+		if err != nil {
+			span.RecordError(fmt.Errorf("local resolver for %s: %w", uri, err))
+		}
+		if found && err == nil {
+			localResolves.WithLabelValues("hit").Inc()
+			bytes, err := json.Marshal(sd)
+			if err != nil {
+				span.RecordError(err)
+				return err
+			}
+			if err := json.Unmarshal(bytes, &result); err != nil {
+				span.RecordError(err)
+				return err
+			}
+			if !opts.NoCache {
+				c.cache.Set(cacheKey, bytes, cache.DefaultExpiration)
+			}
+			return nil
+		}
+		localResolves.WithLabelValues("miss").Inc()
 	}
 
 	endpoint := uri

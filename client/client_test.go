@@ -1146,3 +1146,59 @@ func TestHealthCheckKeepsServerErrorOffline(t *testing.T) {
 		t.Fatal("health check must fail on a 5xx well-known")
 	}
 }
+
+// A LocalResolver answers cckv fetches from the server's own store; only
+// a routing hint to another server, or a miss, goes over HTTP.
+func TestLocalResolverSkipsHTTP(t *testing.T) {
+	const domain = "self.example.test"
+	ccid, priv := newTestIdentity(t)
+	local := newSignedRecord(t, ccid, priv, "cckv://"+ccid+"/local", "local")
+	remote := newSignedRecord(t, ccid, priv, "cckv://"+ccid+"/remote", "remote")
+
+	var served atomic.Int32
+	cl := newResolveTestServer(t, domain, map[string]concrnt.SignedDocument{
+		"cckv://" + ccid + "/local":  remote, // the local copy must win
+		"cckv://" + ccid + "/remote": remote,
+	})
+	var asked atomic.Int32
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		asked.Add(1)
+		if uri == "cckv://"+ccid+"/local" {
+			return local, true, nil
+		}
+		return concrnt.SignedDocument{}, false, nil
+	})
+	inner := cl.transport
+	cl.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		served.Add(1)
+		return inner.RoundTrip(r)
+	})
+
+	var got concrnt.Document[testRecordValue]
+	if err := cl.GetRecord(context.Background(), "cckv://"+ccid+"/local", nil, &got); err != nil {
+		t.Fatalf("GetRecord local: %v", err)
+	}
+	if got.Value.Foo != "local" || served.Load() != 0 {
+		t.Fatalf("local document = %+v after %d HTTP requests, want local and 0", got, served.Load())
+	}
+
+	// a hint naming this server still consults the local store first
+	if err := cl.GetRecord(context.Background(), "cckv://"+ccid+"/remote", &Options{Resolver: domain}, &got); err != nil {
+		t.Fatalf("GetRecord remote: %v", err)
+	}
+	if got.Value.Foo != "remote" || served.Load() == 0 {
+		t.Fatalf("a miss did not fall back to HTTP: %+v, %d requests", got, served.Load())
+	}
+
+	before := asked.Load()
+	cl.cache.Flush()
+	cl.AddHostRemapping("other.example.test", "http://127.0.0.1:1")
+	_ = cl.GetRecord(context.Background(), "cckv://"+ccid+"/local", &Options{Resolver: "other.example.test"}, &got)
+	if asked.Load() != before {
+		t.Fatal("a routing hint to another server was answered locally")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

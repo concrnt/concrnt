@@ -42,6 +42,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/infra/cluster"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
@@ -421,6 +422,23 @@ func main() {
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
 	recordUC.SetEntityCache(mc)
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		entity, err := recordUC.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
+		if err != nil || entity.Domain != domainConfig.FQDN {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		// the resolve endpoint this replaces answers without a requester
+		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if err != nil {
+			// redirects (reference records) and denied reads keep the HTTP path
+			return concrnt.SignedDocument{}, false, nil
+		}
+		return *sd, true, nil
+	})
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := recordRepo
