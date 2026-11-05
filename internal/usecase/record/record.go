@@ -169,6 +169,8 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 	if freshKey {
 		postProcesses = append(postProcesses, uc.associationCountsSeededEmpty(parsed.Key))
+	} else {
+		postProcesses = append(postProcesses, uc.documentCacheInvalidated(&parsed.Key, existingSD.CCFS))
 	}
 
 	if mode == domain.CommitModeExecute {

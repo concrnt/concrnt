@@ -281,6 +281,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 		var removedTimeline, removedItemID string
 
 		if authoritative {
+			postProcesses = append(postProcesses, uc.documentCacheInvalidated(&targetURI, targetSD.CCKV, targetSD.CCFS))
 			switch targetDoc.Kind {
 			case "record":
 
@@ -479,7 +480,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				span.RecordError(err)
 				return nil, false, false, err
 			}
-			postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(refKey))
+			postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
