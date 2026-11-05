@@ -30,13 +30,13 @@ var (
 	}, []string{"host"})
 )
 
-// localResolves counts the cckv fetches the LocalResolver answered (hit)
-// or passed on to HTTP (miss).
+// localResolves counts the cckv fetches the LocalResolver answered (hit),
+// settled as absent (notfound) or passed on to HTTP (miss).
 var localResolves = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "concrnt",
 	Subsystem: "peer",
 	Name:      "local_resolves_total",
-	Help:      "cckv document fetches answered by this server's own store (hit) or sent over HTTP (miss).",
+	Help:      "cckv document fetches answered by this server's own store (hit), settled as absent by it (notfound) or sent over HTTP (miss).",
 }, []string{"result"})
 
 func observePeerRequest(host string, code int, err error, seconds float64) {

@@ -1199,6 +1199,42 @@ func TestLocalResolverSkipsHTTP(t *testing.T) {
 	}
 }
 
+// When the LocalResolver says this server is the authority and has no such
+// document, the fetch is settled as not found without an HTTP request: the
+// request would reach this same server and 404 (a new user's subkey before
+// its enact).
+func TestLocalResolverNotFoundSkipsHTTP(t *testing.T) {
+	const domain = "self.example.test"
+	ccid, priv := newTestIdentity(t)
+	remote := newSignedRecord(t, ccid, priv, "cckv://"+ccid+"/missing", "remote")
+
+	var served atomic.Int32
+	cl := newResolveTestServer(t, domain, map[string]concrnt.SignedDocument{
+		"cckv://" + ccid + "/missing": remote,
+	})
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		return concrnt.SignedDocument{}, false, ErrNotFound
+	})
+	inner := cl.transport
+	cl.transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		served.Add(1)
+		return inner.RoundTrip(r)
+	})
+
+	var got concrnt.Document[testRecordValue]
+	err := cl.GetRecord(context.Background(), "cckv://"+ccid+"/missing", nil, &got)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRecord = %v, want ErrNotFound", err)
+	}
+	if served.Load() != 0 {
+		t.Fatalf("%d HTTP requests were made for a locally settled not-found", served.Load())
+	}
+	// not cached: the document may be committed right after
+	if _, found := cl.cache.Get("resource:cckv://" + ccid + "/missing:application/json"); found {
+		t.Fatal("a not-found must not be cached")
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

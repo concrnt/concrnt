@@ -15,6 +15,7 @@ import (
 
 	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
+	"github.com/concrnt/concrnt/internal/domain"
 	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
@@ -436,6 +437,11 @@ func main() {
 		}
 		// the resolve endpoint this replaces answers without a requester
 		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if errors.Is(err, domain.ErrNotFound) {
+			// this server is the owner's home: the HTTP path would ask this
+			// same server and 404 (a new user's subkey before its enact)
+			return concrnt.SignedDocument{}, false, client.ErrNotFound
+		}
 		if err != nil {
 			// redirects (reference records) and denied reads keep the HTTP path
 			return concrnt.SignedDocument{}, false, nil
