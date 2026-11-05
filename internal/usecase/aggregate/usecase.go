@@ -138,10 +138,14 @@ func (uc *Usecase) Invalidate(ctx context.Context, name, target string) error {
 	return uc.store.Invalidate(ctx, Key(name, target))
 }
 
-// InvalidateAll drops every entry under prefix: "" for all of them,
-// Key(name, "") for one definition, Key(name, targetPrefix) for a family.
-func (uc *Usecase) InvalidateAll(ctx context.Context, prefix string) error {
-	return uc.store.InvalidateAll(ctx, prefix)
+// InvalidateDefinition drops every entry of definition name.
+func (uc *Usecase) InvalidateDefinition(ctx context.Context, name string) error {
+	return uc.store.InvalidateDefinition(ctx, name)
+}
+
+// InvalidateAll drops every entry.
+func (uc *Usecase) InvalidateAll(ctx context.Context) error {
+	return uc.store.InvalidateAll(ctx)
 }
 
 // Cached returns the stored value for target without computing it; false

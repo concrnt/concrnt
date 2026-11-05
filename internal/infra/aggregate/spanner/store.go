@@ -126,9 +126,17 @@ func (s *Store) Invalidate(ctx context.Context, key string) error {
 	return err
 }
 
-// InvalidateAll deletes by key prefix in batches, so a full invalidation
-// of a large table stays under the mutation limit of one commit.
-func (s *Store) InvalidateAll(ctx context.Context, prefix string) error {
+func (s *Store) InvalidateDefinition(ctx context.Context, name string) error {
+	return s.deleteMatching(ctx, aggregate.Key(name, ""))
+}
+
+func (s *Store) InvalidateAll(ctx context.Context) error {
+	return s.deleteMatching(ctx, "")
+}
+
+// deleteMatching deletes the keys starting with prefix in batches, so
+// dropping a large table stays under the mutation limit of one commit.
+func (s *Store) deleteMatching(ctx context.Context, prefix string) error {
 	for {
 		var keys []string
 		it := s.client.Single().Query(ctx, spanner.Statement{

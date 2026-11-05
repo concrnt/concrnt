@@ -8,6 +8,7 @@ package aggregate
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -38,14 +39,22 @@ type Store interface {
 	Apply(ctx context.Context, key string, fn func(old []byte) ([]byte, error)) (*Entry, bool, error)
 	// Invalidate drops the entry under key; a missing entry is fine.
 	Invalidate(ctx context.Context, key string) error
-	// InvalidateAll drops every entry whose key starts with prefix ("" drops
-	// everything). Key prefixes are a definition name followed by ":", so
-	// a whole definition, or one target's family of entries, can be dropped
-	// at once.
-	InvalidateAll(ctx context.Context, prefix string) error
+	// InvalidateDefinition drops every entry of definition name (every key
+	// Key(name, ...) built).
+	InvalidateDefinition(ctx context.Context, name string) error
+	// InvalidateAll drops every entry.
+	InvalidateAll(ctx context.Context) error
 }
 
-// Key is the store key of a definition's entry for target.
+// Key is the store key of a definition's entry for target: the name, ":"
+// and the target. A name contains no ":", so a store can tell the
+// definition of a key by cutting it at the first one (NameOf).
 func Key(name, target string) string {
 	return name + ":" + target
+}
+
+// NameOf is the definition name of a key Key built.
+func NameOf(key string) string {
+	name, _, _ := strings.Cut(key, ":")
+	return name
 }

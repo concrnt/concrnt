@@ -204,7 +204,7 @@ func dropAggregatesAfterGc(ctx context.Context, op *operationContext, deleted in
 	if deleted == 0 {
 		return nil
 	}
-	if err := op.Aggregate.InvalidateAll(ctx, ""); err != nil {
+	if err := op.Aggregate.InvalidateAll(ctx); err != nil {
 		return fmt.Errorf("failed to drop the aggregate caches: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "dropped the aggregate caches; counts rebuild on their next read\n")

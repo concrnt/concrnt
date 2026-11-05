@@ -24,7 +24,7 @@ func TestMemcachedStore(t *testing.T) {
 	open := func(t *testing.T) aggregate.Store {
 		return memcached.New(mc, "t"+strconv.FormatInt(n.Add(1), 10)+":")
 	}
-	storetest.Run(t, open, storetest.DefinitionPrefixesOnly())
+	storetest.Run(t, open)
 
 	// a store that dropped everything is seen by another store (another
 	// process) once its generation cache has been refreshed; a fresh store
@@ -36,7 +36,7 @@ func TestMemcachedStore(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, won)
 
-		require.NoError(t, memcached.New(mc, "shared:").InvalidateAll(ctx, "counts:"))
+		require.NoError(t, memcached.New(mc, "shared:").InvalidateDefinition(ctx, "counts"))
 
 		_, ok, err := memcached.New(mc, "shared:").Get(ctx, "counts:x")
 		require.NoError(t, err)

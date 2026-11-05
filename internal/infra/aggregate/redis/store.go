@@ -1,6 +1,6 @@
 // Package redis keeps aggregate entries as volatile Redis strings; Apply is
-// an optimistic WATCH / MULTI loop. The Firestore store follows the
-// same shape: a transaction for Apply, a key-range query for InvalidateAll.
+// an optimistic WATCH / MULTI loop, InvalidateDefinition / InvalidateAll a
+// SCAN over the key pattern.
 package redis
 
 import (
@@ -122,8 +122,15 @@ func (s *Store) Invalidate(ctx context.Context, key string) error {
 
 var globEscaper = strings.NewReplacer(`\`, `\\`, `*`, `\*`, `?`, `\?`, `[`, `\[`, `]`, `\]`)
 
-func (s *Store) InvalidateAll(ctx context.Context, prefix string) error {
-	pattern := globEscaper.Replace(keyPrefix+prefix) + "*"
+func (s *Store) InvalidateDefinition(ctx context.Context, name string) error {
+	return s.unlinkMatching(ctx, globEscaper.Replace(keyPrefix+aggregate.Key(name, ""))+"*")
+}
+
+func (s *Store) InvalidateAll(ctx context.Context) error {
+	return s.unlinkMatching(ctx, globEscaper.Replace(keyPrefix)+"*")
+}
+
+func (s *Store) unlinkMatching(ctx context.Context, pattern string) error {
 	var cursor uint64
 	for {
 		keys, next, err := s.rdb.Scan(ctx, cursor, pattern, scanBatchCount).Result()

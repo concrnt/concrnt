@@ -52,7 +52,7 @@ aggregate-verify reports drift.`,
 		ctx := cmd.Context()
 		switch {
 		case aggregateInvalidateAll:
-			if err := op.Aggregate.InvalidateAll(ctx, ""); err != nil {
+			if err := op.Aggregate.InvalidateAll(ctx); err != nil {
 				return err
 			}
 			fmt.Fprintln(os.Stderr, "dropped every cached count")
@@ -62,7 +62,7 @@ aggregate-verify reports drift.`,
 			}
 			fmt.Fprintf(os.Stderr, "dropped %s for %s\n", aggregateInvalidateDef, aggregateInvalidateTarget)
 		case aggregateInvalidateDef != "":
-			if err := op.Aggregate.InvalidateAll(ctx, aggregateInvalidateDef+":"); err != nil {
+			if err := op.Aggregate.InvalidateDefinition(ctx, aggregateInvalidateDef); err != nil {
 				return err
 			}
 			fmt.Fprintf(os.Stderr, "dropped every %s entry\n", aggregateInvalidateDef)

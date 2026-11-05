@@ -1,17 +1,14 @@
 // Package memcached keeps aggregate entries in memcached. Apply is a gets /
 // cas loop, like the WATCH / MULTI loop of the Redis store.
 //
-// memcached cannot list its keys, so InvalidateAll works through generation
-// numbers instead of deleting: every stored key embeds the current
-// generation of the whole store and of its definition, and InvalidateAll
-// moves one of them on, which leaves the old entries unreachable until they
-// expire or are evicted. Only the prefixes "" (everything) and "<name>:"
-// (one definition) can be dropped this way; the commit path only ever drops
-// single entries, whole definitions are an operator's action.
+// memcached cannot list its keys, so InvalidateDefinition and InvalidateAll
+// work through generation numbers instead of deleting: every stored key
+// embeds the current generation of the whole store and of its definition,
+// and dropping moves one of them on, which leaves the old entries
+// unreachable until they expire or are evicted.
 //
-// Each process reads the generations at most every genCacheTTL, so after an
-// InvalidateAll other processes keep serving the old entries for up to that
-// long. A generation key that is evicted comes back with a new value, which
+// Each process reads the generations at most every genCacheTTL, so after a
+// drop other processes keep serving the old entries for up to that long. A generation key that is evicted comes back with a new value, which
 // drops its entries too: the store only errs towards recomputing.
 package memcached
 
@@ -24,7 +21,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -112,15 +108,9 @@ func (s *Store) globalGenKey() string { return s.genKey("") }
 
 func (s *Store) defGenKey(name string) string { return s.genKey("def:" + name) }
 
-// definition is the definition name a key belongs to (Key builds name:target).
-func definition(key string) string {
-	name, _, _ := strings.Cut(key, ":")
-	return name
-}
-
 // itemKey is where key is stored under the current generations.
 func (s *Store) itemKey(key string) (string, error) {
-	gk, dk := s.globalGenKey(), s.defGenKey(definition(key))
+	gk, dk := s.globalGenKey(), s.defGenKey(aggregate.NameOf(key))
 	gens, err := s.generations(gk, dk)
 	if err != nil {
 		return "", err
@@ -330,18 +320,15 @@ func (s *Store) Invalidate(_ context.Context, key string) error {
 	return nil
 }
 
-// InvalidateAll moves the generation of everything ("") or of one
-// definition ("<name>:") on; any other prefix is an error.
-func (s *Store) InvalidateAll(_ context.Context, prefix string) error {
-	var gk string
-	switch {
-	case prefix == "":
-		gk = s.globalGenKey()
-	case strings.Index(prefix, ":") == len(prefix)-1:
-		gk = s.defGenKey(strings.TrimSuffix(prefix, ":"))
-	default:
-		return fmt.Errorf("aggregate memcached: cannot drop the entries under %q, only everything (\"\") or one definition (\"<name>:\")", prefix)
-	}
+func (s *Store) InvalidateDefinition(_ context.Context, name string) error {
+	return s.moveGeneration(s.defGenKey(name))
+}
+
+func (s *Store) InvalidateAll(_ context.Context) error {
+	return s.moveGeneration(s.globalGenKey())
+}
+
+func (s *Store) moveGeneration(gk string) error {
 	if err := s.mc.Set(&memcache.Item{Key: gk, Value: []byte(newGeneration())}); err != nil {
 		return fmt.Errorf("aggregate memcached: move generation: %w", err)
 	}

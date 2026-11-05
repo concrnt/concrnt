@@ -314,15 +314,3 @@ func (uc *Usecase) InvalidateAggregate(ctx context.Context, ref AggregateRef) er
 	}
 	return uc.agg.Invalidate(ctx, ref.Name, ref.Target)
 }
-
-// InvalidateAggregates drops every entry of definition name, or every entry
-// when name is "".
-func (uc *Usecase) InvalidateAggregates(ctx context.Context, name string) error {
-	if uc.agg == nil {
-		return nil
-	}
-	if name == "" {
-		return uc.agg.InvalidateAll(ctx, "")
-	}
-	return uc.agg.InvalidateAll(ctx, aggregate.Key(name, ""))
-}
