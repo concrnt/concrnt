@@ -43,6 +43,21 @@ var migrations = []migration{
 		}
 		return nil
 	}},
+	// acks are read by from and ackeds by to (CONTRACT.md eq(from ∨ to)):
+	// the other side's indexes and the schema ones were never scanned, and
+	// the gc flag index is rebuilt by AutoMigrate as a partial index
+	{5, "drop_unused_ack_indexes_and_partial_gc_index", func(tx *gorm.DB) error {
+		for _, name := range []string{
+			"idx_acks_to_valid_created_at", "idx_acks_schema_valid_created_at",
+			"idx_acked_from_valid_created_at", "idx_acked_schema_valid_created_at",
+			"idx_commit_logs_gc_candidate",
+		} {
+			if err := tx.Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // AutoMigrateTables creates or extends every table from its model: tables,

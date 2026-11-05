@@ -51,8 +51,9 @@ type migration struct {
 //     (target_uri, schema, variant, created_at) for the filtered variants;
 //     UNIQUE (unique_key) idempotent association writes.
 //   - acks / ackeds: PK (id) interleaved; UNIQUE (from_ccid, to_ccid, schema)
-//     the accept-if-newer state key; (from_ccid|to_ccid|schema, valid,
-//     created_at) the list and count lookups.
+//     the accept-if-newer state key; acks (from_ccid, valid, created_at) and
+//     ackeds (to_ccid, valid, created_at) the list and count lookups (acks
+//     are read by from, ackeds by to; schema only narrows).
 //   - entities: PK (ccid); (alias) GetEntityByAlias.
 //   - entity_meta: PK (ccid). servers: PK (fqdn); (cs_id). subscriptions:
 //     PK (vendor_id, owner). abuse_reports: PK (id). aggregate_entries:
@@ -127,8 +128,6 @@ var migrations = []migration{
 		) PRIMARY KEY (id), INTERLEAVE IN PARENT commit_logs ON DELETE CASCADE`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_ack_from_to_schema ON acks (from_ccid, to_ccid, schema)`,
 		`CREATE INDEX IF NOT EXISTS idx_acks_from_valid_created_at ON acks (from_ccid, valid, created_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_acks_to_valid_created_at ON acks (to_ccid, valid, created_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_acks_schema_valid_created_at ON acks (schema, valid, created_at)`,
 
 		`CREATE TABLE IF NOT EXISTS ackeds (
 			id STRING(MAX) NOT NULL,
@@ -140,9 +139,7 @@ var migrations = []migration{
 			c_date TIMESTAMP NOT NULL
 		) PRIMARY KEY (id), INTERLEAVE IN PARENT commit_logs ON DELETE CASCADE`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_acked_from_to_schema ON ackeds (from_ccid, to_ccid, schema)`,
-		`CREATE INDEX IF NOT EXISTS idx_acked_from_valid_created_at ON ackeds (from_ccid, valid, created_at)`,
 		`CREATE INDEX IF NOT EXISTS idx_acked_to_valid_created_at ON ackeds (to_ccid, valid, created_at)`,
-		`CREATE INDEX IF NOT EXISTS idx_acked_schema_valid_created_at ON ackeds (schema, valid, created_at)`,
 
 		`CREATE TABLE IF NOT EXISTS entities (
 			ccid STRING(MAX) NOT NULL,
@@ -203,5 +200,14 @@ var migrations = []migration{
 			deltas INT64 NOT NULL,
 			expires_at TIMESTAMP NOT NULL
 		) PRIMARY KEY (key), ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`,
+	}},
+	// acks are read by from and ackeds by to: the other side's indexes and
+	// the schema ones were never scanned. A fresh database never had them
+	// (the baseline above no longer creates them), hence IF EXISTS.
+	{2, "drop_unused_ack_indexes", []string{
+		`DROP INDEX IF EXISTS idx_acks_to_valid_created_at`,
+		`DROP INDEX IF EXISTS idx_acks_schema_valid_created_at`,
+		`DROP INDEX IF EXISTS idx_acked_from_valid_created_at`,
+		`DROP INDEX IF EXISTS idx_acked_schema_valid_created_at`,
 	}},
 }
