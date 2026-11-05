@@ -16,6 +16,7 @@ import (
 	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
 	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
@@ -361,6 +362,8 @@ func main() {
 		aggregateStore = aggfirestore.New(firestoreClient)
 	case "redis":
 		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
 	case "":
 		switch {
 		case db != nil:
@@ -373,7 +376,7 @@ func main() {
 			aggregateStore = aggredis.New(redis)
 		}
 	default:
-		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis)")
+		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis, memcached)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 

@@ -50,10 +50,11 @@ type Repository interface {
 	// layer's cache miss path and the verification tool's reference; request
 	// handlers go through the aggregate layer instead (aggregates.go).
 	ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
-	ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
-	// ComputeAssociationCountsByVariant orders the variants by the createdAt
-	// of their earliest association.
-	ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
+	// ComputeAssociationCounts counts a target's associations by schema and,
+	// within a schema, by variant (an association without a variant counts
+	// under ""); a variant's Order is the createdAt (unix nanoseconds) of
+	// its earliest association.
+	ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -86,7 +87,9 @@ type Repository interface {
 	MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
-	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
+	// DeleteAssociation reports whether an association was removed (false
+	// when it was already gone), so the counts are only adjusted once.
+	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) (bool, error)
 
 	// Offline tooling (conctl gc-commitlog / dump-commitlog)
 

@@ -88,21 +88,19 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	if uc.agg == nil {
-		return uc.repo.ComputeAssociationCountsBySchema(ctx, targetURI)
-	}
-	return aggregate.Get(ctx, uc.agg, uc.aggs.bySchema, targetURI)
-}
-
-func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	if uc.agg == nil {
-		return uc.repo.ComputeAssociationCountsByVariant(ctx, targetURI, schema)
-	}
-	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.byVariant, variantTarget(targetURI, schema))
+	counts, err := uc.associationCounts(ctx, targetURI)
 	if err != nil {
 		return nil, err
 	}
-	return counts.ordered(), nil
+	return counts.bySchema(), nil
+}
+
+func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
+	counts, err := uc.associationCounts(ctx, targetURI)
+	if err != nil {
+		return nil, err
+	}
+	return counts[schema].ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a

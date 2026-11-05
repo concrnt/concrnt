@@ -13,6 +13,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
@@ -170,6 +171,8 @@ func newOperationContext() (*operationContext, error) {
 		aggregateStore = aggfirestore.New(op.firestore)
 	case "redis":
 		aggregateStore = aggredis.New(rdb)
+	case "memcached":
+		aggregateStore = aggmemcached.New(database.NewMemcached(conf.Backends.MemcachedAddr), "")
 	case "":
 		switch {
 		case op.DB != nil:
@@ -183,7 +186,7 @@ func newOperationContext() (*operationContext, error) {
 		}
 	default:
 		op.Close()
-		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, firestore, redis)", conf.Backends.Aggregate.Store)
+		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, firestore, redis, memcached)", conf.Backends.Aggregate.Store)
 	}
 	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 	return op, nil

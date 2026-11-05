@@ -56,17 +56,22 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return result.RowsAffected > 0, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
-		return err
+		return false, err
 	}
 
-	return db.Delete(&sqlitedb.Association{}, "document_id = ?", documentID).Error
+	result := db.Delete(&sqlitedb.Association{}, "document_id = ?", documentID)
+	if result.Error != nil {
+		span.RecordError(result.Error)
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -145,70 +150,48 @@ func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
 	return out, nil
 }
 
-func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
-	defer span.End()
-
-	var counts []struct {
-		Schema string
-		Count  int64
-	}
-
-	err := r.db.WithContext(ctx).
-		Model(&sqlitedb.Association{}).
-		Select("schema, COUNT(*) AS count").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Group("schema").
-		Scan(&counts).Error
-
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	result := make(map[string]int64)
-	for _, c := range counts {
-		result[c.Schema] = c.Count
-	}
-
-	return result, nil
-}
-
-func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
+func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
 	defer span.End()
 
 	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
 	// to min_created_at); the earliest association of each variant decides
 	// the variant order
 	var counts []struct {
-		Variant      string
+		Schema       string
+		Variant      *string
 		Count        int64
 		MinCreatedAt int64
 	}
 
 	err := r.db.WithContext(ctx).
 		Model(&sqlitedb.Association{}).
-		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
+		Select("associations.schema, associations.variant, COUNT(*) AS count, MIN(associations.created_at) AS min_created_at").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).
-		Where("associations.schema = ?", schema).
-		Group("variant").
-		Order("min_created_at ASC").
+		Group("associations.schema, associations.variant").
 		Scan(&counts).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	result := make(utils.OrderedKVMap[int64])
+	result := make(map[string]utils.OrderedKVMap[int64])
 	for _, c := range counts {
-		result[c.Variant] = utils.OrderedKV[int64]{
+		variants, ok := result[c.Schema]
+		if !ok {
+			variants = make(utils.OrderedKVMap[int64])
+			result[c.Schema] = variants
+		}
+		variant := ""
+		if c.Variant != nil {
+			variant = *c.Variant
+		}
+		variants[variant] = utils.OrderedKV[int64]{
 			Value: c.Count,
 			Order: sqlitedb.Time(c.MinCreatedAt).UnixNano(),
 		}
 	}
 
-	return &result, nil
+	return result, nil
 }

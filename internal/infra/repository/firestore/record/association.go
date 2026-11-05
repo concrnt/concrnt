@@ -58,31 +58,31 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return true, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	t, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
-		return err
+		return false, err
 	}
 
 	ref := r.col(fs.ColAssociations).Doc(documentID)
 	m, exists, err := t.read(ref)
 	if err != nil {
 		span.RecordError(err)
-		return err
+		return false, err
 	}
 	if !exists {
-		return nil
+		return false, nil
 	}
 
 	t.del(ref)
 	if unique := str(m, "unique"); unique != "" {
 		t.del(r.col(fs.ColAssocUniques).Doc(uniqueID(unique)))
 	}
-	return nil
+	return true, nil
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -152,38 +152,13 @@ func (r *Repository) GetAssociatedRecords(
 // memory; cost is one document read per matching row, which is why only
 // the aggregate layer calls them (C2).
 
-func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
-	defer span.End()
-
-	result := make(map[string]int64)
-	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("schema").Documents(ctx)
-	defer it.Stop()
-	for {
-		snap, err := it.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			span.RecordError(err)
-			return nil, fs.QueryErr(err)
-		}
-		result[str(snap.Data(), "schema")]++
-	}
-	return result, nil
-}
-
-func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
+func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
 	defer span.End()
 
 	// the earliest association of each variant decides the variant order
-	type agg struct {
-		count int64
-		min   time.Time
-	}
-	groups := map[string]*agg{}
-	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Where("schema", "==", schema).Select("variant", "createdAt").Documents(ctx)
+	result := make(map[string]utils.OrderedKVMap[int64])
+	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("schema", "variant", "createdAt").Documents(ctx)
 	defer it.Stop()
 	for {
 		snap, err := it.Next()
@@ -195,22 +170,21 @@ func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targ
 			return nil, fs.QueryErr(err)
 		}
 		m := snap.Data()
+		schema := str(m, "schema")
+		variants, ok := result[schema]
+		if !ok {
+			variants = make(utils.OrderedKVMap[int64])
+			result[schema] = variants
+		}
 		variant := str(m, "variant")
 		createdAt, _ := timeAt(m, "createdAt")
-		g, ok := groups[variant]
-		if !ok {
-			g = &agg{min: createdAt}
-			groups[variant] = g
+		order := createdAt.UnixNano()
+		c, ok := variants[variant]
+		if !ok || order < c.Order {
+			c.Order = order
 		}
-		g.count++
-		if createdAt.Before(g.min) {
-			g.min = createdAt
-		}
+		c.Value++
+		variants[variant] = c
 	}
-
-	result := make(utils.OrderedKVMap[int64])
-	for variant, g := range groups {
-		result[variant] = utils.OrderedKV[int64]{Value: g.count, Order: g.min.UnixNano()}
-	}
-	return &result, nil
+	return result, nil
 }

@@ -219,8 +219,9 @@ func (b Backends) SpannerDatabasePath() string {
 
 // Aggregate configures the count cache (internal/usecase/aggregate).
 type Aggregate struct {
-	// Store is "postgres" (a table in the record database), "spanner" (same)
-	// or "redis"; empty means the store matching the record database.
+	// Store is "postgres" (a table in the record database), "spanner" or
+	// "firestore" (same), "redis" or "memcached" (backends.memcachedAddr);
+	// empty means the store matching the record database.
 	Store string `yaml:"store"`
 	// TTL is how long a computed value is served before it is recomputed
 	// (default 24h); MaxDeltas how many writes an entry absorbs before it is

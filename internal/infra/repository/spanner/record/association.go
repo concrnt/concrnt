@@ -66,21 +66,25 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return affected > 0, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	stx, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
-		return err
+		return false, err
 	}
 
-	_, err = stx.Update(ctx, spanner.Statement{
+	affected, err := stx.Update(ctx, spanner.Statement{
 		SQL:    "DELETE FROM associations WHERE id = @id",
 		Params: map[string]any{"id": documentID},
 	})
-	return err
+	if err != nil {
+		span.RecordError(err)
+		return false, err
+	}
+	return affected > 0, nil
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -120,15 +124,19 @@ func (r *Repository) GetAssociatedRecords(
 	return commitRows(rows)
 }
 
-func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsBySchema")
+func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
 	defer span.End()
 
+	// the earliest association of each variant decides the variant order
 	counts, err := queryAll[struct {
-		Schema string `spanner:"schema"`
-		Count  int64  `spanner:"count"`
+		Schema       string    `spanner:"schema"`
+		Variant      *string   `spanner:"variant"`
+		Count        int64     `spanner:"count"`
+		MinCreatedAt time.Time `spanner:"min_created_at"`
 	}](ctx, r.client.Single(), spanner.Statement{
-		SQL:    "SELECT schema, COUNT(*) AS count FROM associations WHERE target_uri = @target GROUP BY schema",
+		SQL: `SELECT schema, variant, COUNT(*) AS count, MIN(created_at) AS min_created_at FROM associations
+			WHERE target_uri = @target GROUP BY schema, variant`,
 		Params: map[string]any{"target": targetURI},
 	})
 	if err != nil {
@@ -136,42 +144,21 @@ func (r *Repository) ComputeAssociationCountsBySchema(ctx context.Context, targe
 		return nil, err
 	}
 
-	result := make(map[string]int64)
+	result := make(map[string]utils.OrderedKVMap[int64])
 	for _, c := range counts {
-		result[c.Schema] = c.Count
-	}
-	return result, nil
-}
-
-func (r *Repository) ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCountsByVariant")
-	defer span.End()
-
-	// the earliest association of each variant decides the variant order
-	counts, err := queryAll[struct {
-		Variant      *string   `spanner:"variant"`
-		Count        int64     `spanner:"count"`
-		MinCreatedAt time.Time `spanner:"min_created_at"`
-	}](ctx, r.client.Single(), spanner.Statement{
-		SQL: `SELECT variant, COUNT(*) AS count, MIN(created_at) AS min_created_at FROM associations
-			WHERE target_uri = @target AND schema = @schema GROUP BY variant ORDER BY min_created_at ASC`,
-		Params: map[string]any{"target": targetURI, "schema": schema},
-	})
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	result := make(utils.OrderedKVMap[int64])
-	for _, c := range counts {
+		variants, ok := result[c.Schema]
+		if !ok {
+			variants = make(utils.OrderedKVMap[int64])
+			result[c.Schema] = variants
+		}
 		variant := ""
 		if c.Variant != nil {
 			variant = *c.Variant
 		}
-		result[variant] = utils.OrderedKV[int64]{
+		variants[variant] = utils.OrderedKV[int64]{
 			Value: c.Count,
 			Order: c.MinCreatedAt.UnixNano(),
 		}
 	}
-	return &result, nil
+	return result, nil
 }

@@ -163,15 +163,14 @@ type Acked struct {
 //   - PRIMARY KEY (document_id): one association per commit document and
 //     commit-log foreign-key target; used by record.Repository.DeleteAssociation.
 //   - idx_associations_target_id (target_id): association lookup by target record
-//     key; used by record.Repository.GetAssociatedRecords,
-//     ComputeAssociationCountsBySchema, and ComputeAssociationCountsByVariant.
+//     key; used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_author
 //     (target_id, schema, variant, author): target lookup with optional filters;
 //     used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_created_at
-//     (target_id, schema, variant, created_at): target/schema counts by variant
-//     and earliest association ordering; used by
-//     record.Repository.ComputeAssociationCountsByVariant.
+//     (target_id, schema, variant, created_at): a target's counts by schema and
+//     variant and each variant's earliest association, read from the index
+//     alone; used by record.Repository.ComputeAssociationCounts.
 //   - uni_associations_unique (unique): idempotency key for association writes;
 //     used by record.Repository.CreateAssociation.
 type Association struct {

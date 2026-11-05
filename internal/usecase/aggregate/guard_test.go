@@ -31,7 +31,7 @@ func TestComputeIsCalledOnlyFromTheAggregateLayer(t *testing.T) {
 		"internal/infra/aggregate/",
 		"cmd/conctl/aggregate",
 	}
-	call := regexp.MustCompile(`\.Compute(AssociationCountsBySchema|AssociationCountsByVariant|AcknowledgeCounts)\(`)
+	call := regexp.MustCompile(`\.Compute(AssociationCounts|AcknowledgeCounts)\(`)
 
 	var offenders []string
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {

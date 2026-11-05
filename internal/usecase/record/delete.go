@@ -347,13 +347,13 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					return nil, false, false, err
 				}
 
-				err = uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
+				removed, err := uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
 				if err != nil {
 					span.RecordError(err)
 					return nil, false, false, err
 				}
-				if targetDoc.Associate != nil {
-					postProcesses = append(postProcesses, uc.associationCountsInvalidated(*targetDoc.Associate, targetDoc.Schema))
+				if removed && targetDoc.Associate != nil {
+					postProcesses = append(postProcesses, uc.associationCountsTouched(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, targetDoc.CreatedAt, -1, mode))
 				}
 
 				if err := flagDeleted(targetSD, nil); err != nil {

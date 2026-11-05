@@ -20,6 +20,7 @@ import (
 func RunAssociationSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("ListFilters", func(t *testing.T) { testAssociationListFilters(t, open(t)) })
 	t.Run("Counts", func(t *testing.T) { testAssociationCounts(t, open(t)) })
+	t.Run("Delete", func(t *testing.T) { testAssociationDelete(t, open(t)) })
 }
 
 const associationTargetKey = "cckv://con1owner/timeline/post-1"
@@ -172,30 +173,64 @@ func testAssociationCounts(t *testing.T, be Backend) {
 		{"c-5", "con1dave", repost, nil, t0.Add(4 * time.Minute)},
 	})
 
-	bySchema, err := repo.ComputeAssociationCountsBySchema(ctx, associationTargetKey)
+	counts, err := repo.ComputeAssociationCounts(ctx, associationTargetKey)
 	require.NoError(t, err)
-	require.Equal(t, map[string]int64{like: 4, repost: 2}, bySchema)
+	require.Len(t, counts, 2)
 
-	byVariant, err := repo.ComputeAssociationCountsByVariant(ctx, associationTargetKey, like)
-	require.NoError(t, err)
-	require.NotNil(t, byVariant)
-	require.Len(t, *byVariant, 3)
-	require.EqualValues(t, 2, (*byVariant)["👍"].Value)
-	require.EqualValues(t, 1, (*byVariant)["❤️"].Value)
-	require.EqualValues(t, 1, (*byVariant)["🎉"].Value)
-	require.Equal(t, t0.UnixNano(), (*byVariant)["👍"].Order, "a variant is ordered by its earliest association")
-	require.Equal(t, t0.Add(2*time.Minute).UnixNano(), (*byVariant)["❤️"].Order)
-	require.Equal(t, t0.Add(5*time.Minute).UnixNano(), (*byVariant)["🎉"].Order)
-	encoded, err := json.Marshal(byVariant)
+	likes := counts[like]
+	require.Len(t, likes, 3)
+	require.EqualValues(t, 2, likes["👍"].Value)
+	require.EqualValues(t, 1, likes["❤️"].Value)
+	require.EqualValues(t, 1, likes["🎉"].Value)
+	require.Equal(t, t0.UnixNano(), likes["👍"].Order, "a variant is ordered by its earliest association")
+	require.Equal(t, t0.Add(2*time.Minute).UnixNano(), likes["❤️"].Order)
+	require.Equal(t, t0.Add(5*time.Minute).UnixNano(), likes["🎉"].Order)
+	encoded, err := json.Marshal(likes)
 	require.NoError(t, err)
 	require.Equal(t, `{"👍":2,"❤️":1,"🎉":1}`, string(encoded), "the JSON object lists variants in that order")
 
-	byVariant, err = repo.ComputeAssociationCountsByVariant(ctx, associationTargetKey, repost)
-	require.NoError(t, err)
-	require.Len(t, *byVariant, 1)
-	require.EqualValues(t, 2, (*byVariant)[""].Value, "a variant-less association counts under the empty variant")
+	reposts := counts[repost]
+	require.Len(t, reposts, 1)
+	require.EqualValues(t, 2, reposts[""].Value, "a variant-less association counts under the empty variant")
+	require.Equal(t, t0.Add(3*time.Minute).UnixNano(), reposts[""].Order)
 
-	bySchema, err = repo.ComputeAssociationCountsBySchema(ctx, "cckv://con1owner/timeline")
+	counts, err = repo.ComputeAssociationCounts(ctx, "cckv://con1owner/timeline")
 	require.NoError(t, err)
-	require.Empty(t, bySchema)
+	require.Empty(t, counts)
+}
+
+// DeleteAssociation reports whether it removed an association, so a second
+// delete of the same one (a replay) is told apart and the counts are only
+// adjusted once.
+func testAssociationDelete(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	like := "https://schema.example/like.json"
+	t0 := time.Date(2026, 3, 1, 1, 0, 0, 0, time.UTC)
+	seedAssociations(t, ctx, repo, []associationFixture{
+		{"d-1", "con1alice", like, Ptr("👍"), t0},
+		{"d-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
+	})
+
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		removed, err := repo.DeleteAssociation(ctx, tx, "d-1")
+		require.NoError(t, err)
+		require.True(t, removed, "an existing association is removed")
+	})
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		removed, err := repo.DeleteAssociation(ctx, tx, "d-1")
+		require.NoError(t, err)
+		require.False(t, removed, "an association already gone is not removed again")
+	})
+	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		removed, err := repo.DeleteAssociation(ctx, tx, "never-existed")
+		require.NoError(t, err)
+		require.False(t, removed)
+	})
+
+	counts, err := repo.ComputeAssociationCounts(ctx, associationTargetKey)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, counts[like]["👍"].Value)
+	require.Equal(t, t0.Add(time.Minute).UnixNano(), counts[like]["👍"].Order, "the recomputed order is the earliest association left")
 }

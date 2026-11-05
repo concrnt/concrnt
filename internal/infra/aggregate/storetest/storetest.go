@@ -103,9 +103,27 @@ func (s *InMemory) InvalidateAll(_ context.Context, prefix string) error {
 	return nil
 }
 
+// Option adapts the suite to a store's documented limits.
+type Option func(*options)
+
+type options struct {
+	definitionPrefixesOnly bool
+}
+
+// DefinitionPrefixesOnly is for a store whose InvalidateAll only drops
+// everything ("") or one definition ("<name>:") and rejects any other
+// prefix (memcached, which cannot list its keys).
+func DefinitionPrefixesOnly() Option {
+	return func(o *options) { o.definitionPrefixesOnly = true }
+}
+
 // Run runs the conformance suite; open must return a fresh, isolated store
 // per call.
-func Run(t *testing.T, open func(t *testing.T) aggregate.Store) {
+func Run(t *testing.T, open func(t *testing.T) aggregate.Store, opts ...Option) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	t.Run("MissAndPut", func(t *testing.T) { testMissAndPut(t, open(t)) })
 	t.Run("PutIfAbsentLoses", func(t *testing.T) { testPutIfAbsentLoses(t, open(t)) })
 	t.Run("ApplyAbsent", func(t *testing.T) { testApplyAbsent(t, open(t)) })
@@ -113,9 +131,9 @@ func Run(t *testing.T, open func(t *testing.T) aggregate.Store) {
 	t.Run("ApplyIsAtomic", func(t *testing.T) { testApplyIsAtomic(t, open(t)) })
 	t.Run("ApplyErrorLeavesEntry", func(t *testing.T) { testApplyErrorLeavesEntry(t, open(t)) })
 	t.Run("Invalidate", func(t *testing.T) { testInvalidate(t, open(t)) })
-	t.Run("InvalidateAllByPrefix", func(t *testing.T) { testInvalidateAllByPrefix(t, open(t)) })
+	t.Run("InvalidateAllByPrefix", func(t *testing.T) { testInvalidateAllByPrefix(t, open(t), o) })
 	t.Run("Expiry", func(t *testing.T) { testExpiry(t, open(t)) })
-	t.Run("AwkwardKeys", func(t *testing.T) { testAwkwardKeys(t, open(t)) })
+	t.Run("AwkwardKeys", func(t *testing.T) { testAwkwardKeys(t, open(t), o) })
 }
 
 var asOf = time.Date(2026, 6, 1, 12, 0, 0, 123456000, time.UTC)
@@ -264,7 +282,7 @@ func testInvalidate(t *testing.T, s aggregate.Store) {
 	put(t, s, "counts:a", `2`)
 }
 
-func testInvalidateAllByPrefix(t *testing.T, s aggregate.Store) {
+func testInvalidateAllByPrefix(t *testing.T, s aggregate.Store, o options) {
 	ctx := context.Background()
 	put(t, s, "a:x", `1`)
 	put(t, s, "a:x s", `1`)
@@ -272,14 +290,22 @@ func testInvalidateAllByPrefix(t *testing.T, s aggregate.Store) {
 	put(t, s, "ab:x", `1`)
 	put(t, s, "b:x", `1`)
 
-	require.NoError(t, s.InvalidateAll(ctx, "a:x"))
-	for key, want := range map[string]bool{"a:x": false, "a:x s": false, "a:y": true, "ab:x": true, "b:x": true} {
-		_, ok := get(t, s, key)
-		require.Equal(t, want, ok, "after InvalidateAll(a:x): %s", key)
+	if o.definitionPrefixesOnly {
+		require.Error(t, s.InvalidateAll(ctx, "a:x"), "a prefix inside a definition is rejected")
+		for _, key := range []string{"a:x", "a:x s", "a:y"} {
+			_, ok := get(t, s, key)
+			require.True(t, ok, "a rejected InvalidateAll drops nothing: %s", key)
+		}
+	} else {
+		require.NoError(t, s.InvalidateAll(ctx, "a:x"))
+		for key, want := range map[string]bool{"a:x": false, "a:x s": false, "a:y": true, "ab:x": true, "b:x": true} {
+			_, ok := get(t, s, key)
+			require.Equal(t, want, ok, "after InvalidateAll(a:x): %s", key)
+		}
 	}
 
 	require.NoError(t, s.InvalidateAll(ctx, "a:"))
-	for key, want := range map[string]bool{"a:y": false, "ab:x": true, "b:x": true} {
+	for key, want := range map[string]bool{"a:x": false, "a:x s": false, "a:y": false, "ab:x": true, "b:x": true} {
 		_, ok := get(t, s, key)
 		require.Equal(t, want, ok, "after InvalidateAll(a:): %s", key)
 	}
@@ -307,13 +333,17 @@ func testExpiry(t *testing.T, s aggregate.Store) {
 	require.True(t, won, "an expired entry counts as absent for PutIfAbsent")
 }
 
-func testAwkwardKeys(t *testing.T, s aggregate.Store) {
+func testAwkwardKeys(t *testing.T, s aggregate.Store, o options) {
 	key := "name:cckv://con1owner/" + strings.Repeat("k", 300) + " https://schema.example/x_y%z*?[]"
 	put(t, s, key, `{"👍":1}`)
 	entry, ok := get(t, s, key)
 	require.True(t, ok)
 	require.JSONEq(t, `{"👍":1}`, string(entry.Value))
-	require.NoError(t, s.InvalidateAll(context.Background(), "name:cckv://con1owner/"+strings.Repeat("k", 300)+" "))
+	if o.definitionPrefixesOnly {
+		require.NoError(t, s.Invalidate(context.Background(), key))
+	} else {
+		require.NoError(t, s.InvalidateAll(context.Background(), "name:cckv://con1owner/"+strings.Repeat("k", 300)+" "))
+	}
 	_, ok = get(t, s, key)
 	require.False(t, ok)
 }

@@ -16,7 +16,7 @@ dropping it is always safe and never needs a log replay.
   log). Drifted entries are dropped and rebuild on demand. A redis store
   may show transient drift from concurrent writers; it converges within
   `backends.aggregate.ttl`.
-- **Switching the store** (`backends.aggregate.store: postgres | spanner | firestore | redis`)
+- **Switching the store** (`backends.aggregate.store: postgres | spanner | firestore | redis | memcached`)
   needs no migration: the new store starts cold and fills on demand. The
   old table (`aggregate_entries`, Postgres, Spanner or Firestore) can be
   truncated. On Firestore expired entries are only removed by the TTL
