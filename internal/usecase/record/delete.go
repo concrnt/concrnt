@@ -353,7 +353,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					return nil, false, false, err
 				}
 				if removed && targetDoc.Associate != nil {
-					postProcesses = append(postProcesses, uc.associationCountsTouched(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, targetDoc.CreatedAt, -1, mode))
+					postProcesses = append(postProcesses, uc.associationCountsTouched(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, -1, mode))
 				}
 
 				if err := flagDeleted(targetSD, nil); err != nil {

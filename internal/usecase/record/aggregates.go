@@ -1,10 +1,12 @@
 package record
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -34,31 +36,29 @@ func AggregateNames() []string {
 
 // associationDelta is one association added (N = 1) or removed (N = -1).
 type associationDelta struct {
-	Schema    string
-	Variant   string
-	N         int64
-	CreatedAt time.Time
+	Schema  string
+	Variant string
+	N       int64
 }
 
-// variantCount is one variant's count and the createdAt (unix nanoseconds)
-// of its earliest association, which orders the variants.
 type variantCount struct {
-	Count int64 `json:"count"`
-	First int64 `json:"first"`
+	Variant string `json:"v"`
+	Count   int64  `json:"n"`
 }
 
-type variantCounts map[string]variantCount
+// variantCounts are one schema's variants in display order.
+type variantCounts []variantCount
 
 func (vc variantCounts) ordered() *utils.OrderedKVMap[int64] {
 	out := make(utils.OrderedKVMap[int64], len(vc))
-	for variant, c := range vc {
-		out[variant] = utils.OrderedKV[int64]{Value: c.Count, Order: c.First}
+	for i, c := range vc {
+		out[c.Variant] = utils.OrderedKV[int64]{Value: c.Count, Order: int64(i)}
 	}
 	return &out
 }
 
 // associationCounts is the cached value of AggregateAssociationCounts:
-// schema -> variant -> count.
+// schema -> its variants in order.
 type associationCounts map[string]variantCounts
 
 func (ac associationCounts) bySchema() map[string]int64 {
@@ -77,38 +77,53 @@ func (ac associationCounts) countsOnly() map[string]map[string]int64 {
 	out := make(map[string]map[string]int64, len(ac))
 	for schema, variants := range ac {
 		m := make(map[string]int64, len(variants))
-		for variant, c := range variants {
-			m[variant] = c.Count
+		for _, c := range variants {
+			m[c.Variant] = c.Count
 		}
 		out[schema] = m
 	}
 	return out
 }
 
-// applyAssociationDelta adjusts the counts by one association. A variant is
-// ordered by where it first appeared: an addition can move it earlier, a
+// fromComputed orders each schema's variants by the createdAt of their
+// earliest association (the repository's Order), ties by variant.
+func fromComputed(counts map[string]utils.OrderedKVMap[int64]) associationCounts {
+	out := make(associationCounts, len(counts))
+	for schema, variants := range counts {
+		vc := make(variantCounts, 0, len(variants))
+		for variant, c := range variants {
+			vc = append(vc, variantCount{Variant: variant, Count: c.Value})
+		}
+		slices.SortFunc(vc, func(x, y variantCount) int {
+			return cmp.Or(cmp.Compare(variants[x.Variant].Order, variants[y.Variant].Order), cmp.Compare(x.Variant, y.Variant))
+		})
+		out[schema] = vc
+	}
+	return out
+}
+
+// applyAssociationDelta adjusts the counts by one association. A variant
+// keeps its place while it has associations: a new one is appended, a
 // removal never moves it, and a variant whose count drops to zero is gone
-// (when it comes back it starts at the end). A recomputation orders by the
-// earliest association still present instead, so after the earliest
-// association of a variant is removed the cached order and a recomputed
-// one may differ; that difference is accepted.
+// (when it comes back it starts at the end). The cached order is therefore
+// the order in which variants arrived here, while a recomputation orders by
+// the earliest createdAt still present; the two may differ (a backdated
+// association, the first association of a variant removed), and that
+// difference is accepted.
 func applyAssociationDelta(cur associationCounts, d associationDelta) associationCounts {
 	if cur == nil {
 		cur = associationCounts{}
 	}
 	variants := cur[d.Schema]
-	if variants == nil {
-		variants = variantCounts{}
-	}
-	c, exists := variants[d.Variant]
-	c.Count += d.N
-	if first := d.CreatedAt.UnixNano(); d.N > 0 && (!exists || first < c.First) {
-		c.First = first
-	}
-	if c.Count <= 0 {
-		delete(variants, d.Variant)
-	} else {
-		variants[d.Variant] = c
+	i := slices.IndexFunc(variants, func(c variantCount) bool { return c.Variant == d.Variant })
+	switch {
+	case i < 0 && d.N > 0:
+		variants = append(variants, variantCount{Variant: d.Variant, Count: d.N})
+	case i >= 0:
+		variants[i].Count += d.N
+		if variants[i].Count <= 0 {
+			variants = slices.Delete(variants, i, i+1)
+		}
 	}
 	if len(variants) == 0 {
 		delete(cur, d.Schema)
@@ -132,15 +147,7 @@ func newAggregates(repo Repository) aggregates {
 				if err != nil {
 					return nil, err
 				}
-				out := make(associationCounts, len(counts))
-				for schema, variants := range counts {
-					vc := make(variantCounts, len(variants))
-					for variant, c := range variants {
-						vc[variant] = variantCount{Count: c.Value, First: c.Order}
-					}
-					out[schema] = vc
-				}
-				return out, nil
+				return fromComputed(counts), nil
 			},
 			Apply: applyAssociationDelta,
 		},
@@ -183,7 +190,7 @@ func (uc *Usecase) associationCounts(ctx context.Context, targetURI string) (ass
 // inside the commit, so a concurrent computation stamped earlier is known
 // not to have seen the change. A dump replay (LocalOnlyExecute) is a bulk
 // path and invalidates instead.
-func (uc *Usecase) associationCountsTouched(associate, schema string, variant *string, createdAt time.Time, n int64, mode domain.CommitMode) PostProcessAction {
+func (uc *Usecase) associationCountsTouched(associate, schema string, variant *string, n int64, mode domain.CommitMode) PostProcessAction {
 	receivedAt := time.Now()
 	v := ""
 	if variant != nil {
@@ -196,7 +203,7 @@ func (uc *Usecase) associationCountsTouched(associate, schema string, variant *s
 		if mode == domain.CommitModeLocalOnlyExecute {
 			return uc.agg.Invalidate(ctx, AggregateAssociationCounts, associate)
 		}
-		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, N: n, CreatedAt: createdAt}, receivedAt)
+		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, N: n}, receivedAt)
 	}
 }
 
