@@ -46,7 +46,7 @@ type associationDelta struct {
 // maxTrackedAuthors bounds the author set kept in an entry; a target with
 // more authors is listed from the primary data whenever an author filter
 // is given.
-const maxTrackedAuthors = 200
+const maxTrackedAuthors = 1000
 
 type variantCount struct {
 	Variant string `json:"v"`

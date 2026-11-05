@@ -20,7 +20,7 @@ import (
 // to its key or a delete, both of which drop the entry after the commit;
 // the TTL bounds a write that bypassed them (an offline tool) or an entry
 // re-stored by a read racing the invalidation.
-const documentCacheTTL = 300
+const documentCacheTTL = 3600
 
 var documentCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "concrnt",
