@@ -290,6 +290,20 @@ func (uc *Usecase) associationCountsTouched(associate, schema string, variant *s
 	}
 }
 
+// associationCountsSeededEmpty stores the empty counts of a key that had no
+// record until this commit, saving the first reader's computation. The
+// ordering it assumes, record before associations, is the normal one; an
+// association that reached the key while it was a parent placeholder would
+// be missed until the entry expires.
+func (uc *Usecase) associationCountsSeededEmpty(uri string) PostProcessAction {
+	return func(ctx context.Context) error {
+		if uc.agg == nil {
+			return nil
+		}
+		return aggregate.Seed(ctx, uc.agg, uc.aggs.associations, uri, associationCounts{Schemas: map[string]variantCounts{}})
+	}
+}
+
 // associationCountsOfTargetInvalidated drops the count cache of a record
 // whose associations went away with it.
 func (uc *Usecase) associationCountsOfTargetInvalidated(uri string) PostProcessAction {

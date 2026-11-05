@@ -27,6 +27,7 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	policySelf := parsed
 
 	existingSD, err := uc.repo.GetSignedDocument(ctx, parsed.Key)
+	freshKey := errors.Is(err, domain.ErrNotFound)
 	if err == nil {
 		var existingDoc concrnt.Document[any]
 		err = json.Unmarshal([]byte(existingSD.Document), &existingDoc)
@@ -164,6 +165,10 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	// policy or distributions, and the one it replaced may have been
 	if parsed.Policy != nil || parsed.Distributes != nil || policyLayerAt(stack, parsed.Key) {
 		postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedKey.Owner))
+	}
+
+	if freshKey {
+		postProcesses = append(postProcesses, uc.associationCountsSeededEmpty(parsed.Key))
 	}
 
 	if mode == domain.CommitModeExecute {

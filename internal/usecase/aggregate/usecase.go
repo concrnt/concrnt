@@ -133,6 +133,18 @@ func Touch[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], ta
 	return nil
 }
 
+// Seed stores value for target when the cache has no entry, for a writer
+// that knows the value without computing it (a record just created has no
+// associations). A concurrent computation that stored first wins.
+func Seed[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string, value V) error {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	_, err = uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: time.Now()}, uc.ttlOf(def.TTL))
+	return err
+}
+
 // Invalidate drops one entry.
 func (uc *Usecase) Invalidate(ctx context.Context, name, target string) error {
 	return uc.store.Invalidate(ctx, Key(name, target))
