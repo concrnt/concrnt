@@ -631,3 +631,66 @@ func TestResolveTimelinesLocalCopySkipsMemcached(t *testing.T) {
 		t.Fatalf("resolveTimeline = %+v, %v", single, err)
 	}
 }
+
+// gapPubsub is a worker.PubSub that hands the cache updater its event
+// channel and gap hook.
+type gapPubsub struct {
+	events chan<- concrnt.Event
+	gap    func()
+}
+
+func (p *gapPubsub) Publish(ctx context.Context, channel string, event concrnt.Event) error {
+	return nil
+}
+func (p *gapPubsub) Subscribe(ctx context.Context, prefixes []string, response chan<- concrnt.Event) error {
+	return nil
+}
+func (p *gapPubsub) SubscribeAll(ctx context.Context, response chan<- concrnt.Event) error {
+	p.events = response
+	return nil
+}
+func (p *gapPubsub) OnGap(fn func()) { p.gap = fn }
+
+type fixedDemand []string
+
+func (d fixedDemand) CurrentSubscriptions() []string { return d }
+
+// The cache updater applies created events from its subscription and, after
+// a gap in the stream, purges the latest chunk of the timelines it maintains
+// so readers rebuild it from the origin.
+func TestCacheUpdaterAppliesEventsAndPurgesOnGap(t *testing.T) {
+	r, manifest := newTestResolver(t)
+	ps := &gapPubsub{}
+	r.pubsub = ps
+	r.demand = fixedDemand{testTimeline}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.cacheUpdater(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for ps.events == nil || ps.gap == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("cache updater did not subscribe")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	now := time.Now()
+	epoch := manifest.Time2Chunk(now)
+	seedChunk(t, r.mc, testTimeline, epoch, []chunkline.BodyItem{{Timestamp: now.Add(-time.Minute), Href: "cckv://alice/home/existing"}})
+
+	ps.events <- testEvent(testTimeline+"/rec-new", now)
+	ps.events <- concrnt.Event{Type: "deleted", URI: testTimeline + "/rec-old"}
+	deadline = time.Now().Add(5 * time.Second)
+	for !strings.Contains(cachedBody(t, r.mc, testTimeline, epoch), "rec-new") {
+		if time.Now().After(deadline) {
+			t.Fatal("created event not applied by the cache updater")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ps.gap()
+	if _, err := r.mc.Get(bodyCacheKey(testTimeline, strconv.FormatInt(epoch, 10))); err != memcache.ErrCacheMiss {
+		t.Fatalf("latest chunk not purged after a gap: %v", err)
+	}
+}

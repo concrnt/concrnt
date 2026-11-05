@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -1048,27 +1049,69 @@ func (r *resolver) CurrentSubscriptions() []string {
 	return keep
 }
 
+const (
+	// cacheUpdaterQueue absorbs a burst (an import, a bridge catching up)
+	// while the workers run their memcached round trips
+	cacheUpdaterQueue   = 4096
+	cacheUpdaterWorkers = 8
+)
+
+// cacheUpdater mirrors created events into the chunk cache. Events are
+// applied concurrently: applyEventToCache is order-independent and tolerates
+// duplicates. When the subscription was lost and re-established, the latest
+// chunk of every maintained timeline is purged so readers rebuild it from
+// the origin with whatever was published in between.
 func (r *resolver) cacheUpdater(ctx context.Context) {
+	events := make(chan concrnt.Event, cacheUpdaterQueue)
 
-	events := make(chan concrnt.Event)
-
-	go r.pubsub.SubscribeAll(ctx, events)
-
-	for {
-		var event concrnt.Event
-		select {
-		case <-ctx.Done():
-			return
-		case event = <-events:
-		}
-
-		if event.Type != "created" {
-			continue
-		}
-
-		r.applyEventToCache(ctx, event)
+	if gaps, ok := r.pubsub.(worker.PubSubGaps); ok {
+		gaps.OnGap(func() {
+			if ctx.Err() != nil {
+				return
+			}
+			timelines := r.CurrentSubscriptions()
+			slog.Warn("chunkline cache updater: event stream gap, purging the latest chunks", slog.Int("timelines", len(timelines)))
+			r.PurgeLatest(timelines, 1)
+		})
 	}
+
+	if err := r.pubsub.SubscribeAll(ctx, events); err != nil {
+		slog.Error("chunkline cache updater: subscribe failed", slog.String("error", err.Error()))
+		return
+	}
+
+	var wg sync.WaitGroup
+	for range cacheUpdaterWorkers {
+		wg.Go(func() {
+			for {
+				var event concrnt.Event
+				select {
+				case <-ctx.Done():
+					return
+				case event = <-events:
+				}
+				cacheUpdaterQueued.Set(float64(len(events)))
+
+				if event.Type != "created" {
+					continue
+				}
+				result := "applied"
+				switch err := r.applyEventToCache(ctx, event); {
+				case errors.Is(err, errNotATimelineRecord):
+					result = "skipped"
+				case err != nil:
+					result = "error"
+					slog.Error("chunkline cache updater: event not applied", slog.String("uri", event.URI), slog.String("error", err.Error()))
+				}
+				cacheUpdaterEvents.WithLabelValues(result).Inc()
+			}
+		})
+	}
+	wg.Wait()
 }
+
+// errNotATimelineRecord is a created event on a key with no parent.
+var errNotATimelineRecord = errors.New("record key has no timeline")
 
 // applyEventToCache maintains the cached chunk of the timeline that gained a
 // record. The event arrives on the record's own key (`<timeline>/<id>`, the
@@ -1081,19 +1124,18 @@ func (r *resolver) cacheUpdater(ctx context.Context) {
 // during a leadership handover or a racing origin fetch at worst duplicates
 // the record. Prepend and Replace never create keys, so an unmaintained
 // timeline stays uncached.
-func (r *resolver) applyEventToCache(ctx context.Context, event concrnt.Event) {
+func (r *resolver) applyEventToCache(ctx context.Context, event concrnt.Event) error {
 	// the parent of the created record is the timeline it entered
 	authority := strings.Index(event.URI, "://")
 	cut := strings.LastIndex(event.URI, "/")
 	if authority == -1 || cut <= authority+2 {
-		return // a root key belongs to no timeline; nothing to maintain
+		return errNotATimelineRecord // a root key belongs to no timeline; nothing to maintain
 	}
 	timeline := event.URI[:cut]
 
 	manifest, err := r.resolveTimeline(ctx, timeline)
 	if err != nil {
-		slog.Error("failed to resolve timeline for caching", slog.String("timeline", timeline), slog.String("error", err.Error()))
-		return
+		return fmt.Errorf("resolve timeline %s: %w", timeline, err)
 	}
 	epoch := manifest.Time2Chunk(event.Timestamp)
 
@@ -1103,7 +1145,7 @@ func (r *resolver) applyEventToCache(ctx context.Context, event concrnt.Event) {
 	// record until the epoch rolls over.
 	err = r.mc.Replace(&memcache.Item{Key: itrCacheKey(timeline, epoch), Value: []byte(strconv.FormatInt(epoch, 10)), Expiration: itrCacheTTL})
 	if err != nil && !errors.Is(err, memcache.ErrNotStored) {
-		slog.Error("failed to replace iterator in cache", slog.String("timeline", timeline), slog.String("error", err.Error()))
+		return fmt.Errorf("replace iterator of %s: %w", timeline, err)
 	}
 
 	// the cached entry must mirror what the origin body endpoint serves
@@ -1124,15 +1166,15 @@ func (r *resolver) applyEventToCache(ctx context.Context, event concrnt.Event) {
 		ContentType: "application/concrnt.document+json",
 	})
 	if err != nil {
-		slog.Error("failed to marshal body item for caching", slog.String("timeline", timeline), slog.String("error", err.Error()))
-		return
+		return err
 	}
 
 	bodyKey := bodyCacheKey(timeline, strconv.FormatInt(epoch, 10))
 	err = r.mc.Prepend(&memcache.Item{Key: bodyKey, Value: append([]byte(","), serializedItem...)})
 	if err != nil && !errors.Is(err, memcache.ErrNotStored) {
-		slog.Error("failed to prepend body item in cache", slog.String("timeline", timeline), slog.String("error", err.Error()))
+		return fmt.Errorf("prepend body item of %s: %w", timeline, err)
 	}
+	return nil
 }
 
 // PurgeLatest drops the cached latest chunk (and, for depth 2, the previous

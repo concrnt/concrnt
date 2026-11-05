@@ -916,7 +916,8 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 	defer cancel()
 
 	input := make(chan []string)
-	output := make(chan concrnt.Event)
+	// buffered: the publisher drops events a session does not take
+	output := make(chan concrnt.Event, 64)
 	// subscription lists handed to the usecase, to be acknowledged on the
 	// socket. Answered by the write loop below because gorilla allows only one
 	// concurrent writer.
