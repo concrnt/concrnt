@@ -197,6 +197,18 @@ func testAssociationCounts(t *testing.T, be Backend) {
 	counts, err = repo.ComputeAssociationCounts(ctx, "cckv://con1owner/timeline")
 	require.NoError(t, err)
 	require.Empty(t, counts)
+
+	authors, err := repo.ListAssociationAuthors(ctx, associationTargetKey, 10)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"con1alice", "con1bob", "con1carol", "con1dave", "con1erin"}, authors, "each author once")
+
+	authors, err = repo.ListAssociationAuthors(ctx, associationTargetKey, 2)
+	require.NoError(t, err)
+	require.Len(t, authors, 2, "the limit bounds the distinct authors")
+
+	authors, err = repo.ListAssociationAuthors(ctx, "cckv://con1owner/timeline", 10)
+	require.NoError(t, err)
+	require.Empty(t, authors)
 }
 
 // DeleteAssociation reports whether it removed an association, so a second

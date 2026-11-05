@@ -162,3 +162,24 @@ func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI str
 	}
 	return result, nil
 }
+
+func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
+	defer span.End()
+
+	rows, err := queryAll[struct {
+		Author string `spanner:"author"`
+	}](ctx, r.client.Single(), spanner.Statement{
+		SQL:    `SELECT DISTINCT author FROM associations WHERE target_uri = @target LIMIT @limit`,
+		Params: map[string]any{"target": targetURI, "limit": int64(limit)},
+	})
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	authors := make([]string, 0, len(rows))
+	for _, row := range rows {
+		authors = append(authors, row.Author)
+	}
+	return authors, nil
+}

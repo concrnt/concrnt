@@ -162,12 +162,17 @@ func urisOf(items []concrnt.SignedDocument) []string {
 // associationListRepo counts list reads and serves fixed counts.
 type associationListRepo struct {
 	Repository
-	counts map[string]utils.OrderedKVMap[int64]
-	lists  int
+	counts  map[string]utils.OrderedKVMap[int64]
+	authors []string
+	lists   int
 }
 
 func (r *associationListRepo) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
 	return r.counts, nil
+}
+
+func (r *associationListRepo) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	return r.authors, nil
 }
 
 func (r *associationListRepo) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error) {
@@ -182,7 +187,7 @@ func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
 	ctx := context.Background()
 	repo := &associationListRepo{counts: map[string]utils.OrderedKVMap[int64]{
 		"like": {"": {Value: 1, Order: 1}},
-	}}
+	}, authors: []string{"con1liker"}}
 	uc := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
 	uc.SetAggregates(aggregate.New(storetest.NewInMemory(), 0, 0))
 
@@ -193,7 +198,11 @@ func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
 
 	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "someone", nil, nil, 10, "desc")
 	require.NoError(t, err)
-	require.Equal(t, 1, repo.lists, "a schema with associations is listed from the repository")
+	require.Equal(t, 0, repo.lists, "an author without associations on the target must not reach the repository")
+
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "con1liker", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.lists, "an author with associations is listed from the repository")
 
 	repo.counts = map[string]utils.OrderedKVMap[int64]{}
 	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")

@@ -195,3 +195,22 @@ func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI str
 
 	return result, nil
 }
+
+func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
+	defer span.End()
+
+	var authors []string
+	err := r.db.WithContext(ctx).
+		Model(&postgres.Association{}).
+		Distinct("associations.author").
+		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Where("rk.uri = ?", targetURI).
+		Limit(limit).
+		Pluck("associations.author", &authors).Error
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return authors, nil
+}

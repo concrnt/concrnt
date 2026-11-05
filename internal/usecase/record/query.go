@@ -84,7 +84,7 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 	// primary data (author / since / until only narrow a result further)
 	if uc.agg != nil {
 		counts, err := uc.associationCounts(ctx, targetURI)
-		if err == nil && !counts.mayMatch(schema, variant) {
+		if err == nil && !counts.mayMatch(schema, variant, author) {
 			return concrnt.QueryResult{Items: []concrnt.SignedDocument{}}, nil
 		}
 	}
@@ -109,7 +109,7 @@ func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targe
 	if err != nil {
 		return nil, err
 	}
-	return counts[schema].ordered(), nil
+	return counts.Schemas[schema].ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a

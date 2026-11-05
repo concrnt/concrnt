@@ -22,8 +22,9 @@ import (
 const (
 	// AggregateAssociationCounts: target = the associated record's cckv; one
 	// entry holds every schema's variant counts (the per-schema counts are
-	// their sums).
-	AggregateAssociationCounts = "association-counts"
+	// their sums) and the set of authors. The name changed with the value's
+	// shape: entries under the old name are left to expire.
+	AggregateAssociationCounts = "association-counts-v2"
 	// AggregateAckCounts: target = "from:<ccid>" (acks held for an acker) or
 	// "to:<ccid>" (ackeds held for a target), every schema in one entry.
 	AggregateAckCounts = "ack-counts"
@@ -38,8 +39,14 @@ func AggregateNames() []string {
 type associationDelta struct {
 	Schema  string
 	Variant string
+	Author  string
 	N       int64
 }
+
+// maxTrackedAuthors bounds the author set kept in an entry; a target with
+// more authors is listed from the primary data whenever an author filter
+// is given.
+const maxTrackedAuthors = 200
 
 type variantCount struct {
 	Variant string `json:"v"`
@@ -57,13 +64,22 @@ func (vc variantCounts) ordered() *utils.OrderedKVMap[int64] {
 	return &out
 }
 
-// associationCounts is the cached value of AggregateAssociationCounts:
-// schema -> its variants in order.
-type associationCounts map[string]variantCounts
+// associationCounts is the cached value of AggregateAssociationCounts.
+type associationCounts struct {
+	// Schemas maps a schema to its variants in order.
+	Schemas map[string]variantCounts `json:"s"`
+	// Authors is every author with an association on the target, when
+	// AuthorsUntracked is false.
+	Authors []string `json:"a,omitempty"`
+	// AuthorsUntracked is set when the authors are too many to keep, or a
+	// removal left the set uncertain; an author filter then reads the
+	// primary data.
+	AuthorsUntracked bool `json:"m,omitempty"`
+}
 
 func (ac associationCounts) bySchema() map[string]int64 {
-	out := make(map[string]int64, len(ac))
-	for schema, variants := range ac {
+	out := make(map[string]int64, len(ac.Schemas))
+	for schema, variants := range ac.Schemas {
 		for _, c := range variants {
 			out[schema] += c.Count
 		}
@@ -71,15 +87,18 @@ func (ac associationCounts) bySchema() map[string]int64 {
 	return out
 }
 
-// mayMatch reports whether a listing filtered by schema and variant ("" =
-// no filter) can have rows. The cached "" variant is an association without
-// a variant, so an empty variant filter never narrows.
-func (ac associationCounts) mayMatch(schema, variant string) bool {
-	if len(ac) == 0 {
+// mayMatch reports whether a listing filtered by schema, variant and author
+// ("" = no filter) can have rows. The cached "" variant is an association
+// without a variant, so an empty variant filter never narrows.
+func (ac associationCounts) mayMatch(schema, variant, author string) bool {
+	if len(ac.Schemas) == 0 {
+		return false
+	}
+	if author != "" && !ac.AuthorsUntracked && !slices.Contains(ac.Authors, author) {
 		return false
 	}
 	if schema != "" {
-		variants, ok := ac[schema]
+		variants, ok := ac.Schemas[schema]
 		if !ok {
 			return false
 		}
@@ -88,7 +107,7 @@ func (ac associationCounts) mayMatch(schema, variant string) bool {
 	if variant == "" {
 		return true
 	}
-	for _, variants := range ac {
+	for _, variants := range ac.Schemas {
 		if slices.ContainsFunc(variants, func(c variantCount) bool { return c.Variant == variant }) {
 			return true
 		}
@@ -97,10 +116,11 @@ func (ac associationCounts) mayMatch(schema, variant string) bool {
 }
 
 // countsOnly drops the variant order, which a cached entry and a fresh
-// computation may legitimately disagree on (see applyAssociationDelta).
+// computation may legitimately disagree on (see applyAssociationDelta), and
+// the author set, which a removal leaves untracked.
 func (ac associationCounts) countsOnly() map[string]map[string]int64 {
-	out := make(map[string]map[string]int64, len(ac))
-	for schema, variants := range ac {
+	out := make(map[string]map[string]int64, len(ac.Schemas))
+	for schema, variants := range ac.Schemas {
 		m := make(map[string]int64, len(variants))
 		for _, c := range variants {
 			m[c.Variant] = c.Count
@@ -112,8 +132,8 @@ func (ac associationCounts) countsOnly() map[string]map[string]int64 {
 
 // fromComputed orders each schema's variants by the createdAt of their
 // earliest association (the repository's Order), ties by variant.
-func fromComputed(counts map[string]utils.OrderedKVMap[int64]) associationCounts {
-	out := make(associationCounts, len(counts))
+func fromComputed(counts map[string]utils.OrderedKVMap[int64], authors []string, authorsUntracked bool) associationCounts {
+	out := associationCounts{Schemas: make(map[string]variantCounts, len(counts)), Authors: authors, AuthorsUntracked: authorsUntracked}
 	for schema, variants := range counts {
 		vc := make(variantCounts, 0, len(variants))
 		for variant, c := range variants {
@@ -122,7 +142,7 @@ func fromComputed(counts map[string]utils.OrderedKVMap[int64]) associationCounts
 		slices.SortFunc(vc, func(x, y variantCount) int {
 			return cmp.Or(cmp.Compare(variants[x.Variant].Order, variants[y.Variant].Order), cmp.Compare(x.Variant, y.Variant))
 		})
-		out[schema] = vc
+		out.Schemas[schema] = vc
 	}
 	return out
 }
@@ -134,12 +154,14 @@ func fromComputed(counts map[string]utils.OrderedKVMap[int64]) associationCounts
 // the order in which variants arrived here, while a recomputation orders by
 // the earliest createdAt still present; the two may differ (a backdated
 // association, the first association of a variant removed), and that
-// difference is accepted.
+// difference is accepted. An added author joins the set until it is full;
+// a removal leaves the set untracked, since the author may still have
+// other associations.
 func applyAssociationDelta(cur associationCounts, d associationDelta) associationCounts {
-	if cur == nil {
-		cur = associationCounts{}
+	if cur.Schemas == nil {
+		cur.Schemas = map[string]variantCounts{}
 	}
-	variants := cur[d.Schema]
+	variants := cur.Schemas[d.Schema]
 	i := slices.IndexFunc(variants, func(c variantCount) bool { return c.Variant == d.Variant })
 	switch {
 	case i < 0 && d.N > 0:
@@ -151,9 +173,20 @@ func applyAssociationDelta(cur associationCounts, d associationDelta) associatio
 		}
 	}
 	if len(variants) == 0 {
-		delete(cur, d.Schema)
+		delete(cur.Schemas, d.Schema)
 	} else {
-		cur[d.Schema] = variants
+		cur.Schemas[d.Schema] = variants
+	}
+
+	switch {
+	case cur.AuthorsUntracked:
+	case d.N < 0:
+		cur.Authors, cur.AuthorsUntracked = nil, true
+	case slices.Contains(cur.Authors, d.Author):
+	case len(cur.Authors) >= maxTrackedAuthors:
+		cur.Authors, cur.AuthorsUntracked = nil, true
+	default:
+		cur.Authors = append(cur.Authors, d.Author)
 	}
 	return cur
 }
@@ -170,9 +203,30 @@ func newAggregates(repo Repository) aggregates {
 			Compute: func(ctx context.Context, target string) (associationCounts, error) {
 				counts, err := repo.ComputeAssociationCounts(ctx, target)
 				if err != nil {
-					return nil, err
+					return associationCounts{}, err
 				}
-				return fromComputed(counts), nil
+				// the author set is only listed when it can be complete:
+				// the total bounds the distinct authors, so a target over
+				// the limit is untracked without a second read, and an
+				// empty target (the common case) needs none either
+				var total int64
+				for _, variants := range counts {
+					for _, c := range variants {
+						total += c.Value
+					}
+				}
+				var authors []string
+				untracked := total > maxTrackedAuthors
+				if total > 0 && !untracked {
+					authors, err = repo.ListAssociationAuthors(ctx, target, maxTrackedAuthors+1)
+					if err != nil {
+						return associationCounts{}, err
+					}
+					if len(authors) > maxTrackedAuthors {
+						authors, untracked = nil, true
+					}
+				}
+				return fromComputed(counts, authors, untracked), nil
 			},
 			Apply: applyAssociationDelta,
 		},
@@ -217,8 +271,10 @@ func (uc *Usecase) associationCounts(ctx context.Context, targetURI string) (ass
 // other choice (stamping inside the transaction) can leave a computation
 // that missed the row uncorrected, and GetAssociatedRecords trusts an empty
 // entry to skip the primary data, so an over-count is the error to prefer.
-// A dump replay (LocalOnlyExecute) is a bulk path and invalidates instead.
-func (uc *Usecase) associationCountsTouched(associate, schema string, variant *string, n int64, mode domain.CommitMode) PostProcessAction {
+// A removal invalidates instead: it would leave the author set untracked
+// and the entry worth less than a recomputation. A dump replay
+// (LocalOnlyExecute) is a bulk path and invalidates too.
+func (uc *Usecase) associationCountsTouched(associate, schema string, variant *string, author string, n int64, mode domain.CommitMode) PostProcessAction {
 	v := ""
 	if variant != nil {
 		v = *variant
@@ -227,10 +283,10 @@ func (uc *Usecase) associationCountsTouched(associate, schema string, variant *s
 		if uc.agg == nil {
 			return nil
 		}
-		if mode == domain.CommitModeLocalOnlyExecute {
+		if mode == domain.CommitModeLocalOnlyExecute || n < 0 {
 			return uc.agg.Invalidate(ctx, AggregateAssociationCounts, associate)
 		}
-		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, N: n}, time.Now())
+		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, Author: author, N: n}, time.Now())
 	}
 }
 

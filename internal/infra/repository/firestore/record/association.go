@@ -188,3 +188,33 @@ func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI str
 	}
 	return result, nil
 }
+
+// ListAssociationAuthors has no DISTINCT to lean on: the author field of
+// the target's associations is read, bounded at a multiple of limit, and
+// deduplicated here. The caller only asks for small limits on targets with
+// few associations (the count is known first), so the scan stays short.
+func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
+	defer span.End()
+
+	seen := map[string]bool{}
+	authors := []string{}
+	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("author").Limit(limit * 4).Documents(ctx)
+	defer it.Stop()
+	for len(authors) < limit {
+		snap, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			span.RecordError(err)
+			return nil, fs.QueryErr(err)
+		}
+		author := str(snap.Data(), "author")
+		if !seen[author] {
+			seen[author] = true
+			authors = append(authors, author)
+		}
+	}
+	return authors, nil
+}

@@ -64,6 +64,10 @@ type Repository interface {
 	// under ""); a variant's Order is the createdAt (unix nanoseconds) of
 	// its earliest association.
 	ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error)
+	// ListAssociationAuthors lists up to limit distinct authors of a target's
+	// associations, in no particular order; a result of exactly limit may be
+	// incomplete.
+	ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
