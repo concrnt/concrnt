@@ -79,6 +79,15 @@ func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, sch
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {
+	// most targets have no associations and clients re-read the list on
+	// every event: the count cache settles those without touching the
+	// primary data (author / since / until only narrow a result further)
+	if uc.agg != nil {
+		counts, err := uc.associationCounts(ctx, targetURI)
+		if err == nil && !counts.mayMatch(schema, variant) {
+			return concrnt.QueryResult{Items: []concrnt.SignedDocument{}}, nil
+		}
+	}
 	rows, err := uc.repo.GetAssociatedRecords(ctx, targetURI, schema, variant, author, since, until, limit+1, order)
 	if err != nil {
 		return concrnt.QueryResult{}, err

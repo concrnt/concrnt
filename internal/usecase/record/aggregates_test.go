@@ -75,3 +75,32 @@ func TestAssociationCountsOnlyIgnoresOrder(t *testing.T) {
 	computed := associationCounts{"s": {{Variant: "B", Count: 1}, {Variant: "A", Count: 1}}}
 	require.Equal(t, cached.countsOnly(), computed.countsOnly())
 }
+
+func TestAssociationCountsMayMatch(t *testing.T) {
+	counts := associationCounts{
+		"like":  {{Variant: "", Count: 2}},
+		"react": {{Variant: "👍", Count: 1}},
+	}
+	cases := []struct {
+		name            string
+		counts          associationCounts
+		schema, variant string
+		want            bool
+	}{
+		{"empty entry", associationCounts{}, "", "", false},
+		{"nil entry", nil, "like", "", false},
+		{"no filter", counts, "", "", true},
+		{"schema present", counts, "like", "", true},
+		{"schema absent", counts, "reply", "", false},
+		{"schema and variant present", counts, "react", "👍", true},
+		{"schema and variant absent", counts, "react", "👎", false},
+		{"empty variant filter never narrows", counts, "react", "", true},
+		{"variant across schemas present", counts, "", "👍", true},
+		{"variant across schemas absent", counts, "", "👎", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, tc.counts.mayMatch(tc.schema, tc.variant))
+		})
+	}
+}

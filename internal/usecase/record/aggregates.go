@@ -71,6 +71,31 @@ func (ac associationCounts) bySchema() map[string]int64 {
 	return out
 }
 
+// mayMatch reports whether a listing filtered by schema and variant ("" =
+// no filter) can have rows. The cached "" variant is an association without
+// a variant, so an empty variant filter never narrows.
+func (ac associationCounts) mayMatch(schema, variant string) bool {
+	if len(ac) == 0 {
+		return false
+	}
+	if schema != "" {
+		variants, ok := ac[schema]
+		if !ok {
+			return false
+		}
+		return variant == "" || slices.ContainsFunc(variants, func(c variantCount) bool { return c.Variant == variant })
+	}
+	if variant == "" {
+		return true
+	}
+	for _, variants := range ac {
+		if slices.ContainsFunc(variants, func(c variantCount) bool { return c.Variant == variant }) {
+			return true
+		}
+	}
+	return false
+}
+
 // countsOnly drops the variant order, which a cached entry and a fresh
 // computation may legitimately disagree on (see applyAssociationDelta).
 func (ac associationCounts) countsOnly() map[string]map[string]int64 {
@@ -186,12 +211,14 @@ func (uc *Usecase) associationCounts(ctx context.Context, targetURI string) (ass
 }
 
 // associationCountsTouched folds a committed association (n = 1) or the
-// removal of one (n = -1) into the count cache. receivedAt is taken now,
-// inside the commit, so a concurrent computation stamped earlier is known
-// not to have seen the change. A dump replay (LocalOnlyExecute) is a bulk
-// path and invalidates instead.
+// removal of one (n = -1) into the count cache. receivedAt is taken when the
+// action runs, after the commit: a concurrent computation stamped earlier
+// may have read a snapshot without the change and gets the delta too. The
+// other choice (stamping inside the transaction) can leave a computation
+// that missed the row uncorrected, and GetAssociatedRecords trusts an empty
+// entry to skip the primary data, so an over-count is the error to prefer.
+// A dump replay (LocalOnlyExecute) is a bulk path and invalidates instead.
 func (uc *Usecase) associationCountsTouched(associate, schema string, variant *string, n int64, mode domain.CommitMode) PostProcessAction {
-	receivedAt := time.Now()
 	v := ""
 	if variant != nil {
 		v = *variant
@@ -203,7 +230,7 @@ func (uc *Usecase) associationCountsTouched(associate, schema string, variant *s
 		if mode == domain.CommitModeLocalOnlyExecute {
 			return uc.agg.Invalidate(ctx, AggregateAssociationCounts, associate)
 		}
-		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, N: n}, receivedAt)
+		return aggregate.Touch(ctx, uc.agg, uc.aggs.associations, associate, associationDelta{Schema: schema, Variant: v, N: n}, time.Now())
 	}
 }
 
