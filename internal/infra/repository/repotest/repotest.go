@@ -136,7 +136,7 @@ func WithCommit(t *testing.T, ctx context.Context, repo record.Repository, id st
 	t.Helper()
 
 	require.NoError(t, repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
-		if err := repo.CreateCommitLog(ctx, tx, id, ip, sd.Document, sd.Proof, owner); err != nil {
+		if err := repo.CreateCommitLog(ctx, tx, id, ip, sd.Document, sd.Proof, owner); err != nil && !errors.Is(err, record.ErrAlreadyCommitted) {
 			return err
 		}
 		return fn(tx)

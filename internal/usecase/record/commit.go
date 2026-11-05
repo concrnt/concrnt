@@ -51,15 +51,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if alreadyCommitted {
-		return &sd, nil
-	}
-
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
 	isServiceAccount := serviceAccountType == "system"
 
@@ -250,6 +241,11 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 		return nil
 	})
+	if errors.Is(err, ErrAlreadyCommitted) {
+		// a redelivery: the commit log's insert found the id (there is no
+		// read before it), the transaction rolled back and nothing changed
+		return &sd, nil
+	}
 	if err != nil && !errors.Is(err, errCommitNoop) {
 		span.RecordError(err)
 		return nil, err

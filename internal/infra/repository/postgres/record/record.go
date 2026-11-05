@@ -522,49 +522,43 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	}
 
 	parentRK, err := GetRecordKeyByURI(ctx, db, parentURI)
-	if err != nil {
-		if errors.Is(err, domain.NotFoundError{}) {
-
-			parentID, err := getOrCreateParentRecordKey(ctx, db, parentURI)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			var pid *int64
-			if parentID != nil {
-				pid = &parentID.ID
-			}
-
-			newRecordKey := postgres.RecordKey{
-				URI:      parentURI,
-				RecordID: nil,
-				ParentID: pid,
-			}
-
-			err = db.WithContext(ctx).Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "uri"}},
-				DoNothing: true,
-			}).Create(&newRecordKey).Error
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			// 別トランザクションが先に作成済み（競合）なら ID は 0 のまま → 再取得
-			if newRecordKey.ID == 0 {
-				return GetRecordKeyByURI(ctx, db, parentURI)
-			}
-
-			return &newRecordKey, nil
-
-		} else {
-			span.RecordError(err)
-			return nil, err
-		}
+	if err == nil {
+		return parentRK, nil
+	}
+	if !errors.Is(err, domain.ErrNotFound) {
+		span.RecordError(err)
+		return nil, err
 	}
 
-	return parentRK, nil
+	grandparent, err := getOrCreateParentRecordKey(ctx, db, parentURI)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	var pid *int64
+	if grandparent != nil {
+		pid = &grandparent.ID
+	}
+
+	// one statement for the placeholder: the insert's id, or the id of the
+	// row a concurrent transaction created first (DO NOTHING returns none).
+	// A DO UPDATE upsert would lock the parent row for the whole
+	// transaction and serialize every commit into the same timeline.
+	newRecordKey := postgres.RecordKey{URI: parentURI, ParentID: pid}
+	err = db.WithContext(ctx).Raw(`WITH ins AS (
+		INSERT INTO record_keys (uri, parent_id, clean_on_update) VALUES (?, ?, false)
+		ON CONFLICT (uri) DO NOTHING RETURNING id
+	) SELECT id FROM ins UNION ALL SELECT id FROM record_keys WHERE uri = ? LIMIT 1`, parentURI, pid, parentURI).
+		Scan(&newRecordKey.ID).Error
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if newRecordKey.ID == 0 {
+		// the row seen by neither branch: inserted and deleted in between
+		return GetRecordKeyByURI(ctx, db, parentURI)
+	}
+	return &newRecordKey, nil
 }
 
 func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
@@ -575,9 +569,12 @@ func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.
 	err := db.WithContext(ctx).
 		Where("uri = ?", uri).
 		Take(&recordKey).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, domain.NotFoundError{Resource: "record key"}
+	}
 	if err != nil {
 		span.RecordError(err)
-		return nil, domain.NotFoundError{Resource: "record key"}
+		return nil, err
 	}
 
 	return &recordKey, nil

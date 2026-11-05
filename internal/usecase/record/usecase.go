@@ -3,6 +3,7 @@ package record
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -18,6 +19,11 @@ import (
 	"github.com/concrnt/concrnt/policy"
 )
 
+// ErrAlreadyCommitted is returned by CreateCommitLog for an id the commit
+// log already holds: the document was committed before, and the commit
+// that found out ends as a no-op.
+var ErrAlreadyCommitted = errors.New("document already committed")
+
 type Repository interface {
 	// RunInTx runs fn atomically. fn may be invoked more than once (a backend
 	// may retry on contention), so it must reach the store only through tx and
@@ -26,6 +32,9 @@ type Repository interface {
 	RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error
 
 	// Create / Update
+
+	// CreateCommitLog inserts the commit log by id; an id already held is
+	// left as first written and reported as ErrAlreadyCommitted.
 	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
 
 	CreateEntity(ctx context.Context, tx RepositoryTx, ccid string, alias *string, domain string, documentID string, createdAt time.Time) (bool, error)

@@ -61,8 +61,8 @@ phase 2 (`behavior:` in the PR).
 
 | Method | Shape / semantics | Verdict |
 |---|---|---|
-| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, duplicate id is a silent no-op. `c_date` (receipt time) is set by the backend. | keep |
-| `HasCommitLog(id)` | get(id) → exists. | keep |
+| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, a duplicate id leaves the row as first written and returns `ErrAlreadyCommitted` (the commit path's redelivery check: no read precedes the insert). `c_date` (receipt time) is set by the backend. | keep |
+| `HasCommitLog(id)` | get(id) → exists. Tooling and tests. | keep |
 | `GetAllCommitLogs(owner)` | eq(owner), order(c_date asc). Dump of one owner. | keep |
 | `QueryCommitLogs(owner?, since, until, limit, order)` | eq(owner)?, range(c_date), order(c_date, id). Replication cursor; `QueryRow.CreatedAt` is `c_date`. Ownerless rows carry no CCFS. | keep |
 | `MarkCommitLogGcCandidate(tx, id)` | tx; set flag by id. | keep |

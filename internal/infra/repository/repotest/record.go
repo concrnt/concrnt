@@ -546,8 +546,8 @@ func testRecordWrites(t *testing.T, be Backend) {
 		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "127.0.0.1", "first", proof, "con1owner"))
 			// a re-delivery of the same id is ignored wholesale: document, proof
-			// and owner all stay as first written
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "192.0.2.1", "second", concrnt.Proof{Type: "ignored"}, "con1other"))
+			// and owner all stay as first written, and the caller is told
+			require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "192.0.2.1", "second", concrnt.Proof{Type: "ignored"}, "con1other"), record.ErrAlreadyCommitted)
 		})
 
 		commit := mustCommit(t, ctx, in, "commit-methods")
@@ -1240,8 +1240,8 @@ func testHasCommitLog(t *testing.T, be Backend) {
 
 	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-		// a duplicate id is a silent no-op
-		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+		// a duplicate id changes nothing and is reported
+		require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"), record.ErrAlreadyCommitted)
 	})
 
 	has, err = repo.HasCommitLog(ctx, "has-1")

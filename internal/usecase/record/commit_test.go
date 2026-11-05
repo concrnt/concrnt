@@ -117,9 +117,10 @@ func (r *recordingRecordRepo) CreateCommitLog(ctx context.Context, tx Repository
 	}
 	// same first-write-wins semantics as the postgres implementation
 	// (ON CONFLICT DO NOTHING on the primary key)
-	if _, exists := r.commitLogOwners[id]; !exists {
-		r.commitLogOwners[id] = owner
+	if _, exists := r.commitLogOwners[id]; exists || r.commitLogs[id] {
+		return ErrAlreadyCommitted
 	}
+	r.commitLogOwners[id] = owner
 	return nil
 }
 func (r *recordingRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
@@ -787,8 +788,8 @@ func TestCommitSkipsAlreadyCommittedDocument(t *testing.T) {
 		if repo.createRecordCalled {
 			t.Fatal("CreateRecord should not be called for an already-committed document")
 		}
-		if len(repo.txs) != 0 {
-			t.Fatal("no transaction may be opened for an already-committed document")
+		if len(repo.txs) != 1 || !repo.txs[0].rolledBack {
+			t.Fatal("the transaction that found the commit log must roll back")
 		}
 	})
 

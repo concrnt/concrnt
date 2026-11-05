@@ -59,7 +59,7 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		return err
 	}
 
-	_, err = stx.Update(ctx, spanner.Statement{
+	rows, err := stx.Update(ctx, spanner.Statement{
 		SQL: `INSERT OR IGNORE INTO commit_logs (id, ip, document, proof, owner, gc_candidate, c_date)
 			VALUES (@id, @ip, @document, @proof, @owner, false, PENDING_COMMIT_TIMESTAMP())`,
 		Params: map[string]any{"id": id, "ip": ip, "document": document, "proof": string(proofBytes), "owner": owner},
@@ -67,6 +67,9 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 	if err != nil {
 		span.RecordError(err)
 		return err
+	}
+	if rows == 0 {
+		return ucrecord.ErrAlreadyCommitted
 	}
 	return nil
 }

@@ -59,11 +59,15 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		Proof:    string(proofBytes),
 	}
 
-	if err := db.Clauses(clause.OnConflict{
+	result := db.Clauses(clause.OnConflict{
 		DoNothing: true,
-	}).Create(&commitLog).Error; err != nil {
-		span.RecordError(err)
-		return err
+	}).Create(&commitLog)
+	if result.Error != nil {
+		span.RecordError(result.Error)
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ucrecord.ErrAlreadyCommitted
 	}
 
 	return nil
