@@ -425,7 +425,7 @@ func main() {
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
-	recordUC.SetEntityCache(mc)
+	recordUC.SetSharedCache(mc)
 	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
 		parsed, err := concrnt.ParseCCURI(uri)
 		if err != nil {

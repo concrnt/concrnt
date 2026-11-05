@@ -215,7 +215,7 @@ func (uc *Usecase) evalDeletePolicy(ctx context.Context, requester domain.Entity
 	if targetDoc.Associate != nil {
 		policyRoot = *targetDoc.Associate
 	}
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
+	stack, err := uc.policyStack(ctx, policyRoot)
 	if err != nil {
 		return err
 	}
@@ -301,6 +301,10 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					span.RecordError(err)
 					return nil, false, false, err
 				}
+
+				// a deleted record may have been a layer of its subtree's
+				// stacks; deletes are rare enough to drop the owner's stacks
+				postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedURI.Owner))
 
 				switch parsedURI.Scheme {
 				case "cckv":
@@ -431,10 +435,13 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				return nil, false, false, err
 			}
 
-			stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, refKey)
+			stack, err := uc.policyStack(ctx, refKey)
 			if err != nil {
 				span.RecordError(err)
 				return nil, false, false, err
+			}
+			if parsedRef, err := concrnt.ParseCCURI(refKey); err == nil && policyLayerAt(stack, refKey) {
+				postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedRef.Owner))
 			}
 
 			err = uc.policy.Eval(

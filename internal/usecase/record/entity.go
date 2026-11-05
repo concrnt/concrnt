@@ -108,10 +108,10 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 	return &commitApplyResult{result: &sd, postProcesses: []PostProcessAction{
 		func(ctx context.Context) error {
 			uc.cache.Delete(entityCacheKey(entity.Author))
-			if uc.entityCache == nil {
+			if uc.sharedCache == nil {
 				return nil
 			}
-			if err := uc.entityCache.Delete(entityCacheKey(entity.Author)); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+			if err := uc.sharedCache.Delete(entityCacheKey(entity.Author)); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
 				return fmt.Errorf("invalidate cached entity %s: %w", entity.Author, err)
 			}
 			return nil
@@ -212,11 +212,14 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 	}
 }
 
-// EntityCache is the entity cache shared by every replica (memcached), so
-// an entity commit on one replica invalidates it for all of them.
-type EntityCache interface {
+// SharedCache is the cache shared by every replica (memcached): entities
+// and policy stacks live there, so a commit on one replica invalidates them
+// for all of them.
+type SharedCache interface {
 	Get(key string) (*memcache.Item, error)
+	GetMulti(keys []string) (map[string]*memcache.Item, error)
 	Set(item *memcache.Item) error
+	Add(item *memcache.Item) error
 	Delete(key string) error
 }
 
@@ -235,9 +238,10 @@ var entityCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 	Help:      "Entity lookups by ccid against the entity cache, by result (local: the in-process copy, hit, miss, error: the cache was unreachable).",
 }, []string{"result"})
 
-// SetEntityCache caches the entity lookups by ccid in c.
-func (uc *Usecase) SetEntityCache(c EntityCache) {
-	uc.entityCache = c
+// SetSharedCache caches the entity lookups by ccid and the policy stacks
+// by cckv in c.
+func (uc *Usecase) SetSharedCache(c SharedCache) {
+	uc.sharedCache = c
 }
 
 func entityCacheKey(ccid string) string {
@@ -254,7 +258,7 @@ type cachedEntity struct {
 // getEntityByCCID is repo.GetEntityByCCID behind the entity cache. Misses
 // are not cached: an unknown ccid is fetched from its hint on first use.
 func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
-	if uc.entityCache == nil {
+	if uc.sharedCache == nil {
 		return uc.repo.GetEntityByCCID(ctx, ccid)
 	}
 
@@ -265,7 +269,7 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 	}
 
 	result := "miss"
-	item, err := uc.entityCache.Get(entityCacheKey(ccid))
+	item, err := uc.sharedCache.Get(entityCacheKey(ccid))
 	if err == nil {
 		var cached cachedEntity
 		if json.Unmarshal(item.Value, &cached) == nil {
@@ -286,7 +290,7 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 	uc.cache.Set(entityCacheKey(ccid), *entity, entityLocalTTL)
 	value, err := json.Marshal(cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument})
 	if err == nil && result == "miss" {
-		_ = uc.entityCache.Set(&memcache.Item{Key: entityCacheKey(ccid), Value: value, Expiration: entityCacheTTL})
+		_ = uc.sharedCache.Set(&memcache.Item{Key: entityCacheKey(ccid), Value: value, Expiration: entityCacheTTL})
 	}
 	return entity, nil
 }

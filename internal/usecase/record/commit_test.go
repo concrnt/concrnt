@@ -160,6 +160,18 @@ func (r *recordingRecordRepo) UnAcknowledged(ctx context.Context, tx RepositoryT
 func (r *recordingRecordRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
+func (r *recordingRecordRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
+}
+
+// emptyStacks is the Multi answer of a fake whose records carry no policy.
+func emptyStacks(uris []string) map[string][]concrnt.Policy {
+	stacks := make(map[string][]concrnt.Policy, len(uris))
+	for _, uri := range uris {
+		stacks[uri] = []concrnt.Policy{}
+	}
+	return stacks
+}
 func (r *recordingRecordRepo) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
 	if r.storedSD != nil {
 		return r.storedSD, nil

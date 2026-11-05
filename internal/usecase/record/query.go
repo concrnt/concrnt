@@ -168,7 +168,7 @@ func (uc *Usecase) Query(ctx context.Context, p QueryParams) (concrnt.QueryResul
 	}
 	stacks := map[string][]concrnt.Policy{}
 	if len(roots) > 0 {
-		stacks, err = uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, roots)
+		stacks, err = uc.policyStacks(ctx, roots)
 		if err != nil {
 			slog.Warn("query: policy stacks unavailable, evaluating without them", slog.String("error", err.Error()))
 			stacks = map[string][]concrnt.Policy{}

@@ -33,6 +33,28 @@ func (c *fakeEntityCache) Get(key string) (*memcache.Item, error) {
 	return &memcache.Item{Key: key, Value: value}, nil
 }
 
+func (c *fakeEntityCache) GetMulti(keys []string) (map[string]*memcache.Item, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	items := map[string]*memcache.Item{}
+	for _, key := range keys {
+		if value, ok := c.items[key]; ok {
+			items[key] = &memcache.Item{Key: key, Value: value}
+		}
+	}
+	return items, nil
+}
+
+func (c *fakeEntityCache) Add(item *memcache.Item) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.items[item.Key]; ok {
+		return memcache.ErrNotStored
+	}
+	c.items[item.Key] = item.Value
+	return nil
+}
+
 func (c *fakeEntityCache) Set(item *memcache.Item) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -114,9 +136,9 @@ func (r *entityStoreRepo) lookupCount() int {
 	return r.lookups
 }
 
-func newEntityCacheUsecase(cfg *domain.Config, repo Repository, cache EntityCache) *Usecase {
+func newEntityCacheUsecase(cfg *domain.Config, repo Repository, cache SharedCache) *Usecase {
 	uc := New(repo, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, nopPolicyService{}, nil, nil)
-	uc.SetEntityCache(cache)
+	uc.SetSharedCache(cache)
 	return uc
 }
 

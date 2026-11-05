@@ -206,8 +206,8 @@ type Usecase struct {
 	// straight from repo.Compute*
 	agg  *aggregate.Usecase
 	aggs aggregates
-	// entityCache is nil in offline tooling and tests
-	entityCache EntityCache
+	// sharedCache is nil in offline tooling and tests
+	sharedCache SharedCache
 }
 
 func New(

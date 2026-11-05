@@ -80,6 +80,14 @@ func (r *aliasKeyRecordRepo) GetHierarchicalRecordPolicies(ctx context.Context, 
 	return []concrnt.Policy{}, nil
 }
 
+func (r *aliasKeyRecordRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	stacks := map[string][]concrnt.Policy{}
+	for _, uri := range uris {
+		stacks[uri] = []concrnt.Policy{}
+	}
+	return stacks, nil
+}
+
 type allowAllPolicy struct{}
 
 func (allowAllPolicy) Eval(ctx context.Context, req policy.RequestContext, stack []concrnt.Policy, action string, key string) error {

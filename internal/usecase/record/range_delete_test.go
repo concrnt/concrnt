@@ -123,6 +123,9 @@ func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx Repos
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
+func (r *rangeDeleteRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
+}
 func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf, afterURI: afterURI, limit: limit})
 	out := []concrnt.SignedDocument{}
