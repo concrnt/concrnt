@@ -58,31 +58,31 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return true, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	t, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return err
 	}
 
 	ref := r.col(fs.ColAssociations).Doc(documentID)
 	m, exists, err := t.read(ref)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return err
 	}
 	if !exists {
-		return false, nil
+		return nil
 	}
 
 	t.del(ref)
 	if unique := str(m, "unique"); unique != "" {
 		t.del(r.col(fs.ColAssocUniques).Doc(uniqueID(unique)))
 	}
-	return true, nil
+	return nil
 }
 
 func (r *Repository) GetAssociatedRecords(

@@ -4,21 +4,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 
-	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/concrnt/concrnt"
 )
 
-// The resolved document cache: GetSigned read every record from the
-// primary data on every resolve. A record's row changes only by a commit
-// to its key or a delete, both of which drop the entry after the commit;
-// the TTL bounds a write that bypassed them (an offline tool) or an entry
+// The resolved document cache. A record's row changes only by a commit to
+// its key or a delete, both of which drop the entry after the commit; the
+// TTL bounds a write that bypassed them (an offline tool) or an entry
 // re-stored by a read racing the invalidation.
 const documentCacheTTL = 3600
 
@@ -41,25 +38,19 @@ func (uc *Usecase) signedDocumentCached(ctx context.Context, uri string) (*concr
 	}
 
 	key := documentCacheKey(uri)
-	result := "miss"
-	item, err := uc.sharedCache.Get(key)
-	if err == nil {
-		var sd concrnt.SignedDocument
-		if json.Unmarshal(item.Value, &sd) == nil {
-			documentCacheRequests.WithLabelValues("hit").Inc()
-			return &sd, nil
-		}
-	} else if !errors.Is(err, memcache.ErrCacheMiss) {
-		result = "error"
-	}
+	var cached concrnt.SignedDocument
+	result := uc.sharedCacheGet(key, &cached)
 	documentCacheRequests.WithLabelValues(result).Inc()
+	if result == "hit" {
+		return &cached, nil
+	}
 
 	sd, err := uc.repo.GetSignedDocument(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	if value, err := json.Marshal(sd); err == nil && result == "miss" {
-		_ = uc.sharedCache.Set(&memcache.Item{Key: key, Value: value, Expiration: documentCacheTTL})
+	if result == "miss" {
+		uc.sharedCacheSet(key, sd, documentCacheTTL)
 	}
 	return sd, nil
 }
@@ -76,7 +67,7 @@ func (uc *Usecase) documentCacheInvalidated(uris ...*string) PostProcessAction {
 			if uri == nil || *uri == "" {
 				continue
 			}
-			if err := uc.sharedCache.Delete(documentCacheKey(*uri)); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+			if err := uc.sharedCacheDelete(documentCacheKey(*uri)); err != nil {
 				errs = errors.Join(errs, fmt.Errorf("invalidate cached document %s: %w", *uri, err))
 			}
 		}

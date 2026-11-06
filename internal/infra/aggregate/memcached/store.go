@@ -8,8 +8,9 @@
 // unreachable until they expire or are evicted.
 //
 // Each process reads the generations at most every genCacheTTL, so after a
-// drop other processes keep serving the old entries for up to that long. A generation key that is evicted comes back with a new value, which
-// drops its entries too: the store only errs towards recomputing.
+// drop other processes keep serving the old entries for up to that long. A
+// generation key that is evicted comes back with a new value, which drops
+// its entries too: the store only errs towards recomputing.
 package memcached
 
 import (

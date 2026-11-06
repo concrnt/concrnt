@@ -315,7 +315,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 						return nil, false, false, err
 					}
 					// the key's associations cascaded away with the record
-					postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(targetURI))
+					postProcesses = append(postProcesses, uc.associationCountsInvalidated(targetURI))
 				case "ccfs":
 					if parsedURI.Type != concrnt.CCFSTypeConcrnt {
 						err := errors.New("unsupported ccfs type for delete record: " + parsedURI.Type)
@@ -352,13 +352,13 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					return nil, false, false, err
 				}
 
-				removed, err := uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
+				err = uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
 				if err != nil {
 					span.RecordError(err)
 					return nil, false, false, err
 				}
-				if removed && targetDoc.Associate != nil {
-					postProcesses = append(postProcesses, uc.associationCountsTouched(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, targetDoc.Author, -1, mode))
+				if targetDoc.Associate != nil {
+					postProcesses = append(postProcesses, uc.associationCountsInvalidated(*targetDoc.Associate))
 				}
 
 				if err := flagDeleted(targetSD, nil); err != nil {
@@ -480,7 +480,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				span.RecordError(err)
 				return nil, false, false, err
 			}
-			postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
+			postProcesses = append(postProcesses, uc.associationCountsInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)

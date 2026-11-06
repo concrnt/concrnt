@@ -66,25 +66,21 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return affected > 0, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	stx, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return err
 	}
 
-	affected, err := stx.Update(ctx, spanner.Statement{
+	_, err = stx.Update(ctx, spanner.Statement{
 		SQL:    "DELETE FROM associations WHERE id = @id",
 		Params: map[string]any{"id": documentID},
 	})
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	return affected > 0, nil
+	return err
 }
 
 func (r *Repository) GetAssociatedRecords(

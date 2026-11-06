@@ -56,22 +56,17 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	return result.RowsAffected > 0, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) (bool, error) {
+func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
 	db, err := getRecordTx(ctx, tx)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return err
 	}
 
-	result := db.Delete(&postgres.Association{}, "document_id = ?", documentID)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
-	}
-	return result.RowsAffected > 0, nil
+	return db.Delete(&postgres.Association{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetAssociatedRecords(

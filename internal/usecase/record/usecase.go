@@ -100,9 +100,7 @@ type Repository interface {
 	MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
-	// DeleteAssociation reports whether an association was removed (false
-	// when it was already gone), so the counts are only adjusted once.
-	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) (bool, error)
+	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
 
 	// Offline tooling (conctl gc-commitlog / dump-commitlog)
 

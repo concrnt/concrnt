@@ -595,10 +595,10 @@ func testRecordWrites(t *testing.T, be Backend) {
 		err = repo.DeleteRecordByDocumentID(ctx, foreignTx{}, "invalid")
 		require.Error(t, err)
 
-		_, err = repo.DeleteAssociation(ctx, nil, "invalid")
+		err = repo.DeleteAssociation(ctx, nil, "invalid")
 		require.Error(t, err)
 
-		_, err = repo.DeleteAssociation(ctx, foreignTx{}, "invalid")
+		err = repo.DeleteAssociation(ctx, foreignTx{}, "invalid")
 		require.Error(t, err)
 	})
 }

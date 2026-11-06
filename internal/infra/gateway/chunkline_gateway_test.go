@@ -40,7 +40,7 @@ func newTestResolver(t *testing.T) (*resolver, chunkline.Manifest) {
 	}
 	seedManifest(t, mc, testTimeline, manifest)
 
-	return &resolver{mc: mc}, manifest
+	return newResolver(nil, mc, nil, nil), manifest
 }
 
 func seedManifest(t *testing.T, mc *memcache.Client, timeline string, manifest chunkline.Manifest) {
@@ -505,7 +505,7 @@ func TestQueryDescendingStaticManifestHost(t *testing.T) {
 	cl := client.New(domain)
 	cl.AddHostRemapping(domain, server.URL)
 
-	r := &resolver{mc: mc, client: cl, demand: noDemand{}}
+	r := newResolver(cl, mc, noDemand{}, nil)
 	timeline := "https://" + domain + "/backrooms/manifest.json"
 
 	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, newest.Add(time.Minute), 16)
@@ -588,7 +588,8 @@ func TestQueryDescendingLocalTimelineSkipsHTTP(t *testing.T) {
 		{Timestamp: now.Add(-time.Second), Href: timeline + "/newest"},
 		{Timestamp: now.Add(-2 * time.Second), Href: timeline + "/older"},
 	}}
-	r := &resolver{mc: mc, client: cl, demand: noDemand{}, fqdn: self, local: ucchunkline.New(repo, nil, nil, nil)}
+	r := newResolver(cl, mc, noDemand{}, nil)
+	r.fqdn, r.local = self, ucchunkline.New(repo, nil, nil, nil)
 
 	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, now, 16)
 	if err != nil {

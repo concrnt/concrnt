@@ -161,9 +161,7 @@ func (uc *Usecase) policyStacks(ctx context.Context, uris []string) (map[string]
 		}
 		stacks[uri] = stack
 		uc.cache.Set(remoteKeys[uri], stack, 0)
-		if value, err := json.Marshal(stack); err == nil {
-			_ = uc.sharedCache.Set(&memcache.Item{Key: remoteKeys[uri], Value: value, Expiration: policyStackTTL})
-		}
+		uc.sharedCacheSet(remoteKeys[uri], stack, policyStackTTL)
 	}
 	return stacks, nil
 }

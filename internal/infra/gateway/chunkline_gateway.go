@@ -64,16 +64,20 @@ func NewChunklineGateway(
 	demand SubscriptionDemand,
 	pubsub worker.PubSub,
 ) *ChunklineGateway {
-	r := &resolver{
+	r := newResolver(cl, mc, demand, pubsub)
+	return &ChunklineGateway{
+		resolver: chunkline.NewClient(r),
+		r:        r,
+	}
+}
+
+func newResolver(cl *client.Client, mc *memcache.Client, demand SubscriptionDemand, pubsub worker.PubSub) *resolver {
+	return &resolver{
 		client:    cl,
 		mc:        mc,
 		demand:    demand,
 		pubsub:    pubsub,
 		manifests: cache.New(manifestLocalTTL, time.Minute),
-	}
-	return &ChunklineGateway{
-		resolver: chunkline.NewClient(r),
-		r:        r,
 	}
 }
 
@@ -121,13 +125,10 @@ type resolver struct {
 	fqdn   string
 	local  *ucchunkline.Usecase // nil: every timeline goes over HTTP
 
-	manifests *cache.Cache // nil in tests that build the resolver by hand
+	manifests *cache.Cache // in-process copies, in front of mc
 }
 
 func (r *resolver) localManifest(timeline string) (chunkline.Manifest, bool) {
-	if r.manifests == nil {
-		return chunkline.Manifest{}, false
-	}
 	x, found := r.manifests.Get(manifestCacheKey(timeline))
 	if !found {
 		return chunkline.Manifest{}, false
@@ -136,9 +137,7 @@ func (r *resolver) localManifest(timeline string) (chunkline.Manifest, bool) {
 }
 
 func (r *resolver) keepManifest(timeline string, manifest chunkline.Manifest) {
-	if r.manifests != nil {
-		r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
-	}
+	r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
 }
 
 func (r *resolver) fetchManifest(ctx context.Context, timeline string) (chunkline.Manifest, error) {
@@ -174,6 +173,41 @@ func (r *resolver) localCall(endpoint *url.URL, kind string) (chunkID int64, uri
 	}
 	chunkID, err := strconv.ParseInt(strings.TrimPrefix(rest, "/"), 10, 64)
 	return chunkID, uri, err == nil && strings.HasPrefix(rest, "/")
+}
+
+// fetchFromOrigins issues requestsByDomain (domain -> timeline -> URL) in
+// one batch and returns the body of every 200 response by timeline; every
+// other outcome goes to report and leaves the timeline out.
+func (r *resolver) fetchFromOrigins(ctx context.Context, kind string, requestsByDomain map[string]map[string]string, report func(error)) map[string][]byte {
+	if len(requestsByDomain) == 0 {
+		return nil
+	}
+	responses, err := r.client.BatchGet(ctx, requestsByDomain)
+	if err != nil {
+		report(fmt.Errorf("batch request for %s failed: %w", kind, err))
+	}
+	bodies := make(map[string][]byte)
+	for _, requests := range requestsByDomain {
+		originFetches.WithLabelValues(kind, "http").Add(float64(len(requests)))
+		for tl := range requests {
+			resp, ok := responses[tl]
+			if !ok {
+				report(fmt.Errorf("missing response for timeline %s", tl))
+				continue
+			}
+			if resp.StatusCode != http.StatusOK {
+				report(fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode))
+				continue
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				report(fmt.Errorf("failed to read response body for timeline %s: %w", tl, err))
+				continue
+			}
+			bodies[tl] = body
+		}
+	}
+	return bodies
 }
 
 func manifestCacheKey(timeline string) string {
@@ -473,31 +507,16 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 			requestsByDomain[domain][tl] = endpoint.String()
 		}
 
-		if len(requestsByDomain) > 0 {
-			responces, err := r.client.BatchGet(ctx, requestsByDomain)
-			if err != nil {
-				slog.Error("chunkline removed: batch request failed", slog.String("error", err.Error()))
+		bodies := r.fetchFromOrigins(ctx, "removed", requestsByDomain, func(err error) {
+			slog.Error("chunkline removed: origin fetch failed", slog.String("error", err.Error()))
+		})
+		for tl, body := range bodies {
+			var ids []string
+			if err := json.Unmarshal(body, &ids); err != nil {
+				slog.Error("chunkline removed: failed to unmarshal response", slog.String("timeline", tl), slog.String("error", err.Error()))
+				continue
 			}
-			for _, requests := range requestsByDomain {
-				originFetches.WithLabelValues("removed", "http").Add(float64(len(requests)))
-			}
-			for tl, resp := range responces {
-				if resp.StatusCode != http.StatusOK {
-					slog.Error("chunkline removed: non-200 response", slog.String("timeline", tl), slog.Int("status", resp.StatusCode))
-					continue
-				}
-				bytes, err := io.ReadAll(resp.Body)
-				if err != nil {
-					slog.Error("chunkline removed: failed to read response body", slog.String("timeline", tl), slog.String("error", err.Error()))
-					continue
-				}
-				var ids []string
-				if err := json.Unmarshal(bytes, &ids); err != nil {
-					slog.Error("chunkline removed: failed to unmarshal response", slog.String("timeline", tl), slog.String("error", err.Error()))
-					continue
-				}
-				fetched[tl] = ids
-			}
+			fetched[tl] = ids
 		}
 
 		for tl, ids := range fetched {
@@ -685,31 +704,8 @@ func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, unti
 		}
 	}
 
-	if len(requestsByDomain) > 0 {
-		responces, err := r.client.BatchGet(ctx, requestsByDomain)
-		if err != nil {
-			span.RecordError(fmt.Errorf("batch request for iterators failed: %w", err))
-		}
-		for _, requests := range requestsByDomain {
-			originFetches.WithLabelValues("itr", "http").Add(float64(len(requests)))
-			for tl := range requests {
-				resp, ok := responces[tl]
-				if !ok {
-					span.RecordError(fmt.Errorf("missing response for timeline %s", tl))
-					continue
-				}
-				if resp.StatusCode != http.StatusOK {
-					span.RecordError(fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode))
-					continue
-				}
-				bytes, err := io.ReadAll(resp.Body)
-				if err != nil {
-					span.RecordError(fmt.Errorf("failed to read response body for timeline %s: %w", tl, err))
-					continue
-				}
-				fetched[tl] = string(bytes)
-			}
-		}
+	for tl, body := range r.fetchFromOrigins(ctx, "itr", requestsByDomain, func(err error) { span.RecordError(err) }) {
+		fetched[tl] = string(body)
 	}
 
 	currentSubscriptions := r.demand.CurrentSubscriptions()
@@ -889,31 +885,13 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 		return results, nil // all results were cached
 	}
 
-	if len(requestsByDomain) > 0 {
-		responses, err := r.client.BatchGet(ctx, requestsByDomain)
-		if err != nil {
-			span.RecordError(fmt.Errorf("batch request for chunk bodies failed: %w", err))
+	for tl, body := range r.fetchFromOrigins(ctx, "body", requestsByDomain, func(err error) { span.RecordError(err) }) {
+		var items []chunkline.BodyItem
+		if err := json.Unmarshal(body, &items); err != nil {
+			span.RecordError(fmt.Errorf("failed to decode chunk body for timeline %s: %w", tl, err))
+			continue
 		}
-		for _, requests := range requestsByDomain {
-			originFetches.WithLabelValues("body", "http").Add(float64(len(requests)))
-			for tl := range requests {
-				resp, ok := responses[tl]
-				if !ok {
-					span.RecordError(fmt.Errorf("missing response for timeline %s", tl))
-					continue
-				}
-				if resp.StatusCode != http.StatusOK {
-					span.RecordError(fmt.Errorf("non-200 response for timeline %s: %d", tl, resp.StatusCode))
-					continue
-				}
-				var items []chunkline.BodyItem
-				if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-					span.RecordError(fmt.Errorf("failed to decode chunk body for timeline %s: %w", tl, err))
-					continue
-				}
-				fetched[tl] = items
-			}
-		}
+		fetched[tl] = items
 	}
 
 	currentSubscriptions := r.demand.CurrentSubscriptions()

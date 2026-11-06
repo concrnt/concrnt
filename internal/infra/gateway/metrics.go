@@ -31,7 +31,7 @@ var cacheUpdaterQueued = promauto.NewGauge(prometheus.GaugeOpts{
 })
 
 // origin "local" is this server's own timelines read without HTTP; "http"
-// counts the requests to other servers (and to this one before SetLocal)
+// counts the requests to other servers
 var originFetches = promauto.NewCounterVec(prometheus.CounterOpts{
 	Namespace: "concrnt",
 	Subsystem: "chunkline",

@@ -211,9 +211,8 @@ func testAssociationCounts(t *testing.T, be Backend) {
 	require.Empty(t, authors)
 }
 
-// DeleteAssociation reports whether it removed an association, so a second
-// delete of the same one (a replay) is told apart and the counts are only
-// adjusted once.
+// A deleted association leaves the counts and the variant order to the
+// associations left; deleting one that is gone (a replay) is not an error.
 func testAssociationDelete(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
@@ -226,19 +225,11 @@ func testAssociationDelete(t *testing.T, be Backend) {
 	})
 
 	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		removed, err := repo.DeleteAssociation(ctx, tx, "d-1")
-		require.NoError(t, err)
-		require.True(t, removed, "an existing association is removed")
+		require.NoError(t, repo.DeleteAssociation(ctx, tx, "d-1"))
 	})
 	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		removed, err := repo.DeleteAssociation(ctx, tx, "d-1")
-		require.NoError(t, err)
-		require.False(t, removed, "an association already gone is not removed again")
-	})
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		removed, err := repo.DeleteAssociation(ctx, tx, "never-existed")
-		require.NoError(t, err)
-		require.False(t, removed)
+		require.NoError(t, repo.DeleteAssociation(ctx, tx, "d-1"))
+		require.NoError(t, repo.DeleteAssociation(ctx, tx, "never-existed"))
 	})
 
 	counts, err := repo.ComputeAssociationCounts(ctx, associationTargetKey)

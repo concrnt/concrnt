@@ -9,7 +9,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -111,7 +110,7 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 			if uc.sharedCache == nil {
 				return nil
 			}
-			if err := uc.sharedCache.Delete(entityCacheKey(entity.Author)); err != nil && !errors.Is(err, memcache.ErrCacheMiss) {
+			if err := uc.sharedCacheDelete(entityCacheKey(entity.Author)); err != nil {
 				return fmt.Errorf("invalidate cached entity %s: %w", entity.Author, err)
 			}
 			return nil
@@ -212,17 +211,6 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 	}
 }
 
-// SharedCache is the cache shared by every replica (memcached): entities
-// and policy stacks live there, so a commit on one replica invalidates them
-// for all of them.
-type SharedCache interface {
-	Get(key string) (*memcache.Item, error)
-	GetMulti(keys []string) (map[string]*memcache.Item, error)
-	Set(item *memcache.Item) error
-	Add(item *memcache.Item) error
-	Delete(key string) error
-}
-
 // entityCacheTTL bounds how long a write that bypasses saveEntity (conctl)
 // stays invisible.
 const entityCacheTTL = 60
@@ -237,12 +225,6 @@ var entityCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name:      "entity_cache_requests_total",
 	Help:      "Entity lookups by ccid against the entity cache, by result (local: the in-process copy, hit, miss, error: the cache was unreachable).",
 }, []string{"result"})
-
-// SetSharedCache caches the entity lookups by ccid and the policy stacks
-// by cckv in c.
-func (uc *Usecase) SetSharedCache(c SharedCache) {
-	uc.sharedCache = c
-}
 
 func entityCacheKey(ccid string) string {
 	return "entity:" + ccid
@@ -268,29 +250,22 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 		return &entity, nil
 	}
 
-	result := "miss"
-	item, err := uc.sharedCache.Get(entityCacheKey(ccid))
-	if err == nil {
-		var cached cachedEntity
-		if json.Unmarshal(item.Value, &cached) == nil {
-			entityCacheRequests.WithLabelValues("hit").Inc()
-			cached.Entity.SignedDocument = cached.SignedDocument
-			uc.cache.Set(entityCacheKey(ccid), cached.Entity, entityLocalTTL)
-			return &cached.Entity, nil
-		}
-	} else if !errors.Is(err, memcache.ErrCacheMiss) {
-		result = "error"
-	}
+	var cached cachedEntity
+	result := uc.sharedCacheGet(entityCacheKey(ccid), &cached)
 	entityCacheRequests.WithLabelValues(result).Inc()
+	if result == "hit" {
+		cached.Entity.SignedDocument = cached.SignedDocument
+		uc.cache.Set(entityCacheKey(ccid), cached.Entity, entityLocalTTL)
+		return &cached.Entity, nil
+	}
 
 	entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
 	if err != nil {
 		return nil, err
 	}
 	uc.cache.Set(entityCacheKey(ccid), *entity, entityLocalTTL)
-	value, err := json.Marshal(cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument})
-	if err == nil && result == "miss" {
-		_ = uc.sharedCache.Set(&memcache.Item{Key: entityCacheKey(ccid), Value: value, Expiration: entityCacheTTL})
+	if result == "miss" {
+		uc.sharedCacheSet(entityCacheKey(ccid), cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument}, entityCacheTTL)
 	}
 	return entity, nil
 }

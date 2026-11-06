@@ -100,7 +100,7 @@ phase 2 (`behavior:` in the PR).
 | Method | Shape / semantics | Verdict |
 |---|---|---|
 | `CreateAssociation(tx, documentID, targetURI, owner, author, schema, variant, unique, createdAt)` | tx; `false` when `documentID` or `unique` already exists (C6). The target key must exist. | keep |
-| `DeleteAssociation(tx, documentID)` | tx; delete by id → whether an association was removed (`false` when already gone), so the count cache takes the removal once. | keep |
+| `DeleteAssociation(tx, documentID)` | tx; delete by id. | keep |
 | `GetAssociatedRecords(targetURI, schema?, variant?, author?, since, until, limit, order)` | eq(target) ∧ eq(schema)? ∧ eq(variant)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). CCFS is composed from the association's owner. | keep |
 | `GetAssociatedRecordCountsBySchema(targetURI)` / `GetAssociatedRecordCountsByVariant(targetURI, schema)` → `ComputeAssociationCounts` | eq(target) → `map[schema]map[variant]count`, each variant carrying the earliest association `createdAt` (its order). One computation serves both reads; the per-schema counts are the sums. Expensive scan; aggregate layer only (C2). | rename + merge (T2.2) |
 

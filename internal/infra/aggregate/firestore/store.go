@@ -34,9 +34,9 @@ const applyMaxAttempts = 32
 // sweep.
 const invalidateBatch = 500
 
-// Name is the definition (aggregate.NameOf) InvalidateDefinition queries
-// by; the key itself is only in the document id.
 type entry struct {
+	// the definition (aggregate.NameOf) InvalidateDefinition queries by; the
+	// key itself is only in the document id
 	Name      string    `firestore:"name"`
 	Value     []byte    `firestore:"value"`
 	AsOf      time.Time `firestore:"asOf"`
