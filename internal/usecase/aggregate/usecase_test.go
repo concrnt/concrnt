@@ -202,7 +202,7 @@ func TestInvalidateAllRecomputesOnBothPaths(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 2, d.computes.Load())
 
-	require.NoError(t, uc.InvalidateAll(ctx, ""))
+	require.NoError(t, uc.InvalidateAll(ctx))
 	d.primary["like"] = 9
 
 	got, err := aggregate.Get(ctx, uc, d.def, "t1")

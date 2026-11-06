@@ -61,8 +61,8 @@ phase 2 (`behavior:` in the PR).
 
 | Method | Shape / semantics | Verdict |
 |---|---|---|
-| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, duplicate id is a silent no-op. `c_date` (receipt time) is set by the backend. | keep |
-| `HasCommitLog(id)` | get(id) → exists. | keep |
+| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, a duplicate id leaves the row as first written and returns `ErrAlreadyCommitted` (the commit path's redelivery check: no read precedes the insert). `c_date` (receipt time) is set by the backend. | keep |
+| `HasCommitLog(id)` | get(id) → exists. Tooling and tests. | keep |
 | `GetAllCommitLogs(owner)` | eq(owner), order(c_date asc). Dump of one owner. | keep |
 | `QueryCommitLogs(owner?, since, until, limit, order)` | eq(owner)?, range(c_date), order(c_date, id). Replication cursor; `QueryRow.CreatedAt` is `c_date`. Ownerless rows carry no CCFS. | keep |
 | `MarkCommitLogGcCandidate(tx, id)` | tx; set flag by id. | keep |
@@ -102,8 +102,7 @@ phase 2 (`behavior:` in the PR).
 | `CreateAssociation(tx, documentID, targetURI, owner, author, schema, variant, unique, createdAt)` | tx; `false` when `documentID` or `unique` already exists (C6). The target key must exist. | keep |
 | `DeleteAssociation(tx, documentID)` | tx; delete by id. | keep |
 | `GetAssociatedRecords(targetURI, schema?, variant?, author?, since, until, limit, order)` | eq(target) ∧ eq(schema)? ∧ eq(variant)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). CCFS is composed from the association's owner. | keep |
-| `GetAssociatedRecordCountsBySchema(targetURI)` → `ComputeAssociationCountsBySchema` | eq(target) → `map[schema]count`. Expensive scan; aggregate layer only (C2). | rename (T2.2) |
-| `GetAssociatedRecordCountsByVariant(targetURI, schema)` → `ComputeAssociationCountsByVariant` | eq(target) ∧ eq(schema) → `map[variant]count` ordered by the earliest association `createdAt` of each variant (bug: Postgres scanned the wrong column and the order was effectively random). | rename + bug (T2.2) |
+| `GetAssociatedRecordCountsBySchema(targetURI)` / `GetAssociatedRecordCountsByVariant(targetURI, schema)` → `ComputeAssociationCounts` | eq(target) → `map[schema]map[variant]count`, each variant carrying the earliest association `createdAt` (its order). One computation serves both reads; the per-schema counts are the sums. Expensive scan; aggregate layer only (C2). | rename + merge (T2.2) |
 
 #### Acks (CIP-10)
 

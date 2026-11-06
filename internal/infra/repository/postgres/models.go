@@ -22,17 +22,19 @@ import (
 //   - idx_commit_logs_c_date_id (c_date, id): replication cursor scan without an
 //     owner filter, ordered by receipt time with id as tie-break; used by
 //     record.Repository.QueryCommitLogs.
-//   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
-//     scans; set by record.Repository.CreateRecord when replacing a key,
-//     MarkCommitLogGcCandidate and MarkCommitLogsGcCandidateByOwner on
-//     unregister, read by CountGcCandidates/ListGcCandidates.
+//   - idx_commit_logs_gc_candidate (gc_candidate) WHERE gc_candidate: marks
+//     commits for later GC scans; set by record.Repository.CreateRecord when
+//     replacing a key, MarkCommitLogGcCandidate and
+//     MarkCommitLogsGcCandidateByOwner on unregister, read by
+//     CountGcCandidates/ListGcCandidates. Partial: almost every row is false
+//     and never looked up by this flag.
 type CommitLog struct {
 	ID          string    `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
 	IP          string    `json:"ip" gorm:"type:text"`
 	Document    string    `json:"document" gorm:"type:text"`
 	Proof       string    `json:"proof" gorm:"type:text"`
 	Owner       string    `json:"owner" gorm:"type:text;index:idx_commit_logs_owner_c_date,priority:1"`
-	GcCandidate bool      `json:"gcCandidate" gorm:"type:boolean;not null;default:false;index:idx_commit_logs_gc_candidate"`
+	GcCandidate bool      `json:"gcCandidate" gorm:"type:boolean;not null;default:false;index:idx_commit_logs_gc_candidate,where:gc_candidate"`
 	CDate       time.Time `json:"cdate" gorm:"type:timestamp with time zone;not null;default:clock_timestamp();index:idx_commit_logs_owner_c_date,priority:2;index:idx_commit_logs_c_date_id,priority:1"`
 }
 
@@ -44,8 +46,9 @@ type CommitLog struct {
 //     record.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
 //     GetChunklineManifest/LookupLocalItrs/LoadLocalBody, and association target
-//     lookups. Prefix scans (QueryByPrefix, QueryRecordSubtree, the parent_id IS
-//     NULL branch of QueryByParent*) also walk it with LIKE.
+//     lookups. Its default collation cannot serve LIKE 'x%'.
+//   - idx_record_keys_uri_c (uri COLLATE "C"): prefix scans; used by
+//     record.Repository.QueryByPrefix and QueryRecordSubtree.
 //   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup
 //     and record joins; used by record.Repository.GetHierarchicalRecordPolicies,
 //     policiesFor and signedDocumentsByID.
@@ -58,12 +61,13 @@ type CommitLog struct {
 //     LookupLocalItrs, and LoadLocalBody.
 //   - idx_record_keys_parent_id_uri (parent_id, uri COLLATE "C"): key-ordered
 //     child listing including placeholder keys (no record_created_at
-//     predicate); used by record.Repository.QueryByParentOrderByKey.
+//     predicate); used by record.Repository.QueryByParentOrderByKey, and the
+//     owner-root (parent_id IS NULL + uri prefix) branch of QueryByParent*.
 type RecordKey struct {
 	ID       int64  `json:"id" gorm:"primaryKey;autoIncrement"`
 	ParentID *int64 `json:"parentID" gorm:"index:idx_record_keys_parent_id_record_id,priority:1;index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
 	// key order is byte order (CONTRACT.md "Key order"), hence COLLATE "C"
-	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\""`
+	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\";index:idx_record_keys_uri_c,collate:\"C\""`
 	RecordID        *string    `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_id_record_id,priority:2;index:idx_record_keys_parent_created_at_record_id,priority:3"`
 	Record          Record     `json:"record" gorm:"foreignKey:RecordID;references:DocumentID;constraint:OnDelete:CASCADE;"`
 	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone;index:idx_record_keys_parent_created_at_record_id,priority:2,sort:desc"`
@@ -112,21 +116,19 @@ type Record struct {
 //   - idx_acks_from_valid_created_at (from, valid, created_at): from-filtered
 //     ack list/count lookup; used by record.Repository.getAckRecords and
 //     getAckRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
-//   - idx_acks_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; same callers.
-//   - idx_acks_schema_valid_created_at (schema, valid, created_at):
-//     schema-filtered ack list/count lookup; same callers.
+//     The to side is read from ackeds and schema only narrows a from
+//     lookup, so those have no index of their own.
 type Ack struct {
 	From   string `json:"from" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:1;index:idx_acks_from_valid_created_at,priority:1"`
-	To     string `json:"to" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:2;index:idx_acks_to_valid_created_at,priority:1"`
-	Schema string `json:"schema" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:3;index:idx_acks_schema_valid_created_at,priority:1"`
+	To     string `json:"to" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:2"`
+	Schema string `json:"schema" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:3"`
 
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
 
-	Valid bool `json:"valid" gorm:"type:boolean;not null;default:true;index:idx_acks_from_valid_created_at,priority:2;index:idx_acks_to_valid_created_at,priority:2;index:idx_acks_schema_valid_created_at,priority:2"`
+	Valid bool `json:"valid" gorm:"type:boolean;not null;default:true;index:idx_acks_from_valid_created_at,priority:2"`
 
-	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;index:idx_acks_from_valid_created_at,priority:3;index:idx_acks_to_valid_created_at,priority:3;index:idx_acks_schema_valid_created_at,priority:3"` // user-provided creation time
+	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;index:idx_acks_from_valid_created_at,priority:3"` // user-provided creation time
 	CDate     time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
 }
 
@@ -136,24 +138,22 @@ type Ack struct {
 //   - idx_acked_from_to_schema UNIQUE (from, to, schema): idempotent ack state
 //     upsert; used by record.Repository.processAcked and filtered by
 //     getAckedRecords/getAckedRecordCounts.
-//   - idx_acked_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by record.Repository.getAckedRecords and
-//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
 //   - idx_acked_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; same callers.
-//   - idx_acked_schema_valid_created_at (schema, valid, created_at):
-//     schema-filtered ack list/count lookup; same callers.
+//     list/count lookup; used by record.Repository.getAckedRecords and
+//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     The from side is read from acks and schema only narrows a to lookup,
+//     so those have no index of their own.
 type Acked struct {
-	From   string `json:"from" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:1;index:idx_acked_from_valid_created_at,priority:1"`
+	From   string `json:"from" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:1"`
 	To     string `json:"to" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:2;index:idx_acked_to_valid_created_at,priority:1"`
-	Schema string `json:"schema" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:3;index:idx_acked_schema_valid_created_at,priority:1"`
+	Schema string `json:"schema" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:3"`
 
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
 
-	Valid bool `json:"valid" gorm:"type:boolean;not null;default:true;index:idx_acked_from_valid_created_at,priority:2;index:idx_acked_to_valid_created_at,priority:2;index:idx_acked_schema_valid_created_at,priority:2"`
+	Valid bool `json:"valid" gorm:"type:boolean;not null;default:true;index:idx_acked_to_valid_created_at,priority:2"`
 
-	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;index:idx_acked_from_valid_created_at,priority:3;index:idx_acked_to_valid_created_at,priority:3;index:idx_acked_schema_valid_created_at,priority:3"` // user-provided creation time
+	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;index:idx_acked_to_valid_created_at,priority:3"` // user-provided creation time
 	CDate     time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
 }
 
@@ -161,15 +161,14 @@ type Acked struct {
 //   - PRIMARY KEY (document_id): one association per commit document and
 //     commit-log foreign-key target; used by record.Repository.DeleteAssociation.
 //   - idx_associations_target_id (target_id): association lookup by target record
-//     key; used by record.Repository.GetAssociatedRecords,
-//     ComputeAssociationCountsBySchema, and ComputeAssociationCountsByVariant.
+//     key; used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_author
 //     (target_id, schema, variant, author): target lookup with optional filters;
 //     used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_created_at
-//     (target_id, schema, variant, created_at): target/schema counts by variant
-//     and earliest association ordering; used by
-//     record.Repository.ComputeAssociationCountsByVariant.
+//     (target_id, schema, variant, created_at): a target's counts by schema and
+//     variant and each variant's earliest association, read from the index
+//     alone; used by record.Repository.ComputeAssociationCounts.
 //   - uni_associations_unique (unique): idempotency key for association writes;
 //     used by record.Repository.CreateAssociation.
 type Association struct {

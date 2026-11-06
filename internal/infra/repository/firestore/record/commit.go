@@ -55,7 +55,7 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		return err
 	}
 	if exists {
-		return nil
+		return ucrecord.ErrAlreadyCommitted
 	}
 	t.set(ref, commitDoc{IP: ip, Document: document, Proof: string(proofBytes), Owner: owner}.toMap())
 	return nil

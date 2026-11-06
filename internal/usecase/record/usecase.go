@@ -3,6 +3,7 @@ package record
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -18,6 +19,11 @@ import (
 	"github.com/concrnt/concrnt/policy"
 )
 
+// ErrAlreadyCommitted is returned by CreateCommitLog for an id the commit
+// log already holds: the document was committed before, and the commit
+// that found out ends as a no-op.
+var ErrAlreadyCommitted = errors.New("document already committed")
+
 type Repository interface {
 	// RunInTx runs fn atomically. fn may be invoked more than once (a backend
 	// may retry on contention), so it must reach the store only through tx and
@@ -26,6 +32,9 @@ type Repository interface {
 	RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error
 
 	// Create / Update
+
+	// CreateCommitLog inserts the commit log by id; an id already held is
+	// left as first written and reported as ErrAlreadyCommitted.
 	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
 
 	CreateEntity(ctx context.Context, tx RepositoryTx, ccid string, alias *string, domain string, documentID string, createdAt time.Time) (bool, error)
@@ -50,10 +59,15 @@ type Repository interface {
 	// layer's cache miss path and the verification tool's reference; request
 	// handlers go through the aggregate layer instead (aggregates.go).
 	ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
-	ComputeAssociationCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
-	// ComputeAssociationCountsByVariant orders the variants by the createdAt
-	// of their earliest association.
-	ComputeAssociationCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
+	// ComputeAssociationCounts counts a target's associations by schema and,
+	// within a schema, by variant (an association without a variant counts
+	// under ""); a variant's Order is the createdAt (unix nanoseconds) of
+	// its earliest association.
+	ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error)
+	// ListAssociationAuthors lists up to limit distinct authors of a target's
+	// associations, in no particular order; a result of exactly limit may be
+	// incomplete.
+	ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -203,6 +217,8 @@ type Usecase struct {
 	// straight from repo.Compute*
 	agg  *aggregate.Usecase
 	aggs aggregates
+	// sharedCache is nil in offline tooling and tests
+	sharedCache SharedCache
 }
 
 func New(

@@ -79,6 +79,15 @@ func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, sch
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {
+	// most targets have no associations and clients re-read the list on
+	// every event: the count cache settles those without touching the
+	// primary data (author / since / until only narrow a result further)
+	if uc.agg != nil {
+		counts, err := uc.associationCounts(ctx, targetURI)
+		if err == nil && !counts.mayMatch(schema, variant, author) {
+			return concrnt.QueryResult{Items: []concrnt.SignedDocument{}}, nil
+		}
+	}
 	rows, err := uc.repo.GetAssociatedRecords(ctx, targetURI, schema, variant, author, since, until, limit+1, order)
 	if err != nil {
 		return concrnt.QueryResult{}, err
@@ -88,21 +97,19 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	if uc.agg == nil {
-		return uc.repo.ComputeAssociationCountsBySchema(ctx, targetURI)
-	}
-	return aggregate.Get(ctx, uc.agg, uc.aggs.bySchema, targetURI)
-}
-
-func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	if uc.agg == nil {
-		return uc.repo.ComputeAssociationCountsByVariant(ctx, targetURI, schema)
-	}
-	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.byVariant, variantTarget(targetURI, schema))
+	counts, err := uc.associationCounts(ctx, targetURI)
 	if err != nil {
 		return nil, err
 	}
-	return counts.ordered(), nil
+	return counts.bySchema(), nil
+}
+
+func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
+	counts, err := uc.associationCounts(ctx, targetURI)
+	if err != nil {
+		return nil, err
+	}
+	return counts.Schemas[schema].ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a
@@ -161,7 +168,7 @@ func (uc *Usecase) Query(ctx context.Context, p QueryParams) (concrnt.QueryResul
 	}
 	stacks := map[string][]concrnt.Policy{}
 	if len(roots) > 0 {
-		stacks, err = uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, roots)
+		stacks, err = uc.policyStacks(ctx, roots)
 		if err != nil {
 			slog.Warn("query: policy stacks unavailable, evaluating without them", slog.String("error", err.Error()))
 			stacks = map[string][]concrnt.Policy{}

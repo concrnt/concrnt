@@ -68,10 +68,24 @@ type SubState struct {
 	writeMu sync.Mutex
 }
 
+// PubSub carries events between replicas. Subscribe delivers the events of
+// the channels starting with one of prefixes on response until ctx is done;
+// SubscribeAll delivers every event. Delivery may be dropped for a
+// subscriber that does not drain response, so callers buffer it. A backend
+// whose server does cheap subject matching (NATS) may subscribe per caller;
+// one whose matching is per connection and linear in the patterns (Redis)
+// holds one subscription per replica and fans out in-process.
 type PubSub interface {
 	Publish(ctx context.Context, channel string, event concrnt.Event) error
 	Subscribe(ctx context.Context, prefixes []string, response chan<- concrnt.Event) error
 	SubscribeAll(ctx context.Context, response chan<- concrnt.Event) error
+}
+
+// PubSubGaps is implemented by a PubSub whose subscription can be lost and
+// re-established, losing the events published in between; fn runs after
+// each such gap so a consumer that mirrors the stream can resynchronize.
+type PubSubGaps interface {
+	OnGap(fn func())
 }
 
 // LeaderSubscriber is the Subscriber that actually dials peer websockets.

@@ -15,7 +15,9 @@ import (
 
 	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
+	"github.com/concrnt/concrnt/internal/domain"
 	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
@@ -42,6 +44,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/infra/cluster"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
@@ -235,10 +238,21 @@ func main() {
 		db               *gorm.DB           // postgres only; the aggregate store's default home
 		spannerClient    *gspanner.Client   // spanner only; same role
 		firestoreClient  *gfirestore.Client // firestore only; same role
+		// logged as one line once the job queue is sized
+		concurrencySettings []any
 	)
 	switch conf.Backends.Database {
 	case "", "postgres":
-		pg, err := database.NewPostgres(conf.Backends.PostgresDsn)
+		pool, clamped := conf.Backends.Postgres.WithDefaults()
+		if clamped {
+			slog.Warn("backends.postgres: maxConcurrentTx lowered to half of maxOpenConns (a transaction's reads take a second connection)",
+				slog.Int("configuredMaxOpenConns", conf.Backends.Postgres.MaxOpenConns),
+				slog.Int("configuredMaxConcurrentTx", conf.Backends.Postgres.MaxConcurrentTx),
+				slog.Int("maxOpenConns", pool.MaxOpenConns),
+				slog.Int("maxConcurrentTx", pool.MaxConcurrentTx))
+		}
+		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", pool.MaxOpenConns), slog.Int("postgresMaxConcurrentTx", pool.MaxConcurrentTx))
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, pool.MaxOpenConns)
 		if err != nil {
 			panic("failed to connect database: " + err.Error())
 		}
@@ -256,7 +270,7 @@ func main() {
 
 		db = pg
 		databaseReady = sqlDB.PingContext
-		recordRepo = pgrecord.New(pg, cl, domainConfig)
+		recordRepo = pgrecord.New(pg, cl, domainConfig, pool.MaxConcurrentTx)
 		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
 		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
 		notificationRepo = postgres.NewNotificationRepository(pg)
@@ -349,6 +363,8 @@ func main() {
 		aggregateStore = aggfirestore.New(firestoreClient)
 	case "redis":
 		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
 	case "":
 		switch {
 		case db != nil:
@@ -361,7 +377,7 @@ func main() {
 			aggregateStore = aggredis.New(redis)
 		}
 	default:
-		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis)")
+		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis, memcached)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
@@ -394,7 +410,9 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog))
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	slog.Info("concurrency settings", append(concurrencySettings, slog.Int("jobQueueConsumers", jobQueueConcurrency))...)
+	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
 		service.GlobalParameters{
@@ -407,6 +425,29 @@ func main() {
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
+	recordUC.SetSharedCache(mc)
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		entity, err := recordUC.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
+		if err != nil || entity.Domain != domainConfig.FQDN {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		// the resolve endpoint this replaces answers without a requester
+		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if errors.Is(err, domain.ErrNotFound) {
+			// this server is the owner's home: the HTTP path would ask this
+			// same server and 404 (a new user's subkey before its enact)
+			return concrnt.SignedDocument{}, false, client.ErrNotFound
+		}
+		if err != nil {
+			// redirects (reference records) and denied reads keep the HTTP path
+			return concrnt.SignedDocument{}, false, nil
+		}
+		return *sd, true, nil
+	})
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := recordRepo
@@ -472,6 +513,7 @@ func main() {
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
 	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineGateway.SetLocal(domainConfig.FQDN, chunklineUC)
 
 	go func() {
 		if err := jobQueue.Run(ctx); err != nil {
@@ -530,7 +572,7 @@ func main() {
 		abuseUC,
 		subscriptionUC,
 	)
-	api := e.Group("", authMiddleware.IdentifyIdentity, authMiddleware.IdentifyIdentity)
+	api := e.Group("", authMiddleware.IdentifyIdentity)
 
 	if conf.Integrations.CaptchaSecret != "" {
 		validator, err := recaptcha.NewWithSecert(conf.Integrations.CaptchaSecret)

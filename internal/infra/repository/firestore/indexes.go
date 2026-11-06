@@ -81,8 +81,8 @@ var shapes = []queryShape{
 	{Name: "entities.byAlias", Collection: ColEntities, Equalities: []string{"alias"}},
 	{Name: "entities.byDocumentID", Collection: ColEntities, Equalities: []string{"documentID"}},
 	{Name: "servers.byCSID", Collection: ColServers, Equalities: []string{"csID"}},
-	// aggregate.Store.InvalidateAll
-	{Name: "aggregate_entries.byKeyPrefix", Collection: ColAggregateEntries, Range: "key", OrderBy: []orderField{{"key", false}}},
+	// aggregate.Store.InvalidateDefinition
+	{Name: "aggregate_entries.byName", Collection: ColAggregateEntries, Equalities: []string{"name"}},
 }
 
 // needsCompositeIndex reports whether a shape (with a given set of optional

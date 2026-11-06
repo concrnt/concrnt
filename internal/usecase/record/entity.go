@@ -9,6 +9,9 @@ import (
 	"net"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
@@ -101,7 +104,18 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 		return &commitApplyResult{result: &sd, noop: true}, nil
 	}
 
-	return &commitApplyResult{result: &sd}, nil
+	return &commitApplyResult{result: &sd, postProcesses: []PostProcessAction{
+		func(ctx context.Context) error {
+			uc.cache.Delete(entityCacheKey(entity.Author))
+			if uc.sharedCache == nil {
+				return nil
+			}
+			if err := uc.sharedCacheDelete(entityCacheKey(entity.Author)); err != nil {
+				return fmt.Errorf("invalidate cached entity %s: %w", entity.Author, err)
+			}
+			return nil
+		},
+	}}, nil
 }
 
 func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, error) {
@@ -157,7 +171,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		return uc.GetEntity(ctx, redirect)
 	} else {
 		ccid := parsed.Owner
-		entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
+		entity, err := uc.getEntityByCCID(ctx, ccid)
 		if err == nil {
 			if parsed.Hint != nil && *parsed.Hint != entity.Domain && *parsed.Hint != uc.config.FQDN && uc.kvs != nil && uc.client != nil {
 				go uc.recheckEntityByHint(context.WithoutCancel(ctx), ccid, *parsed.Hint)
@@ -189,12 +203,71 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 		}
 
 		// commit済みなので今度は成功するはず
-		entity, err = uc.repo.GetEntityByCCID(ctx, ccid)
+		entity, err = uc.getEntityByCCID(ctx, ccid)
 		if err != nil {
 			return nil, err
 		}
 		return entity, nil
 	}
+}
+
+// entityCacheTTL bounds how long a write that bypasses saveEntity (conctl)
+// stays invisible.
+const entityCacheTTL = 60
+
+// entityLocalTTL is the in-process copy in front of memcached: a session
+// authenticates with the same entity on every request, and a commit on
+// another replica reaches this one after at most this long.
+const entityLocalTTL = 5 * time.Second
+
+var entityCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "concrnt",
+	Name:      "entity_cache_requests_total",
+	Help:      "Entity lookups by ccid against the entity cache, by result (local: the in-process copy, hit, miss, error: the cache was unreachable).",
+}, []string{"result"})
+
+func entityCacheKey(ccid string) string {
+	return "entity:" + ccid
+}
+
+// cachedEntity carries the SignedDocument that domain.Entity leaves out of
+// its JSON.
+type cachedEntity struct {
+	Entity         domain.Entity           `json:"entity"`
+	SignedDocument *concrnt.SignedDocument `json:"signedDocument"`
+}
+
+// getEntityByCCID is repo.GetEntityByCCID behind the entity cache. Misses
+// are not cached: an unknown ccid is fetched from its hint on first use.
+func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+	if uc.sharedCache == nil {
+		return uc.repo.GetEntityByCCID(ctx, ccid)
+	}
+
+	if x, found := uc.cache.Get(entityCacheKey(ccid)); found {
+		entityCacheRequests.WithLabelValues("local").Inc()
+		entity := x.(domain.Entity)
+		return &entity, nil
+	}
+
+	var cached cachedEntity
+	result := uc.sharedCacheGet(entityCacheKey(ccid), &cached)
+	entityCacheRequests.WithLabelValues(result).Inc()
+	if result == "hit" {
+		cached.Entity.SignedDocument = cached.SignedDocument
+		uc.cache.Set(entityCacheKey(ccid), cached.Entity, entityLocalTTL)
+		return &cached.Entity, nil
+	}
+
+	entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
+	if err != nil {
+		return nil, err
+	}
+	uc.cache.Set(entityCacheKey(ccid), *entity, entityLocalTTL)
+	if result == "miss" {
+		uc.sharedCacheSet(entityCacheKey(ccid), cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument}, entityCacheTTL)
+	}
+	return entity, nil
 }
 
 const entityRecheckTTL = time.Hour
@@ -290,8 +363,10 @@ func (uc *Usecase) getEntityWithReference(ctx context.Context, ip string, ccid s
 	}
 	uri.Hint = &referenced.Value.Domain
 
+	// a stale cached copy only makes a not-newer document look newer, and
+	// its commit is then a no-op of the accept-if-newer upsert
 	newer := true
-	stored, err := uc.repo.GetEntityByCCID(ctx, ccid)
+	stored, err := uc.getEntityByCCID(ctx, ccid)
 	if err == nil && stored.SignedDocument != nil {
 		var storedDoc concrnt.Document[schemas.Entity]
 		if err := json.Unmarshal([]byte(stored.SignedDocument.Document), &storedDoc); err == nil {

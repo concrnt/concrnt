@@ -14,7 +14,11 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections. Transactions hold
+// one connection while their reads take another (CONTRACT.md C4), so the
+// record repository must run at most maxOpenConns/2 of them at once
+// (config.Postgres.WithDefaults).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -47,8 +51,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	sqlDB.SetMaxOpenConns(8)
-	sqlDB.SetMaxIdleConns(8)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 

@@ -180,7 +180,12 @@ backend's package, and every backend passes the same contract suites
 
 - `postgres` (default): `internal/infra/repository/postgres`, GORM over
   `backends.postgresDsn`. Schema changes are numbered steps in
-  `postgres/migrations.go`, applied at server start.
+  `postgres/migrations.go`, applied at server start. Each replica opens up
+  to `backends.postgres.maxOpenConns` connections (default 64) and runs at
+  most `maxConcurrentTx` transactions at once (default and cap: half the
+  pool), so keep replicas × maxOpenConns (+ conctl and exporters) under the
+  server's `max_connections` (`SHOW max_connections`; Cloud SQL sizes it
+  from memory, e.g. 100 on db-custom-1-3840, so set the flag explicitly).
 - `sqlite`: `internal/infra/repository/sqlite`, GORM over the pure-Go (wasm,
   no cgo) `github.com/ncruces/go-sqlite3`, one file at `backends.sqlite.path`
   (default `./concrnt.db`). Its own models live in `sqlite/models.go` and are
@@ -250,6 +255,11 @@ the operational notes.
 `migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,
 `import-commitlog`, `gc-commitlog`, `dump-/import-subscriptions`,
 `aggregate-*`) work on every backend.
+
+Entities are cached in memcached (`entity:<ccid>`, 60 s) for every backend.
+Entity commits invalidate the entry, but `conctl` edits of the `entities`
+table (a changed `tag`, `delete-user`, `gc-commitlog`) do not reach the
+cache and take effect within that TTL.
 
 ### Migration
 

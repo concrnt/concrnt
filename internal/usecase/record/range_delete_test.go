@@ -123,6 +123,9 @@ func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx Repos
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
+func (r *rangeDeleteRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
+}
 func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf, afterURI: afterURI, limit: limit})
 	out := []concrnt.SignedDocument{}
@@ -184,6 +187,33 @@ type recordingDeliveryQueue struct {
 	jobs      []DeliveryJob
 	rangeJobs []RangeDeleteJob
 	handlers  map[string]func(ctx context.Context, payload json.RawMessage) error
+	// published holds the events sent through publishRecorder
+	published []concrnt.Event
+}
+
+// publishRecorder is the signal of a usecase whose local channels skip the
+// queue; it keeps their events next to the queued ones.
+type publishRecorder struct{ d *recordingDeliveryQueue }
+
+func (p publishRecorder) Publish(ctx context.Context, channel string, event concrnt.Event) error {
+	p.d.published = append(p.d.published, event)
+	return nil
+}
+
+// deletedEventURIs lists the URIs of the deleted events, published or queued.
+func (d *recordingDeliveryQueue) deletedEventURIs() []string {
+	uris := []string{}
+	for _, event := range d.published {
+		if event.Type == "deleted" {
+			uris = append(uris, event.URI)
+		}
+	}
+	for _, job := range d.jobs {
+		if job.Event != nil && job.Event.Type == "deleted" {
+			uris = append(uris, job.Event.URI)
+		}
+	}
+	return uris
 }
 
 func (d *recordingDeliveryQueue) Enqueue(ctx context.Context, jobType string, payload any) error {
@@ -250,14 +280,14 @@ func signedDelete(t *testing.T, ccid, privKeyHex, target string) concrnt.SignedD
 // newRangeDeleteUsecase wires a usecase whose delete author is a local,
 // resolvable entity. The subtree base's owner is the server FQDN itself, so
 // ResolveResourceHost resolves it locally without any network.
-func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery usecase.JobQueue, kvs usecase.KVS) *Usecase {
+func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery *recordingDeliveryQueue, kvs usecase.KVS) *Usecase {
 	return New(
 		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
 		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
-		nopSignalService{},
+		publishRecorder{delivery},
 		pol,
 		delivery,
 		kvs,
@@ -306,13 +336,7 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 	}
 
 	// one "deleted" event per target, addressed to the concrete URI
-	deletedEventURIs := []string{}
-	for _, job := range delivery.jobs {
-		if job.Event != nil && job.Event.Type == "deleted" {
-			deletedEventURIs = append(deletedEventURIs, job.Event.URI)
-		}
-	}
-	if !slices.Equal(deletedEventURIs, wantURIs) {
+	if deletedEventURIs := delivery.deletedEventURIs(); !slices.Equal(deletedEventURIs, wantURIs) {
 		t.Fatalf("deleted events for %v, want %v", deletedEventURIs, wantURIs)
 	}
 
@@ -619,7 +643,7 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
-		nopSignalService{},
+		publishRecorder{delivery},
 		&denyKeysPolicyService{},
 		delivery,
 		nil,
@@ -655,12 +679,8 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 
 	// one "deleted" event per target and destination (the target itself and
 	// its distribute destination), so each target shows up once per channel
-	eventURIs := []string{}
-	for _, job := range delivery.jobs {
-		if job.Event != nil && job.Event.Type == "deleted" {
-			eventURIs = append(eventURIs, job.Event.URI)
-		}
-	}
+	eventURIs := delivery.deletedEventURIs()
+	slices.Sort(eventURIs)
 	want := []string{base, base, base + "/a", base + "/a"}
 	if !slices.Equal(eventURIs, want) {
 		t.Fatalf("deleted events for %v, want %v", eventURIs, want)

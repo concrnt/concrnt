@@ -34,6 +34,13 @@ backends:
   # and needs no database server; redis and memcached are still required.
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # postgres sizes the connection pool of each replica. replicas x
+  # maxOpenConns must stay under the server's max_connections. a
+  # transaction's reads take a second connection, so maxConcurrentTx is
+  # capped at maxOpenConns/2 (a larger value is lowered with a warning).
+  # postgres:
+  #   maxOpenConns: 64      # default 64
+  #   maxConcurrentTx: 32   # default maxOpenConns/2
   # sqlite:
   #   path: /var/lib/concrnt/concrnt.db
   # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),
@@ -59,14 +66,20 @@ backends:
   memcachedAddr: "memcached:11211"
   # aggregate is the cache of counts (association counts, ack counts).
   # store: postgres, spanner or firestore (a table / collection in the
-  # record database) or redis; the default is the record database when it
-  # is postgres, spanner or firestore, redis otherwise.
+  # record database), redis or memcached; the default is the record
+  # database when it is postgres, spanner or firestore, redis otherwise.
+  # memcached shares memcachedAddr with the timeline chunk cache, and
+  # `aggregate-invalidate` there reaches the other replicas within 5s.
   # the cache is never the source of truth: `conctl op aggregate-invalidate
   # --all` drops it and every count is recomputed on its next read.
   # aggregate:
   #   store: postgres
   #   ttl: 24h
   #   maxDeltas: 10000
+  # jobqueue runs the background jobs (federation delivery, realtime
+  # events); concurrency is the consumer goroutines per replica.
+  # jobqueue:
+  #   concurrency: 16       # default 16
 
 observability:
   enableTrace: true

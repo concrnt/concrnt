@@ -21,17 +21,19 @@ import "gorm.io/gorm"
 //   - idx_commit_logs_c_date_id (c_date, id): replication cursor scan without an
 //     owner filter, ordered by receipt time with id as tie-break; used by
 //     record.Repository.QueryCommitLogs.
-//   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
-//     scans; set by record.Repository.CreateRecord when replacing a key,
-//     MarkCommitLogGcCandidate and MarkCommitLogsGcCandidateByOwner on
-//     unregister, read by CountGcCandidates/ListGcCandidates.
+//   - idx_commit_logs_gc_candidate (gc_candidate) WHERE gc_candidate: marks
+//     commits for later GC scans; set by record.Repository.CreateRecord when
+//     replacing a key, MarkCommitLogGcCandidate and
+//     MarkCommitLogsGcCandidateByOwner on unregister, read by
+//     CountGcCandidates/ListGcCandidates. Partial: almost every row is false
+//     and never looked up by this flag.
 type CommitLog struct {
 	ID          string `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
 	IP          string `json:"ip" gorm:"type:text"`
 	Document    string `json:"document" gorm:"type:text"`
 	Proof       string `json:"proof" gorm:"type:text"`
 	Owner       string `json:"owner" gorm:"type:text;index:idx_commit_logs_owner_c_date,priority:1"`
-	GcCandidate bool   `json:"gcCandidate" gorm:"type:integer;not null;default:false;index:idx_commit_logs_gc_candidate"`
+	GcCandidate bool   `json:"gcCandidate" gorm:"type:integer;not null;default:false;index:idx_commit_logs_gc_candidate,where:gc_candidate"`
 	CDate       int64  `json:"cdate" gorm:"type:integer;not null;index:idx_commit_logs_owner_c_date,priority:2;index:idx_commit_logs_c_date_id,priority:1"`
 }
 
@@ -122,23 +124,21 @@ func (m *Record) BeforeCreate(*gorm.DB) error {
 //   - idx_acks_from_valid_created_at (from, valid, created_at): from-filtered
 //     ack list/count lookup; used by record.Repository.getAckRecords and
 //     getAckRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
-//   - idx_acks_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; same callers.
-//   - idx_acks_schema_valid_created_at (schema, valid, created_at):
-//     schema-filtered ack list/count lookup; same callers.
+//     The to side is read from ackeds and schema only narrows a from
+//     lookup, so those have no index of their own.
 type Ack struct {
 	From   string `json:"from" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:1;index:idx_acks_from_valid_created_at,priority:1"`
-	To     string `json:"to" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:2;index:idx_acks_to_valid_created_at,priority:1"`
-	Schema string `json:"schema" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:3;index:idx_acks_schema_valid_created_at,priority:1"`
+	To     string `json:"to" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:2"`
+	Schema string `json:"schema" gorm:"type:text;index:idx_ack_from_to_schema,unique,priority:3"`
 
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
 
 	// no default: gorm would swap a false for it on insert, and an
 	// unacknowledge may be the first state a (from, to, schema) ever sees
-	Valid bool `json:"valid" gorm:"type:integer;not null;index:idx_acks_from_valid_created_at,priority:2;index:idx_acks_to_valid_created_at,priority:2;index:idx_acks_schema_valid_created_at,priority:2"`
+	Valid bool `json:"valid" gorm:"type:integer;not null;index:idx_acks_from_valid_created_at,priority:2"`
 
-	CreatedAt int64 `json:"createdAt" gorm:"type:integer;not null;index:idx_acks_from_valid_created_at,priority:3;index:idx_acks_to_valid_created_at,priority:3;index:idx_acks_schema_valid_created_at,priority:3"` // user-provided creation time
+	CreatedAt int64 `json:"createdAt" gorm:"type:integer;not null;index:idx_acks_from_valid_created_at,priority:3"` // user-provided creation time
 	CDate     int64 `json:"cdate" gorm:"->;<-:create;type:integer;not null"`
 }
 
@@ -155,24 +155,22 @@ func (m *Ack) BeforeCreate(*gorm.DB) error {
 //   - idx_acked_from_to_schema UNIQUE (from, to, schema): idempotent ack state
 //     upsert; used by record.Repository.processAcked and filtered by
 //     getAckedRecords/getAckedRecordCounts.
-//   - idx_acked_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by record.Repository.getAckedRecords and
-//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
 //   - idx_acked_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; same callers.
-//   - idx_acked_schema_valid_created_at (schema, valid, created_at):
-//     schema-filtered ack list/count lookup; same callers.
+//     list/count lookup; used by record.Repository.getAckedRecords and
+//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     The from side is read from acks and schema only narrows a to lookup,
+//     so those have no index of their own.
 type Acked struct {
-	From   string `json:"from" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:1;index:idx_acked_from_valid_created_at,priority:1"`
+	From   string `json:"from" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:1"`
 	To     string `json:"to" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:2;index:idx_acked_to_valid_created_at,priority:1"`
-	Schema string `json:"schema" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:3;index:idx_acked_schema_valid_created_at,priority:1"`
+	Schema string `json:"schema" gorm:"type:text;index:idx_acked_from_to_schema,unique,priority:3"`
 
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
 
-	Valid bool `json:"valid" gorm:"type:integer;not null;index:idx_acked_from_valid_created_at,priority:2;index:idx_acked_to_valid_created_at,priority:2;index:idx_acked_schema_valid_created_at,priority:2"`
+	Valid bool `json:"valid" gorm:"type:integer;not null;index:idx_acked_to_valid_created_at,priority:2"`
 
-	CreatedAt int64 `json:"createdAt" gorm:"type:integer;not null;index:idx_acked_from_valid_created_at,priority:3;index:idx_acked_to_valid_created_at,priority:3;index:idx_acked_schema_valid_created_at,priority:3"` // user-provided creation time
+	CreatedAt int64 `json:"createdAt" gorm:"type:integer;not null;index:idx_acked_to_valid_created_at,priority:3"` // user-provided creation time
 	CDate     int64 `json:"cdate" gorm:"->;<-:create;type:integer;not null"`
 }
 
@@ -187,15 +185,14 @@ func (m *Acked) BeforeCreate(*gorm.DB) error {
 //   - PRIMARY KEY (document_id): one association per commit document and
 //     commit-log foreign-key target; used by record.Repository.DeleteAssociation.
 //   - idx_associations_target_id (target_id): association lookup by target record
-//     key; used by record.Repository.GetAssociatedRecords,
-//     ComputeAssociationCountsBySchema, and ComputeAssociationCountsByVariant.
+//     key; used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_author
 //     (target_id, schema, variant, author): target lookup with optional filters;
 //     used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_created_at
-//     (target_id, schema, variant, created_at): target/schema counts by variant
-//     and earliest association ordering; used by
-//     record.Repository.ComputeAssociationCountsByVariant.
+//     (target_id, schema, variant, created_at): a target's counts by schema and
+//     variant and each variant's earliest association, read from the index
+//     alone; used by record.Repository.ComputeAssociationCounts.
 //   - uni_associations_unique (unique): idempotency key for association writes;
 //     used by record.Repository.CreateAssociation.
 type Association struct {

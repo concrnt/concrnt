@@ -30,11 +30,14 @@ func New(client *firestore.Client) *Store {
 // the writers of one hot key serialise on its document.
 const applyMaxAttempts = 32
 
-// invalidateBatch is the page of one InvalidateAll sweep.
+// invalidateBatch is the page of one InvalidateDefinition / InvalidateAll
+// sweep.
 const invalidateBatch = 500
 
 type entry struct {
-	Key       string    `firestore:"key"`
+	// the definition (aggregate.NameOf) InvalidateDefinition queries by; the
+	// key itself is only in the document id
+	Name      string    `firestore:"name"`
 	Value     []byte    `firestore:"value"`
 	AsOf      time.Time `firestore:"asOf"`
 	Deltas    int64     `firestore:"deltas"`
@@ -49,8 +52,7 @@ func (e entry) live(now time.Time) bool {
 	return now.Before(e.ExpiresAt)
 }
 
-// keys contain '/' (name:cckv://owner/...), so the document id is a hash
-// and the key itself is a field.
+// keys contain '/' (name:cckv://owner/...), so the document id is a hash.
 func (s *Store) ref(key string) *firestore.DocumentRef {
 	return s.client.Collection(fsrepo.ColAggregateEntries).Doc(fsrepo.HashID(key))
 }
@@ -90,7 +92,7 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, in aggregate.Entry,
 			return nil
 		}
 		won = true
-		return tx.Set(s.ref(key), entry{Key: key, Value: in.Value, AsOf: in.AsOf, Deltas: 0, ExpiresAt: now.Add(ttl)})
+		return tx.Set(s.ref(key), entry{Name: aggregate.NameOf(key), Value: in.Value, AsOf: in.AsOf, Deltas: 0, ExpiresAt: now.Add(ttl)})
 	}, firestore.MaxAttempts(applyMaxAttempts))
 	if err != nil {
 		return false, err
@@ -132,24 +134,29 @@ func (s *Store) Invalidate(ctx context.Context, key string) error {
 	return err
 }
 
-// InvalidateAll walks the keys in order from prefix and deletes until the
-// first key outside the prefix, one page per BulkWriter.
-func (s *Store) InvalidateAll(ctx context.Context, prefix string) error {
-	q := s.client.Collection(fsrepo.ColAggregateEntries).Where("key", ">=", prefix).OrderBy("key", firestore.Asc).Select("key").Limit(invalidateBatch)
+func (s *Store) InvalidateDefinition(ctx context.Context, name string) error {
+	return s.deleteAll(ctx, s.client.Collection(fsrepo.ColAggregateEntries).Where("name", "==", name))
+}
+
+func (s *Store) InvalidateAll(ctx context.Context) error {
+	return s.deleteAll(ctx, s.client.Collection(fsrepo.ColAggregateEntries).Query)
+}
+
+// deleteAll deletes what q matches a page at a time, one BulkWriter per
+// page; a deleted page no longer matches, so every page is the first one.
+func (s *Store) deleteAll(ctx context.Context, q firestore.Query) error {
+	q = q.Select().Limit(invalidateBatch)
 	for {
 		snaps, err := q.Documents(ctx).GetAll()
 		if err != nil {
 			return fsrepo.QueryErr(err)
 		}
+		if len(snaps) == 0 {
+			return nil
+		}
 		bw := s.client.BulkWriter(ctx)
-		var jobs []*firestore.BulkWriterJob
-		done := false
+		jobs := make([]*firestore.BulkWriterJob, 0, len(snaps))
 		for _, snap := range snaps {
-			key, _ := snap.DataAt("key")
-			if k, ok := key.(string); !ok || len(k) < len(prefix) || k[:len(prefix)] != prefix {
-				done = true
-				break
-			}
 			job, err := bw.Delete(snap.Ref)
 			if err != nil {
 				return err
@@ -166,9 +173,8 @@ func (s *Store) InvalidateAll(ctx context.Context, prefix string) error {
 		if err := errors.Join(errs...); err != nil {
 			return err
 		}
-		if done || len(snaps) < invalidateBatch {
+		if len(snaps) < invalidateBatch {
 			return nil
 		}
-		q = q.StartAfter(snaps[len(snaps)-1])
 	}
 }

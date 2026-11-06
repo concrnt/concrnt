@@ -17,7 +17,7 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateRecord")
 	defer span.End()
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, parsed.Key)
+	stack, err := uc.policyStack(ctx, parsed.Key)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -27,6 +27,7 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	policySelf := parsed
 
 	existingSD, err := uc.repo.GetSignedDocument(ctx, parsed.Key)
+	freshKey := errors.Is(err, domain.ErrNotFound)
 	if err == nil {
 		var existingDoc concrnt.Document[any]
 		err = json.Unmarshal([]byte(existingSD.Document), &existingDoc)
@@ -159,6 +160,18 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	}
 
 	postProcesses := []PostProcessAction{}
+
+	// the stored record is a layer of its subtree's stacks when it carries a
+	// policy or distributions, and the one it replaced may have been
+	if parsed.Policy != nil || parsed.Distributes != nil || policyLayerAt(stack, parsed.Key) {
+		postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedKey.Owner))
+	}
+
+	if freshKey {
+		postProcesses = append(postProcesses, uc.associationCountsSeededEmpty(parsed.Key))
+	} else {
+		postProcesses = append(postProcesses, uc.documentCacheInvalidated(&parsed.Key, existingSD.CCFS))
+	}
 
 	if mode == domain.CommitModeExecute {
 		postProcesses = append(postProcesses, func(ctx context.Context) error {

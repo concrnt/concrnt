@@ -126,6 +126,32 @@ func (uc *Usecase) createReferenceDistributionActions(ctx context.Context, ip st
 	return postProcesses, nil
 }
 
+// enqueueEventDelivery delivers a realtime event job. When the channel's
+// owner lives on this server the event is published right away: queued
+// behind federation jobs it reached local subscribers tens of seconds late
+// under load, and Deliver would do nothing remote for a local host anyway.
+func (uc *Usecase) enqueueEventDelivery(ctx context.Context, job DeliveryJob) error {
+	// Deliver's host resolution, with the owner from the entity cache instead
+	// of a resolve request; an unknown owner goes through the queue
+	local := false
+	if parsed, err := concrnt.ParseCCURI(job.ResolveURI); err == nil && job.Event != nil {
+		if concrnt.IsCCID(parsed.Owner) {
+			entity, err := uc.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
+			local = err == nil && entity.Domain == uc.config.FQDN
+		} else {
+			local = parsed.Owner == uc.config.FQDN
+		}
+	}
+	if local {
+		err := uc.signal.Publish(ctx, job.ResolveURI, *job.Event)
+		if err == nil {
+			return nil
+		}
+		slog.Warn("local publish failed, queueing it for retry", slog.String("channel", job.ResolveURI), slog.String("error", err.Error()))
+	}
+	return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, job)
+}
+
 // Deliver executes one delivery job produced by this usecase: resolve the
 // destination (unless it's already a known host), then act locally (publish
 // a realtime event, or re-enter Commit) or remotely (POST to the resolved

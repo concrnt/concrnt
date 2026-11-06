@@ -84,7 +84,8 @@ func TestRequestRoundTripBudgets(t *testing.T) {
 			name:   "resolve a record",
 			path:   "/resolve?uri=" + url.QueryEscape("cckv://con1alice/app/a"),
 			handle: (*Handler).handleResolve,
-			want:   map[string]int{"GetSignedDocument": 1, "GetHierarchicalRecordPolicies": 1},
+			// cckv stacks go through the policy cache, which fetches in bulk
+			want: map[string]int{"GetSignedDocument": 1, "GetHierarchicalRecordPoliciesMulti": 1},
 		},
 		{
 			name:   "chunkline body",

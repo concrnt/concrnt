@@ -104,9 +104,12 @@ func (s *Store) Invalidate(ctx context.Context, key string) error {
 
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
-func (s *Store) InvalidateAll(ctx context.Context, prefix string) error {
-	if prefix == "" {
-		return s.db.WithContext(ctx).Exec(`DELETE FROM aggregate_entries`).Error
-	}
-	return s.db.WithContext(ctx).Exec(`DELETE FROM aggregate_entries WHERE "key" LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%").Error
+// InvalidateDefinition deletes the key range of the definition (the "C"
+// collation lets LIKE with a fixed prefix use the primary key).
+func (s *Store) InvalidateDefinition(ctx context.Context, name string) error {
+	return s.db.WithContext(ctx).Exec(`DELETE FROM aggregate_entries WHERE "key" LIKE ? ESCAPE '\'`, likeEscaper.Replace(aggregate.Key(name, ""))+"%").Error
+}
+
+func (s *Store) InvalidateAll(ctx context.Context) error {
+	return s.db.WithContext(ctx).Exec(`DELETE FROM aggregate_entries`).Error
 }

@@ -37,7 +37,7 @@ func (uc *Usecase) GetSigned(ctx context.Context, uri string) (*concrnt.SignedDo
 			return nil, err
 		}
 
-		sd, err := uc.repo.GetSignedDocument(ctx, uri)
+		sd, err := uc.signedDocumentCached(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
@@ -102,7 +102,7 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 		return err
 	}
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
+	stack, err := uc.policyStack(ctx, policyRoot)
 	if err != nil {
 		span.RecordError(err)
 		stack = []concrnt.Policy{}

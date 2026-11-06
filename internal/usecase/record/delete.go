@@ -215,7 +215,7 @@ func (uc *Usecase) evalDeletePolicy(ctx context.Context, requester domain.Entity
 	if targetDoc.Associate != nil {
 		policyRoot = *targetDoc.Associate
 	}
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
+	stack, err := uc.policyStack(ctx, policyRoot)
 	if err != nil {
 		return err
 	}
@@ -281,6 +281,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 		var removedTimeline, removedItemID string
 
 		if authoritative {
+			postProcesses = append(postProcesses, uc.documentCacheInvalidated(&targetURI, targetSD.CCKV, targetSD.CCFS))
 			switch targetDoc.Kind {
 			case "record":
 
@@ -302,6 +303,10 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					return nil, false, false, err
 				}
 
+				// a deleted record may have been a layer of its subtree's
+				// stacks; deletes are rare enough to drop the owner's stacks
+				postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedURI.Owner))
+
 				switch parsedURI.Scheme {
 				case "cckv":
 					err = uc.repo.DeleteRecordByKey(ctx, tx, targetURI)
@@ -310,7 +315,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 						return nil, false, false, err
 					}
 					// the key's associations cascaded away with the record
-					postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(targetURI))
+					postProcesses = append(postProcesses, uc.associationCountsInvalidated(targetURI))
 				case "ccfs":
 					if parsedURI.Type != concrnt.CCFSTypeConcrnt {
 						err := errors.New("unsupported ccfs type for delete record: " + parsedURI.Type)
@@ -353,7 +358,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 					return nil, false, false, err
 				}
 				if targetDoc.Associate != nil {
-					postProcesses = append(postProcesses, uc.associationCountsInvalidated(*targetDoc.Associate, targetDoc.Schema))
+					postProcesses = append(postProcesses, uc.associationCountsInvalidated(*targetDoc.Associate))
 				}
 
 				if err := flagDeleted(targetSD, nil); err != nil {
@@ -431,10 +436,13 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				return nil, false, false, err
 			}
 
-			stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, refKey)
+			stack, err := uc.policyStack(ctx, refKey)
 			if err != nil {
 				span.RecordError(err)
 				return nil, false, false, err
+			}
+			if parsedRef, err := concrnt.ParseCCURI(refKey); err == nil && policyLayerAt(stack, refKey) {
+				postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedRef.Owner))
 			}
 
 			err = uc.policy.Eval(
@@ -472,7 +480,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				span.RecordError(err)
 				return nil, false, false, err
 			}
-			postProcesses = append(postProcesses, uc.associationCountsOfTargetInvalidated(refKey))
+			postProcesses = append(postProcesses, uc.associationCountsInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
@@ -506,7 +514,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 			postProcesses = append(
 				postProcesses,
 				func(ctx context.Context) error {
-					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+					return uc.enqueueEventDelivery(ctx, DeliveryJob{
 						ResolveURI: dest,
 						Payload:    remoteSD,
 						Local:      DeliveryLocalPublish,
@@ -567,7 +575,7 @@ func (uc *Usecase) deleteTargets(ctx context.Context, tx RepositoryTx, page dele
 				}
 				postProcesses = append(postProcesses,
 					func(ctx context.Context) error {
-						return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+						return uc.enqueueEventDelivery(ctx, DeliveryJob{
 							ResolveURI: dest,
 							Payload:    remoteSD,
 							Local:      DeliveryLocalPublish,

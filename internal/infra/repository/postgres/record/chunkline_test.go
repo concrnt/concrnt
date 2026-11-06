@@ -25,7 +25,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db, nil, domain.Config{})
+	recordRepo := New(db, nil, domain.Config{}, 8)
 	chunklineRepo := recordRepo
 
 	parentURI := "cckv://con2owner/timeline"
