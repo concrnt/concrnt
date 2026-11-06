@@ -3,12 +3,12 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -137,28 +137,12 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 
 	rows := make([]ucrecord.QueryRow, 0, len(commitLogs))
 	for _, cl := range commitLogs {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		sd, err := repoutil.CommitDocument(cl.Owner, cl.ID, cl.Document, cl.Proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-
-		row := ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				Document: cl.Document,
-				Proof:    proof,
-			},
-			CreatedAt: sqlitedb.Time(cl.CDate),
-		}
-		// an ownerless commit (unrepaired legacy row) has no ccfs namespace to
-		// compose; ComposeCCFSURI("") would yield a URI that misparses
-		if cl.Owner != "" {
-			ccfs := concrnt.ComposeCCFSURI(cl.Owner, concrnt.CCFSTypeConcrnt, cl.ID)
-			row.Row.CCFS = &ccfs
-		}
-
-		rows = append(rows, row)
+		rows = append(rows, ucrecord.QueryRow{Row: sd, CreatedAt: sqlitedb.Time(cl.CDate)})
 	}
 
 	return rows, nil
@@ -228,20 +212,11 @@ func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLog
 func commitLogEntries(logs []sqlitedb.CommitLog) ([]ucrecord.CommitLogEntry, error) {
 	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
 	for _, cl := range logs {
-		var proof concrnt.Proof
-		if cl.Proof != "" {
-			if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
-				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
-			}
+		entry, err := repoutil.CommitLogEntry(cl.ID, cl.IP, cl.Document, cl.Proof, cl.Owner, sqlitedb.Time(cl.CDate))
+		if err != nil {
+			return nil, err
 		}
-		entries = append(entries, ucrecord.CommitLogEntry{
-			ID:       cl.ID,
-			IP:       cl.IP,
-			Document: cl.Document,
-			Proof:    proof,
-			Owner:    cl.Owner,
-			CDate:    sqlitedb.Time(cl.CDate),
-		})
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }

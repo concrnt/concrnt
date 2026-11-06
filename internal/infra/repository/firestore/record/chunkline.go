@@ -2,7 +2,6 @@ package record
 
 import (
 	"context"
-	"net/url"
 	"sync"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/internal/domain"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 )
 
 const (
@@ -53,23 +53,12 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	}
 	if len(snaps) == 1 {
 		if ts, ok := timeAt(snaps[0].Data(), "recordCreatedAt"); ok {
-			chunk := ts.Unix() / 600
+			chunk := ts.Unix() / repoutil.ChunkSize
 			firstChunk = &chunk
 		}
 	}
 
-	safeURI := url.QueryEscape(uri)
-
-	return &chunkline.Manifest{
-		Version:    "1.0",
-		ChunkSize:  600,
-		FirstChunk: firstChunk,
-		Descending: &chunkline.Endpoint{
-			Iterator: "/api/v2/chunkline/itr/{chunk}?uri=" + safeURI,
-			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
-		},
-		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
-	}, nil
+	return repoutil.ChunklineManifest(uri, firstChunk), nil
 }
 
 // LookupLocalItrs finds, per timeline, the chunk holding the newest item at
@@ -80,7 +69,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
-	cutoff := time.Unix((chunkID+1)*600, 0) // descending order
+	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
 
 	refs := make([]*firestore.DocumentRef, 0, len(uris))
 	for _, uri := range uris {
@@ -116,7 +105,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 				return nil
 			}
 			mu.Lock()
-			lookup[uri] = ts.Unix() / 600
+			lookup[uri] = ts.Unix() / repoutil.ChunkSize
 			mu.Unlock()
 			return nil
 		})
@@ -132,8 +121,8 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 
-	chunkDate := time.Unix((chunkID+1)*600, 0)
-	prevChunkDate := time.Unix((chunkID-1)*600, 0)
+	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
+	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
 
 	key, err := r.getKey(ctx, uri)
 	if err != nil {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net/url"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,6 +11,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -172,17 +171,9 @@ func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetHierarchicalRecordPoliciesMulti")
 	defer span.End()
 
-	for _, uri := range uris {
-		parsed, err := concrnt.ParseCCURI(uri)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		if parsed.Scheme != "cckv" {
-			err := fmt.Errorf("policy stacks are keyed by cckv, got %s", uri)
-			span.RecordError(err)
-			return nil, err
-		}
+	if err := repoutil.RequireCCKV(uris); err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 	stacks, err := r.policiesFor(ctx, uris)
 	if err != nil {
@@ -192,56 +183,15 @@ func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 	return stacks, nil
 }
 
-// hierarchyOf lists the ancestor chain of a cckv URI, root first, the URI
-// itself last.
-func hierarchyOf(cckv string) ([]string, error) {
-	hierarchy := []string{}
-	currentURI := cckv
-	for {
-		hierarchy = append([]string{currentURI}, hierarchy...)
-		parentURI, err := url.JoinPath(currentURI, "..")
-		if err != nil {
-			return nil, err
-		}
-		if parentURI == currentURI {
-			break
-		}
-		currentURI = parentURI
-	}
-	return hierarchy, nil
-}
-
-// policiesFor builds the CIP-12 §5.3 policy stack (root first, the resource
-// itself last) of every cckv URI with one query over the union of their
-// ancestor chains.
+// policiesFor builds the policy stack of every cckv URI with one query
+// over the union of their ancestor chains.
 func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[string][]concrnt.Policy, error) {
-	hierarchies := make(map[string][]string, len(cckvs))
-	wanted := map[string]bool{}
-	for _, cckv := range cckvs {
-		if _, ok := hierarchies[cckv]; ok {
-			continue
+	return repoutil.PolicyStacks(cckvs, repoutil.HierarchyOf, func(uris []string) (map[string]repoutil.PolicyLayer, error) {
+		var entries []struct {
+			Uri           string               `gorm:"column:uri"`
+			Policy        *string              `gorm:"column:policy"`
+			Distributions sqlitedb.JSONStrings `gorm:"column:distributions"`
 		}
-		hierarchy, err := hierarchyOf(cckv)
-		if err != nil {
-			return nil, err
-		}
-		hierarchies[cckv] = hierarchy
-		for _, uri := range hierarchy {
-			wanted[uri] = true
-		}
-	}
-	uris := make([]string, 0, len(wanted))
-	for uri := range wanted {
-		uris = append(uris, uri)
-	}
-
-	type tuple struct {
-		Uri           string               `gorm:"column:uri"`
-		Policy        *string              `gorm:"column:policy"`
-		Distributions sqlitedb.JSONStrings `gorm:"column:distributions"`
-	}
-	var entries []tuple
-	if len(uris) > 0 {
 		err := r.db.WithContext(ctx).
 			Model(&sqlitedb.Record{}).
 			Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
@@ -251,93 +201,28 @@ func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[strin
 		if err != nil {
 			return nil, err
 		}
-	}
-
-	// A level with no policy of its own still matters when it distributes: its
-	// virtual parents (the destination timelines' policies) must reach the
-	// stack, so emit it as an empty layer rather than dropping it.
-	tupleMap := make(map[string]tuple)
-	for _, res := range entries {
-		if res.Policy != nil || len(res.Distributions) > 0 {
-			tupleMap[res.Uri] = res
+		layers := make(map[string]repoutil.PolicyLayer, len(entries))
+		for _, e := range entries {
+			layers[e.Uri] = repoutil.PolicyLayer{Policy: e.Policy, Distributions: e.Distributions}
 		}
-	}
-
-	// CIP-12 §5.3: layers are emitted root-first, the target resource itself
-	// last. With the evaluator's strong=first-wins / weak=last-wins folding
-	// this makes strong conclusions prefer the outer (global-side) layers and
-	// weak conclusions the resource itself.
-	stacks := make(map[string][]concrnt.Policy, len(hierarchies))
-	for cckv, hierarchy := range hierarchies {
-		policies := []concrnt.Policy{}
-		for _, uri := range hierarchy {
-			t, ok := tupleMap[uri]
-			if !ok {
-				continue
-			}
-			var policyDoc concrnt.Policy
-			if t.Policy != nil {
-				if err := json.Unmarshal([]byte(*t.Policy), &policyDoc); err != nil {
-					return nil, err
-				}
-			}
-			policyDoc.Source = uri
-			virtualParents := append([]string{}, t.Distributions...)
-			policyDoc.VirtualParents = &virtualParents
-			policies = append(policies, policyDoc)
-		}
-		stacks[cckv] = policies
-	}
-	return stacks, nil
+		return layers, nil
+	})
 }
 
 func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetSignedDocument")
 	defer span.End()
 
-	parsed, err := concrnt.ParseCCURI(uri)
+	sds, err := r.GetSignedDocuments(ctx, []string{uri})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	switch parsed.Scheme {
-	case "cckv":
-		rows, err := scanRecordRows(joinRecords(r.db.WithContext(ctx).Model(&sqlitedb.RecordKey{}), false).Where("record_keys.uri = ?", uri))
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		if len(rows) == 0 {
-			return nil, domain.NotFoundError{Resource: uri}
-		}
-		sd, err := rows[0].signedDocument()
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		return &sd, nil
-
-	case "ccfs":
-		if parsed.Type != concrnt.CCFSTypeConcrnt {
-			return nil, domain.NotFoundError{Resource: uri}
-		}
-		sds, err := r.signedDocumentsByID(ctx, []string{parsed.CDID})
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		sd, ok := sds[parsed.CDID]
-		if !ok {
-			return nil, domain.NotFoundError{Resource: uri}
-		}
-		sd.CCFS = &uri
-		return &sd, nil
-	default:
-		err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
-		span.RecordError(err)
-		return nil, err
+	sd, ok := sds[uri]
+	if !ok {
+		return nil, domain.NotFoundError{Resource: uri}
 	}
+	return sd, nil
 }
 
 // GetSignedDocuments fetches several documents in one statement per URI
@@ -346,28 +231,10 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetSignedDocuments")
 	defer span.End()
 
-	keys := []string{}
-	ids := []string{}
-	idOf := map[string]string{} // ccfs uri -> commit id
-	for _, uri := range uris {
-		parsed, err := concrnt.ParseCCURI(uri)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		switch parsed.Scheme {
-		case "cckv":
-			keys = append(keys, uri)
-		case "ccfs":
-			if parsed.Type == concrnt.CCFSTypeConcrnt {
-				ids = append(ids, parsed.CDID)
-				idOf[uri] = parsed.CDID
-			}
-		default:
-			err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
-			span.RecordError(err)
-			return nil, err
-		}
+	keys, ids, idOf, err := repoutil.PartitionDocumentURIs(uris)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 
 	out := make(map[string]*concrnt.SignedDocument, len(uris))
@@ -502,18 +369,12 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
 	defer span.End()
 
-	parentURI, err := url.JoinPath(uri, "..")
+	parentURI, ok, err := repoutil.ParentURI(uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	parsed, err := url.Parse(parentURI)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if parsed.Path == "" || parsed.Path == "/" {
+	if !ok {
 		return nil, nil
 	}
 

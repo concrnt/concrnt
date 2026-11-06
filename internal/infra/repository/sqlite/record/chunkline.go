@@ -3,12 +3,12 @@ package record
 import (
 	"context"
 	"errors"
-	"net/url"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/chunkline"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
 
@@ -36,25 +36,14 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 		Limit(1).
 		Take(&firstCollectionMember).Error
 	if err == nil {
-		chunk := sqlitedb.Time(*firstCollectionMember.RecordCreatedAt).Unix() / 600
+		chunk := sqlitedb.Time(*firstCollectionMember.RecordCreatedAt).Unix() / repoutil.ChunkSize
 		firstChunk = &chunk
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	safeURI := url.QueryEscape(uri)
-
-	return &chunkline.Manifest{
-		Version:    "1.0",
-		ChunkSize:  600,
-		FirstChunk: firstChunk,
-		Descending: &chunkline.Endpoint{
-			Iterator: "/api/v2/chunkline/itr/{chunk}?uri=" + safeURI,
-			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
-		},
-		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
-	}, nil
+	return repoutil.ChunklineManifest(uri, firstChunk), nil
 }
 
 func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
@@ -68,7 +57,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 
 	var res []TimelineRow
 
-	cutoff := time.Unix((chunkID+1)*600, 0) // descending order
+	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
 
 	latestSubQuery := r.db.
 		Table("record_keys AS child").
@@ -94,7 +83,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 		if row.MaxCreatedAt == nil {
 			continue
 		}
-		lookup[row.URI] = sqlitedb.Time(*row.MaxCreatedAt).Unix() / 600
+		lookup[row.URI] = sqlitedb.Time(*row.MaxCreatedAt).Unix() / repoutil.ChunkSize
 	}
 	return lookup, nil
 }
@@ -103,8 +92,8 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 
-	chunkDate := time.Unix((chunkID+1)*600, 0)
-	prevChunkDate := time.Unix((chunkID-1)*600, 0)
+	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
+	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
 
 	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {

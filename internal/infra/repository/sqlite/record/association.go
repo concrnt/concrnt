@@ -2,12 +2,11 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/utils"
@@ -132,13 +131,12 @@ type commitRow struct {
 func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
 	out := make([]ucrecord.QueryRow, len(rows))
 	for i, row := range rows {
-		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
+		sd, err := repoutil.CommitDocument(row.Owner, row.DocumentID, row.Document, row.Proof)
+		if err != nil {
 			return nil, err
 		}
-		ccfs := concrnt.ComposeCCFSURI(row.Owner, concrnt.CCFSTypeConcrnt, row.DocumentID)
 		out[i] = ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: row.Document, Proof: proof},
+			Row:       sd,
 			CreatedAt: sqlitedb.Time(row.CreatedAt),
 		}
 	}

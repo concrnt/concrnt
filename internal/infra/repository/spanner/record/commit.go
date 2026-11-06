@@ -3,13 +3,13 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -126,22 +126,12 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 
 	rows := make([]ucrecord.QueryRow, 0, len(logs))
 	for _, cl := range logs {
-		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+		sd, err := repoutil.CommitDocument(cl.Owner, cl.ID, cl.Document, cl.Proof)
+		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		row := ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{Document: cl.Document, Proof: proof},
-			CreatedAt: cl.CDate.UTC(),
-		}
-		// an ownerless commit (unrepaired legacy row) has no ccfs namespace to
-		// compose; ComposeCCFSURI("") would yield a URI that misparses
-		if cl.Owner != "" {
-			ccfs := concrnt.ComposeCCFSURI(cl.Owner, concrnt.CCFSTypeConcrnt, cl.ID)
-			row.Row.CCFS = &ccfs
-		}
-		rows = append(rows, row)
+		rows = append(rows, ucrecord.QueryRow{Row: sd, CreatedAt: cl.CDate.UTC()})
 	}
 	return rows, nil
 }
@@ -232,20 +222,11 @@ func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLog
 func commitLogEntries(logs []commitLogRow) ([]ucrecord.CommitLogEntry, error) {
 	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
 	for _, cl := range logs {
-		var proof concrnt.Proof
-		if cl.Proof != "" {
-			if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
-				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
-			}
+		entry, err := repoutil.CommitLogEntry(cl.ID, cl.IP, cl.Document, cl.Proof, cl.Owner, cl.CDate)
+		if err != nil {
+			return nil, err
 		}
-		entries = append(entries, ucrecord.CommitLogEntry{
-			ID:       cl.ID,
-			IP:       cl.IP,
-			Document: cl.Document,
-			Proof:    proof,
-			Owner:    cl.Owner,
-			CDate:    cl.CDate.UTC(),
-		})
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }

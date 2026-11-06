@@ -2,13 +2,13 @@ package record
 
 import (
 	"context"
-	"net/url"
 	"time"
 
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 )
 
 const (
@@ -43,29 +43,18 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 		return nil, err
 	}
 	if found {
-		chunk := first.RecordCreatedAt.Unix() / 600
+		chunk := first.RecordCreatedAt.Unix() / repoutil.ChunkSize
 		firstChunk = &chunk
 	}
 
-	safeURI := url.QueryEscape(uri)
-
-	return &chunkline.Manifest{
-		Version:    "1.0",
-		ChunkSize:  600,
-		FirstChunk: firstChunk,
-		Descending: &chunkline.Endpoint{
-			Iterator: "/api/v2/chunkline/itr/{chunk}?uri=" + safeURI,
-			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
-		},
-		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
-	}, nil
+	return repoutil.ChunklineManifest(uri, firstChunk), nil
 }
 
 func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
-	cutoff := time.Unix((chunkID+1)*600, 0) // descending order
+	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
 
 	rows, err := queryAll[struct {
 		URI          string     `spanner:"uri"`
@@ -88,7 +77,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 		if row.MaxCreatedAt == nil {
 			continue
 		}
-		lookup[row.URI] = row.MaxCreatedAt.Unix() / 600
+		lookup[row.URI] = row.MaxCreatedAt.Unix() / repoutil.ChunkSize
 	}
 	return lookup, nil
 }
@@ -97,8 +86,8 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 
-	chunkDate := time.Unix((chunkID+1)*600, 0)
-	prevChunkDate := time.Unix((chunkID-1)*600, 0)
+	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
+	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
 
 	parentRecordKey, err := readRecordKey(ctx, r.client.Single(), uri)
 	if err != nil {

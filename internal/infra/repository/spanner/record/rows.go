@@ -2,12 +2,12 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -41,23 +41,14 @@ func scanRecordRows(ctx context.Context, q reader, sql string, params map[string
 
 // signedDocument builds the signed document of a row holding a record.
 func (row recordRow) signedDocument() (concrnt.SignedDocument, error) {
-	var proof concrnt.Proof
-	if row.Proof != nil {
-		if err := json.Unmarshal([]byte(*row.Proof), &proof); err != nil {
-			return concrnt.SignedDocument{}, err
-		}
+	return repoutil.RecordDocument(row.URI, deref(row.Owner), *row.RecordID, deref(row.Document), deref(row.Proof))
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
 	}
-	uri := row.URI
-	owner := ""
-	if row.Owner != nil {
-		owner = *row.Owner
-	}
-	document := ""
-	if row.Document != nil {
-		document = *row.Document
-	}
-	ccfs := concrnt.ComposeCCFSURI(owner, concrnt.CCFSTypeConcrnt, *row.RecordID)
-	return concrnt.SignedDocument{CCKV: &uri, CCFS: &ccfs, Document: document, Proof: proof}, nil
+	return *s
 }
 
 // queryRows converts joined rows into query rows carrying the created_at
@@ -97,13 +88,12 @@ type commitRow struct {
 func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
 	out := make([]ucrecord.QueryRow, len(rows))
 	for i, row := range rows {
-		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(row.Proof), &proof); err != nil {
+		sd, err := repoutil.CommitDocument(row.Owner, row.DocumentID, row.Document, row.Proof)
+		if err != nil {
 			return nil, err
 		}
-		ccfs := concrnt.ComposeCCFSURI(row.Owner, concrnt.CCFSTypeConcrnt, row.DocumentID)
 		out[i] = ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: row.Document, Proof: proof},
+			Row:       sd,
 			CreatedAt: row.CreatedAt.UTC(),
 		}
 	}

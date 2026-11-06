@@ -12,6 +12,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
@@ -26,22 +27,39 @@ func NewServerRepository(fs *firestore.Client, cl *client.Client) server.Reposit
 	return &ServerRepository{client: fs, cl: cl}
 }
 
-func serverDocToDomain(m *serverDoc) (*domain.Server, error) {
-	var wkc concrnt.WellKnownConcrnt
-	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
-		return nil, err
-	}
-	return &domain.Server{TagString: m.Tag, WellKnown: wkc}, nil
-}
-
 func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
 	ctx, span := tracer.Start(ctx, "ServerRepository.Resolve")
 	defer span.End()
 
-	if concrnt.IsCSID(identifier) {
-		return r.GetAndCacheByCSID(ctx, identifier, hint)
+	byCSID := concrnt.IsCSID(identifier)
+	var snap *firestore.DocumentSnapshot
+	if byCSID {
+		snaps, err := r.client.Collection(ColServers).Where("csID", "==", identifier).Limit(1).Documents(ctx).GetAll()
+		if err == nil && len(snaps) == 1 {
+			snap = snaps[0]
+		}
+	} else {
+		hint = nil
+		if s, err := r.client.Collection(ColServers).Doc(identifier).Get(ctx); err == nil && s.Exists() {
+			snap = s
+		}
 	}
-	return r.GetAndCacheByFQDN(ctx, identifier)
+	if snap != nil {
+		var s serverDoc
+		if err := decode(snap, &s); err == nil && s.WellKnown != "" {
+			return repoutil.ServerFromWellKnown(s.Tag, s.WellKnown)
+		}
+	}
+	if byCSID && hint == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	wkc, err := r.cl.GetServer(ctx, identifier, hint)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return r.cache(ctx, &wkc)
 }
 
 // cache stores a freshly fetched well-known document under its FQDN.
@@ -61,51 +79,7 @@ func (r *ServerRepository) cache(ctx context.Context, wkc *concrnt.WellKnownConc
 	if err != nil {
 		return nil, err
 	}
-	return serverDocToDomain(&doc)
-}
-
-func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
-	defer span.End()
-
-	snaps, err := r.client.Collection(ColServers).Where("csID", "==", csid).Limit(1).Documents(ctx).GetAll()
-	if err == nil && len(snaps) == 1 {
-		var s serverDoc
-		if err := decode(snaps[0], &s); err == nil && s.WellKnown != "" {
-			return serverDocToDomain(&s)
-		}
-	}
-
-	if hint == nil {
-		return nil, domain.ErrNotFound
-	}
-
-	wkc, err := r.cl.GetServer(ctx, csid, hint)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return r.cache(ctx, &wkc)
-}
-
-func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
-	defer span.End()
-
-	snap, err := r.client.Collection(ColServers).Doc(fqdn).Get(ctx)
-	if err == nil && snap.Exists() {
-		var s serverDoc
-		if err := decode(snap, &s); err == nil && s.WellKnown != "" {
-			return serverDocToDomain(&s)
-		}
-	}
-
-	wkc, err := r.cl.GetServer(ctx, fqdn, nil)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return r.cache(ctx, &wkc)
+	return repoutil.ServerFromWellKnown(doc.Tag, doc.WellKnown)
 }
 
 func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {

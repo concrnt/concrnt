@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -113,22 +113,12 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	rows := make([]ucrecord.QueryRow, 0, len(snaps))
 	for _, snap := range snaps {
 		c := commitFromMap(snap.Data())
-		proof, err := c.proof()
+		sd, err := repoutil.CommitDocument(c.Owner, snap.Ref.ID, c.Document, c.Proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		row := ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{Document: c.Document, Proof: proof},
-			CreatedAt: c.CDate,
-		}
-		// an ownerless commit (unrepaired legacy row) has no ccfs namespace to
-		// compose; ComposeCCFSURI("") would yield a URI that misparses
-		if c.Owner != "" {
-			ccfs := concrnt.ComposeCCFSURI(c.Owner, concrnt.CCFSTypeConcrnt, snap.Ref.ID)
-			row.Row.CCFS = &ccfs
-		}
-		rows = append(rows, row)
+		rows = append(rows, ucrecord.QueryRow{Row: sd, CreatedAt: c.CDate})
 	}
 	return rows, nil
 }
@@ -341,18 +331,11 @@ func commitLogEntries(snaps []*firestore.DocumentSnapshot) ([]ucrecord.CommitLog
 	entries := make([]ucrecord.CommitLogEntry, 0, len(snaps))
 	for _, snap := range snaps {
 		c := commitFromMap(snap.Data())
-		proof, err := c.proof()
+		entry, err := repoutil.CommitLogEntry(snap.Ref.ID, c.IP, c.Document, c.Proof, c.Owner, c.CDate)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse proof for commit %s: %w", snap.Ref.ID, err)
+			return nil, err
 		}
-		entries = append(entries, ucrecord.CommitLogEntry{
-			ID:       snap.Ref.ID,
-			IP:       c.IP,
-			Document: c.Document,
-			Proof:    proof,
-			Owner:    c.Owner,
-			CDate:    c.CDate,
-		})
+		entries = append(entries, entry)
 	}
 	return entries, nil
 }

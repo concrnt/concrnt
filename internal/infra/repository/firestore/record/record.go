@@ -2,7 +2,6 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -164,17 +164,9 @@ func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetHierarchicalRecordPoliciesMulti")
 	defer span.End()
 
-	for _, uri := range uris {
-		parsed, err := concrnt.ParseCCURI(uri)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		if parsed.Scheme != "cckv" {
-			err := fmt.Errorf("policy stacks are keyed by cckv, got %s", uri)
-			span.RecordError(err)
-			return nil, err
-		}
+	if err := repoutil.RequireCCKV(uris); err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 	stacks, err := r.policiesFor(ctx, uris)
 	if err != nil {
@@ -184,73 +176,34 @@ func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 	return stacks, nil
 }
 
-// hierarchyOf lists the ancestor chain of a cckv URI, root first, the URI
-// itself last.
-func hierarchyOf(cckv string) []string {
-	return append(ancestorsOf(cckv), cckv)
-}
-
-// policiesFor builds the CIP-12 §5.3 policy stack (root first, the resource
-// itself last) of every cckv URI with one batch read over the union of
-// their ancestor chains.
+// policiesFor builds the policy stack of every cckv URI with one batch
+// read over the union of their ancestor chains. The chain is the key's
+// own ancestors field plus itself, so it matches what was written.
 func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[string][]concrnt.Policy, error) {
-	hierarchies := make(map[string][]string, len(cckvs))
-	wanted := map[string]bool{}
-	var refs []*firestore.DocumentRef
-	for _, cckv := range cckvs {
-		if _, ok := hierarchies[cckv]; ok {
-			continue
+	hierarchyOf := func(cckv string) ([]string, error) { return append(ancestorsOf(cckv), cckv), nil }
+	return repoutil.PolicyStacks(cckvs, hierarchyOf, func(uris []string) (map[string]repoutil.PolicyLayer, error) {
+		refs := make([]*firestore.DocumentRef, len(uris))
+		for i, uri := range uris {
+			refs[i] = r.col(fs.ColRecordKeys).Doc(keyID(uri))
 		}
-		hierarchy := hierarchyOf(cckv)
-		hierarchies[cckv] = hierarchy
-		for _, uri := range hierarchy {
-			if !wanted[uri] {
-				wanted[uri] = true
-				refs = append(refs, r.col(fs.ColRecordKeys).Doc(keyID(uri)))
-			}
+		docs, err := r.getAll(ctx, refs)
+		if err != nil {
+			return nil, err
 		}
-	}
-	docs, err := r.getAll(ctx, refs)
-	if err != nil {
-		return nil, err
-	}
-
-	// A level with no policy of its own still matters when it distributes: its
-	// virtual parents (the destination timelines' policies) must reach the
-	// stack, so emit it as an empty layer rather than dropping it.
-	keys := make(map[string]recordKeyDoc, len(docs))
-	for _, m := range docs {
-		key := recordKeyFromMap(m)
-		if key.isPlaceholder() || (key.Policies == "" && len(key.Distributions) == 0) {
-			continue
-		}
-		keys[key.URI] = key
-	}
-
-	// CIP-12 §5.3: layers are emitted root-first, the target resource itself
-	// last.
-	stacks := make(map[string][]concrnt.Policy, len(hierarchies))
-	for cckv, hierarchy := range hierarchies {
-		policies := []concrnt.Policy{}
-		for _, uri := range hierarchy {
-			key, ok := keys[uri]
-			if !ok {
+		layers := make(map[string]repoutil.PolicyLayer, len(docs))
+		for _, m := range docs {
+			key := recordKeyFromMap(m)
+			if key.isPlaceholder() {
 				continue
 			}
-			var policyDoc concrnt.Policy
+			layer := repoutil.PolicyLayer{Distributions: key.Distributions}
 			if key.Policies != "" {
-				if err := json.Unmarshal([]byte(key.Policies), &policyDoc); err != nil {
-					return nil, err
-				}
+				layer.Policy = &key.Policies
 			}
-			policyDoc.Source = uri
-			virtualParents := append([]string{}, key.Distributions...)
-			policyDoc.VirtualParents = &virtualParents
-			policies = append(policies, policyDoc)
+			layers[key.URI] = layer
 		}
-		stacks[cckv] = policies
-	}
-	return stacks, nil
+		return layers, nil
+	})
 }
 
 func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
@@ -288,31 +241,16 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetSignedDocuments")
 	defer span.End()
 
-	var keyRefs []*firestore.DocumentRef
-	keyURIs := map[string]string{} // key doc id -> cckv uri
-	var ids []string
-	idOf := map[string]string{} // ccfs uri -> commit id
-	for _, uri := range uris {
-		parsed, err := concrnt.ParseCCURI(uri)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		switch parsed.Scheme {
-		case "cckv":
-			ref := r.col(fs.ColRecordKeys).Doc(keyID(uri))
-			keyRefs = append(keyRefs, ref)
-			keyURIs[ref.ID] = uri
-		case "ccfs":
-			if parsed.Type == concrnt.CCFSTypeConcrnt {
-				ids = append(ids, parsed.CDID)
-				idOf[uri] = parsed.CDID
-			}
-		default:
-			err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
-			span.RecordError(err)
-			return nil, err
-		}
+	cckvs, ids, idOf, err := repoutil.PartitionDocumentURIs(uris)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	keyRefs := make([]*firestore.DocumentRef, len(cckvs))
+	keyURIs := make(map[string]string, len(cckvs)) // key doc id -> cckv uri
+	for i, uri := range cckvs {
+		keyRefs[i] = r.col(fs.ColRecordKeys).Doc(keyID(uri))
+		keyURIs[keyRefs[i].ID] = uri
 	}
 
 	out := make(map[string]*concrnt.SignedDocument, len(uris))

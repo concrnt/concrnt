@@ -1,12 +1,12 @@
 package record
 
 import (
-	"encoding/json"
 	"time"
 
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -47,23 +47,14 @@ func scanRecordRows(query *gorm.DB) ([]recordRow, error) {
 
 // signedDocument builds the signed document of a row holding a record.
 func (row recordRow) signedDocument() (concrnt.SignedDocument, error) {
-	var proof concrnt.Proof
-	if row.Proof != nil {
-		if err := json.Unmarshal([]byte(*row.Proof), &proof); err != nil {
-			return concrnt.SignedDocument{}, err
-		}
+	return repoutil.RecordDocument(row.URI, deref(row.Owner), *row.RecordID, deref(row.Document), deref(row.Proof))
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
 	}
-	uri := row.URI
-	owner := ""
-	if row.Owner != nil {
-		owner = *row.Owner
-	}
-	document := ""
-	if row.Document != nil {
-		document = *row.Document
-	}
-	ccfs := concrnt.ComposeCCFSURI(owner, concrnt.CCFSTypeConcrnt, *row.RecordID)
-	return concrnt.SignedDocument{CCKV: &uri, CCFS: &ccfs, Document: document, Proof: proof}, nil
+	return *s
 }
 
 // queryRows converts joined rows into query rows carrying the created_at

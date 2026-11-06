@@ -10,6 +10,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
@@ -32,25 +33,34 @@ type serverRow struct {
 
 const serverSelect = "SELECT fqdn, cs_id, tag, layer, well_known FROM servers"
 
-func modelToDomainServer(m *serverRow) (*domain.Server, error) {
-	var wkc concrnt.WellKnownConcrnt
-	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
-		return nil, err
-	}
-	return &domain.Server{
-		TagString: m.Tag,
-		WellKnown: wkc,
-	}, nil
-}
-
 func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
 	ctx, span := tracer.Start(ctx, "ServerRepository.Resolve")
 	defer span.End()
 
-	if concrnt.IsCSID(identifier) {
-		return r.GetAndCacheByCSID(ctx, identifier, hint)
+	byCSID := concrnt.IsCSID(identifier)
+	column := "fqdn"
+	if byCSID {
+		column = "cs_id"
+	} else {
+		hint = nil
 	}
-	return r.GetAndCacheByFQDN(ctx, identifier)
+	srv, found, err := queryOne[serverRow](ctx, r.client.Single(), spanner.Statement{
+		SQL:    serverSelect + " WHERE " + column + " = @identifier",
+		Params: map[string]any{"identifier": identifier},
+	})
+	if err == nil && found && srv.WellKnown != "" {
+		return repoutil.ServerFromWellKnown(srv.Tag, srv.WellKnown)
+	}
+	if byCSID && hint == nil {
+		return nil, domain.ErrNotFound
+	}
+
+	wkc, err := r.cl.GetServer(ctx, identifier, hint)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return r.cache(ctx, wkc)
 }
 
 // cache upserts the well-known document by fqdn.
@@ -87,51 +97,7 @@ func (r *ServerRepository) cache(ctx context.Context, wkc concrnt.WellKnownConcr
 	if err != nil {
 		return nil, err
 	}
-	return modelToDomainServer(&newServer)
-}
-
-func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
-	defer span.End()
-
-	srv, found, err := queryOne[serverRow](ctx, r.client.Single(), spanner.Statement{
-		SQL:    serverSelect + " WHERE cs_id = @cs_id",
-		Params: map[string]any{"cs_id": csid},
-	})
-	if err == nil && found && srv.WellKnown != "" {
-		return modelToDomainServer(&srv)
-	}
-
-	if hint == nil {
-		return nil, domain.ErrNotFound
-	}
-
-	wkc, err := r.cl.GetServer(ctx, csid, hint)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return r.cache(ctx, wkc)
-}
-
-func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
-	defer span.End()
-
-	srv, found, err := queryOne[serverRow](ctx, r.client.Single(), spanner.Statement{
-		SQL:    serverSelect + " WHERE fqdn = @fqdn",
-		Params: map[string]any{"fqdn": fqdn},
-	})
-	if err == nil && found && srv.WellKnown != "" {
-		return modelToDomainServer(&srv)
-	}
-
-	wkc, err := r.cl.GetServer(ctx, fqdn, nil)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return r.cache(ctx, wkc)
+	return repoutil.ServerFromWellKnown(newServer.Tag, newServer.WellKnown)
 }
 
 func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {

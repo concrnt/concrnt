@@ -11,6 +11,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
@@ -26,56 +27,36 @@ func NewServerRepository(db *gorm.DB, cl *client.Client) server.Repository {
 	}
 }
 
-func modelToDomainServer(m *Server) (*domain.Server, error) {
-	var wkc concrnt.WellKnownConcrnt
-	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
-		return nil, err
-	}
-	return &domain.Server{
-		TagString: m.Tag,
-		WellKnown: wkc,
-	}, nil
-}
-
 func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
 	ctx, span := tracer.Start(ctx, "ServerRepository.Resolve")
 	defer span.End()
 
-	if concrnt.IsCSID(identifier) {
-		return r.GetAndCacheByCSID(ctx, identifier, hint)
+	byCSID := concrnt.IsCSID(identifier)
+	column := "id"
+	if byCSID {
+		column = "cs_id"
 	} else {
-		return r.GetAndCacheByFQDN(ctx, identifier)
+		hint = nil
 	}
-}
-
-func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
-	defer span.End()
-
 	var server Server
-	err := r.db.WithContext(ctx).
-		Where("cs_id = ?", csid).
-		Take(&server).Error
+	err := r.db.WithContext(ctx).Where(column+" = ?", identifier).Take(&server).Error
 	if err == nil && server.WellKnown != "" {
-		return modelToDomainServer(&server)
+		return repoutil.ServerFromWellKnown(server.Tag, server.WellKnown)
 	}
-
-	if hint == nil {
+	if byCSID && hint == nil {
 		return nil, domain.ErrNotFound
 	}
 
-	wkc, err := r.client.GetServer(ctx, csid, hint)
+	wkc, err := r.client.GetServer(ctx, identifier, hint)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
 	serialized, err := json.Marshal(wkc)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
 	newServer := Server{
 		ID:        wkc.Domain,
 		CSID:      wkc.CSID,
@@ -83,7 +64,6 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 		Tag:       "",
 		WellKnown: string(serialized),
 	}
-
 	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "id"}},
 		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known"}),
@@ -91,51 +71,7 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 	if err != nil {
 		return nil, err
 	}
-
-	return modelToDomainServer(&newServer)
-}
-
-func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
-	defer span.End()
-
-	var server Server
-	err := r.db.WithContext(ctx).
-		Where("id = ?", fqdn).
-		Take(&server).Error
-	if err == nil && server.WellKnown != "" {
-		return modelToDomainServer(&server)
-	}
-
-	wkc, err := r.client.GetServer(ctx, fqdn, nil)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	serialized, err := json.Marshal(wkc)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	newServer := Server{
-		ID:        wkc.Domain,
-		CSID:      wkc.CSID,
-		Layer:     wkc.Layer,
-		Tag:       "",
-		WellKnown: string(serialized),
-	}
-
-	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known"}),
-	}).Create(&newServer).Error
-	if err != nil {
-		return nil, err
-	}
-
-	return modelToDomainServer(&newServer)
+	return repoutil.ServerFromWellKnown(newServer.Tag, newServer.WellKnown)
 }
 
 func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {
