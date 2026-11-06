@@ -64,6 +64,11 @@ func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Ti
 	return err
 }
 
+func (i *inspector) SetRecordCreatedAt(ctx context.Context, documentID string, createdAt time.Time) error {
+	_, err := i.client.Collection(fs.ColRecords).Doc(documentID).Update(ctx, []firestore.Update{{Path: "createdAt", Value: createdAt}})
+	return err
+}
+
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
 	m, found, err := i.fetch(ctx, fs.ColRecords, documentID)
 	if err != nil || !found {

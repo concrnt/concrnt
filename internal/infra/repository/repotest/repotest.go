@@ -35,6 +35,20 @@ type Backend struct {
 	Inspect      Inspector
 }
 
+// Run runs every contract suite against the backend open returns; open
+// must return a fresh, isolated backend per call and is called once per
+// test.
+func Run(t *testing.T, open func(t *testing.T) Backend) {
+	t.Run("Record", func(t *testing.T) { RunRecordSuite(t, open) })
+	t.Run("Association", func(t *testing.T) { RunAssociationSuite(t, open) })
+	t.Run("Ack", func(t *testing.T) { RunAckSuite(t, open) })
+	t.Run("Chunkline", func(t *testing.T) { RunChunklineSuite(t, open) })
+	t.Run("Residence", func(t *testing.T) { RunResidenceSuite(t, open) })
+	t.Run("Replication", func(t *testing.T) { RunReplicationSuite(t, open) })
+	t.Run("Maintenance", func(t *testing.T) { RunMaintenanceSuite(t, open) })
+	t.Run("World", func(t *testing.T) { RunWorldSuite(t, open) })
+}
+
 // Inspector exposes the stored state behind the repository interfaces; each
 // backend implements it over its own store. Every lookup returns nil, nil
 // when the state is absent.
@@ -47,6 +61,10 @@ type Inspector interface {
 	// Record returns the record payload stored for documentID (nil once the
 	// record has been forgotten or deleted while its commit log stays).
 	Record(ctx context.Context, documentID string) (*RecordState, error)
+	// SetRecordCreatedAt overwrites the createdAt stored with the record
+	// payload (not the key's copy of it), so suites can make the two
+	// diverge the way a backdated write does.
+	SetRecordCreatedAt(ctx context.Context, documentID string, createdAt time.Time) error
 	// RecordKey returns the key state for uri, placeholder parents included
 	// (a placeholder has RecordID == nil).
 	RecordKey(ctx context.Context, uri string) (*KeyState, error)
@@ -183,9 +201,9 @@ func SignedDocument(t *testing.T, doc any) concrnt.SignedDocument {
 	}
 }
 
-// CreateChunklineRecord commits a plain record under key, owned by con1owner,
+// createChunklineRecord commits a plain record under key, owned by con1owner,
 // with the given createdAt — the shape the chunkline suites feed on.
-func CreateChunklineRecord(t *testing.T, ctx context.Context, repo record.Repository, id string, key string, createdAt time.Time) {
+func createChunklineRecord(t *testing.T, ctx context.Context, repo record.Repository, id string, key string, createdAt time.Time) {
 	t.Helper()
 
 	sd := SignedDocument(t, concrnt.Document[map[string]string]{

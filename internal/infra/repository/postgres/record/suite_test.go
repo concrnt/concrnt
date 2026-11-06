@@ -25,11 +25,4 @@ func openBackend(t *testing.T) repotest.Backend {
 	}
 }
 
-func TestPostgresRecordSuite(t *testing.T)      { repotest.RunRecordSuite(t, openBackend) }
-func TestPostgresAssociationSuite(t *testing.T) { repotest.RunAssociationSuite(t, openBackend) }
-func TestPostgresAckSuite(t *testing.T)         { repotest.RunAckSuite(t, openBackend) }
-func TestPostgresChunklineSuite(t *testing.T)   { repotest.RunChunklineSuite(t, openBackend) }
-func TestPostgresResidenceSuite(t *testing.T)   { repotest.RunResidenceSuite(t, openBackend) }
-func TestPostgresReplicationSuite(t *testing.T) { repotest.RunReplicationSuite(t, openBackend) }
-func TestPostgresMaintenanceSuite(t *testing.T) { repotest.RunMaintenanceSuite(t, openBackend) }
-func TestPostgresWorldSuite(t *testing.T)       { repotest.RunWorldSuite(t, openBackend) }
+func TestPostgresSuite(t *testing.T) { repotest.Run(t, openBackend) }

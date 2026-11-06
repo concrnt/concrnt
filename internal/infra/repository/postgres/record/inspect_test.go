@@ -54,6 +54,10 @@ func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Ti
 	return i.db.WithContext(ctx).Model(&postgres.CommitLog{}).Where("id = ?", id).Update("c_date", cDate).Error
 }
 
+func (i *inspector) SetRecordCreatedAt(ctx context.Context, documentID string, createdAt time.Time) error {
+	return i.db.WithContext(ctx).Model(&postgres.Record{}).Where("document_id = ?", documentID).Update("created_at", createdAt).Error
+}
+
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
 	var rec postgres.Record
 	found, err := take(i.db.WithContext(ctx).Where("document_id = ?", documentID), &rec)

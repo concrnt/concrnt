@@ -50,6 +50,16 @@ func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Ti
 	return err
 }
 
+func (i *inspector) SetRecordCreatedAt(ctx context.Context, documentID string, createdAt time.Time) error {
+	_, err := i.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		_, err := tx.Update(ctx, spanner.Statement{
+			SQL: "UPDATE records SET created_at = @created_at WHERE id = @id", Params: map[string]any{"id": documentID, "created_at": createdAt},
+		})
+		return err
+	})
+	return err
+}
+
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
 	rec, found, err := spannerdb.QueryOne[struct {
 		Owner         string    `spanner:"owner"`

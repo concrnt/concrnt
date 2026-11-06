@@ -31,11 +31,4 @@ func openBackend(t *testing.T) repotest.Backend {
 	}
 }
 
-func TestSpannerRecordSuite(t *testing.T)      { repotest.RunRecordSuite(t, openBackend) }
-func TestSpannerAssociationSuite(t *testing.T) { repotest.RunAssociationSuite(t, openBackend) }
-func TestSpannerAckSuite(t *testing.T)         { repotest.RunAckSuite(t, openBackend) }
-func TestSpannerChunklineSuite(t *testing.T)   { repotest.RunChunklineSuite(t, openBackend) }
-func TestSpannerResidenceSuite(t *testing.T)   { repotest.RunResidenceSuite(t, openBackend) }
-func TestSpannerReplicationSuite(t *testing.T) { repotest.RunReplicationSuite(t, openBackend) }
-func TestSpannerMaintenanceSuite(t *testing.T) { repotest.RunMaintenanceSuite(t, openBackend) }
-func TestSpannerWorldSuite(t *testing.T)       { repotest.RunWorldSuite(t, openBackend) }
+func TestSpannerSuite(t *testing.T) { repotest.Run(t, openBackend) }
