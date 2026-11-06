@@ -9,7 +9,6 @@ package firestore
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -154,23 +153,11 @@ func (s *Store) deleteAll(ctx context.Context, q firestore.Query) error {
 		if len(snaps) == 0 {
 			return nil
 		}
-		bw := s.client.BulkWriter(ctx)
-		jobs := make([]*firestore.BulkWriterJob, 0, len(snaps))
+		b := fsrepo.NewBulk(ctx, s.client)
 		for _, snap := range snaps {
-			job, err := bw.Delete(snap.Ref)
-			if err != nil {
-				return err
-			}
-			jobs = append(jobs, job)
+			b.Delete(snap.Ref)
 		}
-		bw.End()
-		var errs []error
-		for _, job := range jobs {
-			if _, err := job.Results(); err != nil {
-				errs = append(errs, err)
-			}
-		}
-		if err := errors.Join(errs...); err != nil {
+		if err := b.End(); err != nil {
 			return err
 		}
 		if len(snaps) < invalidateBatch {

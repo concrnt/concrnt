@@ -44,7 +44,7 @@ func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint 
 	} else {
 		hint = nil
 	}
-	srv, found, err := queryOne[serverRow](ctx, r.client.Single(), spanner.Statement{
+	srv, found, err := QueryOne[serverRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    serverSelect + " WHERE " + column + " = @identifier",
 		Params: map[string]any{"identifier": identifier},
 	})
@@ -72,7 +72,7 @@ func (r *ServerRepository) cache(ctx context.Context, wkc concrnt.WellKnownConcr
 	newServer := serverRow{ID: wkc.Domain, CSID: wkc.CSID, Layer: wkc.Layer, Tag: "", WellKnown: string(serialized)}
 
 	_, err = r.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		_, found, err := queryOne[serverRow](ctx, tx, spanner.Statement{
+		_, found, err := QueryOne[serverRow](ctx, tx, spanner.Statement{
 			SQL:    serverSelect + " WHERE fqdn = @fqdn",
 			Params: map[string]any{"fqdn": newServer.ID},
 		})
@@ -104,7 +104,7 @@ func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrn
 	ctx, span := tracer.Start(ctx, "ServerRepository.List")
 	defer span.End()
 
-	servers, err := queryAll[serverRow](ctx, r.client.Single(), spanner.Statement{SQL: serverSelect})
+	servers, err := QueryAll[serverRow](ctx, r.client.Single(), spanner.Statement{SQL: serverSelect})
 	if err != nil {
 		return nil, err
 	}

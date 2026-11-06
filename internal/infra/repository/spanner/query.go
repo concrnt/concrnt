@@ -7,14 +7,15 @@ import (
 	"google.golang.org/api/iterator"
 )
 
-// reader is what a single-use read-only transaction and a read-write
+// Reader is what a single-use read-only transaction and a read-write
 // transaction have in common.
-type reader interface {
+type Reader interface {
 	Query(ctx context.Context, stmt spanner.Statement) *spanner.RowIterator
+	ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
 }
 
-// queryAll runs stmt and decodes every row into a T by column name.
-func queryAll[T any](ctx context.Context, q reader, stmt spanner.Statement) ([]T, error) {
+// QueryAll runs stmt and decodes every row into a T by column name.
+func QueryAll[T any](ctx context.Context, q Reader, stmt spanner.Statement) ([]T, error) {
 	it := q.Query(ctx, stmt)
 	defer it.Stop()
 	var out []T
@@ -34,9 +35,9 @@ func queryAll[T any](ctx context.Context, q reader, stmt spanner.Statement) ([]T
 	}
 }
 
-// queryOne runs stmt and decodes its first row; found is false when there
+// QueryOne runs stmt and decodes its first row; found is false when there
 // is none.
-func queryOne[T any](ctx context.Context, q reader, stmt spanner.Statement) (v T, found bool, err error) {
+func QueryOne[T any](ctx context.Context, q Reader, stmt spanner.Statement) (v T, found bool, err error) {
 	it := q.Query(ctx, stmt)
 	defer it.Stop()
 	row, err := it.Next()

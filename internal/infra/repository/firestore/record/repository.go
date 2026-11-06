@@ -53,7 +53,7 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.Repository
 	attempts := 0
 	err := r.client.RunTransaction(ctx, func(_ context.Context, ftx *firestore.Transaction) error {
 		attempts++
-		tx := newRecordTx(ftx)
+		tx := &recordTx{ftx: ftx, ops: map[string]*pendingWrite{}}
 		if err := fn(tx); err != nil {
 			return err
 		}

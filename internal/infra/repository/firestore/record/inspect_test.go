@@ -77,7 +77,7 @@ func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.Re
 	return &repotest.RecordState{
 		Owner:         rec.Owner,
 		Schema:        rec.Schema,
-		Redirect:      strPtr(rec.Redirect),
+		Redirect:      fs.StrPtr(rec.Redirect),
 		Distributions: distributions,
 		CreatedAt:     rec.CreatedAt,
 	}, nil
@@ -90,9 +90,9 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 	}
 	key := recordKeyFromMap(m)
 	return &repotest.KeyState{
-		RecordID:        strPtr(key.RecordID),
+		RecordID:        fs.StrPtr(key.RecordID),
 		RecordCreatedAt: key.RecordCreatedAt,
-		Redirect:        strPtr(key.Redirect),
+		Redirect:        fs.StrPtr(key.Redirect),
 	}, nil
 }
 
@@ -111,7 +111,7 @@ func (i *inspector) Association(ctx context.Context, documentID string) (*repote
 		return nil, err
 	}
 	a := associationFromMap(m)
-	return &repotest.AssociationState{Owner: a.Owner, Author: a.Author, Variant: strPtr(a.Variant), Unique: a.Unique}, nil
+	return &repotest.AssociationState{Owner: a.Owner, Author: a.Author, Variant: fs.StrPtr(a.Variant), Unique: a.Unique}, nil
 }
 
 func (i *inspector) AssociationCountByUnique(ctx context.Context, unique string) (int64, error) {

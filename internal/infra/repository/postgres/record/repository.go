@@ -69,13 +69,6 @@ var (
 	})
 )
 
-// isRetryableTxError reports serialization_failure / deadlock_detected, the
-// two outcomes Postgres asks the client to retry from scratch.
-func isRetryableTxError(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
-}
-
 func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.RepositoryTx) error) error {
 	waitStart := time.Now()
 	select {
@@ -94,7 +87,11 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.Repository
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			return fn(&recordTx{tx: tx})
 		})
-		if err == nil || !isRetryableTxError(err) || attempt >= txMaxAttempts {
+		// serialization_failure / deadlock_detected are the two outcomes
+		// Postgres asks the client to retry from scratch
+		var pgErr *pgconn.PgError
+		retryable := errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+		if err == nil || !retryable || attempt >= txMaxAttempts {
 			return err
 		}
 		timer := time.NewTimer(backoff)

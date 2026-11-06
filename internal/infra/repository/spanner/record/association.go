@@ -5,6 +5,8 @@ import (
 	"strings"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt/internal/domain"
@@ -37,7 +39,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	// re-delivered is caught by INSERT OR IGNORE on the id, the same logical
 	// association under a new document id by the unique_key lookup (a unique
 	// index violation would otherwise fail the statement).
-	_, found, err := queryOne[struct {
+	_, found, err := spannerdb.QueryOne[struct {
 		ID string `spanner:"id"`
 	}](ctx, stx, spanner.Statement{
 		SQL:    "SELECT id FROM associations WHERE unique_key = @unique",
@@ -112,7 +114,7 @@ func (r *Repository) GetAssociatedRecords(
 	sql := `SELECT a.id AS document_id, a.owner AS owner, a.created_at AS created_at, c.document AS document, c.proof AS proof
 		FROM associations a JOIN commit_logs c ON c.id = a.id WHERE ` + strings.Join(where, " AND ") +
 		orderLimit("a.created_at", "a.id", order, limit, params)
-	rows, err := queryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
+	rows, err := spannerdb.QueryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -125,7 +127,7 @@ func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI str
 	defer span.End()
 
 	// the earliest association of each variant decides the variant order
-	counts, err := queryAll[struct {
+	counts, err := spannerdb.QueryAll[struct {
 		Schema       string    `spanner:"schema"`
 		Variant      *string   `spanner:"variant"`
 		Count        int64     `spanner:"count"`
@@ -163,7 +165,7 @@ func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI strin
 	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
 	defer span.End()
 
-	rows, err := queryAll[struct {
+	rows, err := spannerdb.QueryAll[struct {
 		Author string `spanner:"author"`
 	}](ctx, r.client.Single(), spanner.Statement{
 		SQL:    `SELECT DISTINCT author FROM associations WHERE target_uri = @target LIMIT @limit`,

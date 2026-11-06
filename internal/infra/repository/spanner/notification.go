@@ -92,7 +92,7 @@ func (r *NotificationRepository) List(ctx context.Context) ([]domain.Notificatio
 	ctx, span := tracer.Start(ctx, "Repository.Notification.List")
 	defer span.End()
 
-	models, err := queryAll[subscriptionRow](ctx, r.client.Single(), spanner.Statement{SQL: subscriptionSelect})
+	models, err := QueryAll[subscriptionRow](ctx, r.client.Single(), spanner.Statement{SQL: subscriptionSelect})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -109,7 +109,7 @@ func (r *NotificationRepository) Get(ctx context.Context, vendorID, owner string
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Get")
 	defer span.End()
 
-	model, found, err := queryOne[subscriptionRow](ctx, r.client.Single(), spanner.Statement{
+	model, found, err := QueryOne[subscriptionRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    subscriptionSelect + " WHERE vendor_id = @vendor_id AND owner = @owner",
 		Params: map[string]any{"vendor_id": vendorID, "owner": owner},
 	})

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -31,7 +33,7 @@ var (
 // The state row is keyed by the document id (its commit), so a move is a
 // delete of the old row and an insert of the new one.
 func upsertAck(ctx context.Context, stx *spanner.ReadWriteTransaction, table ackTable, documentID, from, to, schema string, createdAt time.Time, valid bool) (bool, error) {
-	old, found, err := queryOne[struct {
+	old, found, err := spannerdb.QueryOne[struct {
 		ID        string    `spanner:"id"`
 		CreatedAt time.Time `spanner:"created_at"`
 	}](ctx, stx, spanner.Statement{
@@ -125,7 +127,7 @@ func (r *Repository) ackRecords(ctx context.Context, table ackTable, ccid, schem
 	sql := "SELECT a.id AS document_id, a." + table.owner + ` AS owner, a.created_at AS created_at, c.document AS document, c.proof AS proof
 		FROM ` + table.name + " a JOIN commit_logs c ON c.id = a.id WHERE " + strings.Join(where, " AND ") +
 		orderLimit("a.created_at", "a.id", order, limit, params)
-	rows, err := queryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
+	rows, err := spannerdb.QueryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +162,7 @@ func (r *Repository) ackCounts(ctx context.Context, table ackTable, ccid, schema
 		where = append(where, "schema = @schema")
 		params["schema"] = schema
 	}
-	results, err := queryAll[struct {
+	results, err := spannerdb.QueryAll[struct {
 		Schema string `spanner:"schema"`
 		Count  int64  `spanner:"count"`
 	}](ctx, r.client.Single(), spanner.Statement{

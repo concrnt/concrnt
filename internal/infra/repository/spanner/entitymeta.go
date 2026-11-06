@@ -39,7 +39,7 @@ func (r *EntityMetaRepository) SaveMeta(ctx context.Context, meta domain.EntityM
 		info = "null"
 	}
 	_, err := r.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		_, found, err := queryOne[entityMetaRow](ctx, tx, spanner.Statement{
+		_, found, err := QueryOne[entityMetaRow](ctx, tx, spanner.Statement{
 			SQL:    "SELECT ccid, inviter, info FROM entity_meta WHERE ccid = @ccid",
 			Params: map[string]any{"ccid": meta.ID},
 		})
@@ -70,7 +70,7 @@ func (r *EntityMetaRepository) GetMeta(ctx context.Context, ccid string) (*domai
 	ctx, span := tracer.Start(ctx, "Repository.GetMeta")
 	defer span.End()
 
-	meta, found, err := queryOne[entityMetaRow](ctx, r.client.Single(), spanner.Statement{
+	meta, found, err := QueryOne[entityMetaRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    "SELECT ccid, inviter, info FROM entity_meta WHERE ccid = @ccid",
 		Params: map[string]any{"ccid": ccid},
 	})
@@ -136,7 +136,7 @@ func (r *EntityMetaRepository) ListMetas(ctx context.Context, owner string) ([]d
 		stmt.SQL += " WHERE ccid = @ccid"
 		stmt.Params["ccid"] = owner
 	}
-	metas, err := queryAll[entityMetaRow](ctx, r.client.Single(), stmt)
+	metas, err := QueryAll[entityMetaRow](ctx, r.client.Single(), stmt)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err

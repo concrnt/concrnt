@@ -39,10 +39,6 @@ type recordTx struct {
 
 func (*recordTx) IsRepositoryTx() {}
 
-func newRecordTx(ftx *firestore.Transaction) *recordTx {
-	return &recordTx{ftx: ftx, ops: map[string]*pendingWrite{}}
-}
-
 // docState is one document as the transaction sees it: the committed data
 // with the pending writes applied.
 type docState struct {

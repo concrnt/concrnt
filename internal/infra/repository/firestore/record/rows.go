@@ -2,7 +2,6 @@ package record
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -106,19 +105,6 @@ func (r *Repository) getKey(ctx context.Context, uri string) (*recordKeyDoc, err
 	return &key, nil
 }
 
-// keyByRecordID finds the key currently pointing at a record version.
-func (r *Repository) keyByRecordID(ctx context.Context, recordID string) (*recordKeyDoc, error) {
-	snaps, err := r.col(fs.ColRecordKeys).Where("recordID", "==", recordID).Limit(1).Documents(ctx).GetAll()
-	if err != nil {
-		return nil, fs.QueryErr(err)
-	}
-	if len(snaps) == 0 {
-		return nil, nil
-	}
-	key := recordKeyFromMap(snaps[0].Data())
-	return &key, nil
-}
-
 // decodeKeys decodes key snapshots, leaving placeholders out when
 // recordsOnly is set.
 func decodeKeys(snaps []*firestore.DocumentSnapshot, recordsOnly bool) []recordKeyDoc {
@@ -171,54 +157,4 @@ func (r *Repository) keysToQueryRows(ctx context.Context, keys []recordKeyDoc) (
 		})
 	}
 	return rows, nil
-}
-
-// bulk wraps a BulkWriter so callers get every write's outcome: the writer's
-// End only flushes, the results must be awaited per job. A document is
-// written at most once (the BulkWriter rejects a second write to the same
-// document). Not safe for concurrent use.
-type bulk struct {
-	bw   *firestore.BulkWriter
-	jobs []*firestore.BulkWriterJob
-	seen map[string]bool
-	errs []error
-}
-
-func newBulk(ctx context.Context, client *firestore.Client) *bulk {
-	return &bulk{bw: client.BulkWriter(ctx), seen: map[string]bool{}}
-}
-
-func (b *bulk) add(job *firestore.BulkWriterJob, err error) {
-	if err != nil {
-		b.errs = append(b.errs, err)
-		return
-	}
-	b.jobs = append(b.jobs, job)
-}
-
-func (b *bulk) delete(ref *firestore.DocumentRef) {
-	if b.seen[ref.Path] {
-		return
-	}
-	b.seen[ref.Path] = true
-	b.add(b.bw.Delete(ref))
-}
-
-func (b *bulk) update(ref *firestore.DocumentRef, updates []firestore.Update) {
-	if b.seen[ref.Path] {
-		return
-	}
-	b.seen[ref.Path] = true
-	b.add(b.bw.Update(ref, updates))
-}
-
-// end flushes and waits for every write, returning the joined errors.
-func (b *bulk) end() error {
-	b.bw.End()
-	for _, job := range b.jobs {
-		if _, err := job.Results(); err != nil {
-			b.errs = append(b.errs, err)
-		}
-	}
-	return errors.Join(b.errs...)
 }

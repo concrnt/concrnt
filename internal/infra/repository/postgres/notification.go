@@ -31,23 +31,19 @@ func modelToDomainNotification(m Subscription) domain.NotificationSubscription {
 	}
 }
 
-func domainToModelNotification(d domain.NotificationSubscription) Subscription {
-	return Subscription{
-		VendorID:     d.VendorID,
-		Owner:        d.Owner,
-		Schemas:      pq.StringArray(d.Schemas),
-		Prefixes:     pq.StringArray(d.Prefixes),
-		Subscription: d.Subscription,
-		CDate:        d.CDate,
-		MDate:        d.MDate,
-	}
-}
-
 func (r *NotificationRepository) Subscribe(ctx context.Context, subscription domain.NotificationSubscription) (domain.NotificationSubscription, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()
 
-	model := domainToModelNotification(subscription)
+	model := Subscription{
+		VendorID:     subscription.VendorID,
+		Owner:        subscription.Owner,
+		Schemas:      pq.StringArray(subscription.Schemas),
+		Prefixes:     pq.StringArray(subscription.Prefixes),
+		Subscription: subscription.Subscription,
+		CDate:        subscription.CDate,
+		MDate:        subscription.MDate,
+	}
 	if err := r.db.WithContext(ctx).Save(&model).Error; err != nil {
 		span.RecordError(err)
 		return domain.NotificationSubscription{}, err

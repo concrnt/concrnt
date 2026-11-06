@@ -75,8 +75,8 @@ func (r *Repository) CreateRecord(
 		Owner:         owner,
 		Author:        author,
 		Schema:        schema,
-		Redirect:      deref(redirect),
-		Policies:      deref(policies),
+		Redirect:      fs.Deref(redirect),
+		Policies:      fs.Deref(policies),
 		Distributions: distributions,
 		CreatedAt:     createdAt,
 	}.toMap())
@@ -105,8 +105,8 @@ func (r *Repository) CreateRecord(
 		Owner:           owner,
 		Author:          author,
 		Schema:          schema,
-		Redirect:        deref(redirect),
-		Policies:        deref(policies),
+		Redirect:        fs.Deref(redirect),
+		Policies:        fs.Deref(policies),
 		Distributions:   distributions,
 	}.toMap())
 
@@ -138,15 +138,15 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		key, err := r.keyByRecordID(ctx, parsed.CDID)
+		snaps, err := r.col(fs.ColRecordKeys).Where("recordID", "==", parsed.CDID).Limit(1).Select("uri").Documents(ctx).GetAll()
 		if err != nil {
 			span.RecordError(err)
-			return nil, err
+			return nil, fs.QueryErr(err)
 		}
-		if key == nil {
+		if len(snaps) == 0 {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		cckv = key.URI
+		cckv = str(snaps[0].Data(), "uri")
 	}
 
 	stacks, err := r.policiesFor(ctx, []string{cckv})
@@ -418,7 +418,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 
 	// only keys under a timeline key (not the owner root) and holding a
 	// record appear in chunkline bodies
-	if key.ParentURI == "" || isOwnerRoot(key.ParentURI) || key.RecordCreatedAt == nil {
+	if key.ParentURI == "" || len(ancestorsOf(key.ParentURI)) == 0 || key.RecordCreatedAt == nil {
 		return "", "", nil
 	}
 

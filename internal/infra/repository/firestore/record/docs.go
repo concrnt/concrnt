@@ -88,11 +88,6 @@ func parentOf(uri string) string {
 	return ancestors[len(ancestors)-1]
 }
 
-// isOwnerRoot reports whether uri is cckv://<owner> with no key path.
-func isOwnerRoot(uri string) bool {
-	return len(ancestorsOf(uri)) == 0
-}
-
 // commits/{cdid}
 type commitDoc struct {
 	IP          string
@@ -328,16 +323,3 @@ func entityFromMap(m map[string]any) entityDoc {
 }
 
 // strPtr maps the empty string back to the nil the domain uses for "unset".
-func strPtr(s string) *string {
-	if s == "" {
-		return nil
-	}
-	return &s
-}
-
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}

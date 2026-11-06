@@ -41,7 +41,7 @@ func (r *Repository) CreateEntity(
 
 	if !exists {
 		t.set(ref, map[string]any{
-			"alias":      deref(alias),
+			"alias":      fs.Deref(alias),
 			"domain":     domain,
 			"tag":        "",
 			"documentID": documentID,
@@ -59,7 +59,7 @@ func (r *Repository) CreateEntity(
 		return false, nil
 	}
 	t.update(ref, []firestore.Update{
-		{Path: "alias", Value: deref(alias)},
+		{Path: "alias", Value: fs.Deref(alias)},
 		{Path: "domain", Value: domain},
 		{Path: "documentID", Value: documentID},
 		{Path: "createdAt", Value: createdAt},
@@ -84,7 +84,7 @@ func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner
 		Select().Documents(ctx)
 	defer it.Stop()
 
-	b := newBulk(ctx, r.client)
+	b := fs.NewBulk(ctx, r.client)
 	for {
 		snap, err := it.Next()
 		if errors.Is(err, iterator.Done) {
@@ -92,12 +92,12 @@ func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner
 		}
 		if err != nil {
 			span.RecordError(err)
-			_ = b.end()
+			_ = b.End()
 			return fs.QueryErr(err)
 		}
-		b.update(snap.Ref, []firestore.Update{{Path: "gcCandidate", Value: true}})
+		b.Update(snap.Ref, []firestore.Update{{Path: "gcCandidate", Value: true}})
 	}
-	if err := b.end(); err != nil {
+	if err := b.End(); err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -123,7 +123,7 @@ func (r *Repository) entityWithDocument(ctx context.Context, ccid string, m map[
 	return &domain.Entity{
 		ID:             ccid,
 		Domain:         entity.Domain,
-		Alias:          strPtr(entity.Alias),
+		Alias:          fs.StrPtr(entity.Alias),
 		TagString:      entity.Tag,
 		SignedDocument: &concrnt.SignedDocument{Document: commit.Document, Proof: proof},
 	}, nil

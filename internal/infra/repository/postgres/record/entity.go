@@ -2,7 +2,6 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -78,74 +78,49 @@ func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner
 	return nil
 }
 
-func (r *Repository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByCCID")
-	defer span.End()
-
+// getEntity reads one entity row with its commit log.
+func (r *Repository) getEntity(ctx context.Context, where string, arg any) (*domain.Entity, error) {
 	entity, err := gorm.G[postgres.Entity](r.db).
 		Joins(clause.Has("Document"), nil).
-		Where("entities.id = ?", ccid).
+		Where(where, arg).
 		Take(ctx)
 	if err != nil {
-		span.RecordError(err)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, domain.NotFoundError{Resource: "entity"}
 		}
 		return nil, err
 	}
-
-	var proof concrnt.Proof
-	err = json.Unmarshal([]byte(entity.Document.Proof), &proof)
+	proof, err := repoutil.ParseProof(entity.Document.Proof)
 	if err != nil {
 		return nil, err
 	}
-
-	signedDocument := concrnt.SignedDocument{
-		Document: entity.Document.Document,
-		Proof:    proof,
-	}
-
 	return &domain.Entity{
 		ID:             entity.ID,
 		Domain:         entity.Domain,
 		Alias:          entity.Alias,
 		TagString:      entity.Tag,
-		SignedDocument: &signedDocument,
+		SignedDocument: &concrnt.SignedDocument{Document: entity.Document.Document, Proof: proof},
 	}, nil
+}
+
+func (r *Repository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByCCID")
+	defer span.End()
+
+	entity, err := r.getEntity(ctx, "entities.id = ?", ccid)
+	if err != nil {
+		span.RecordError(err)
+	}
+	return entity, err
 }
 
 func (r *Repository) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByAlias")
 	defer span.End()
 
-	entity, err := gorm.G[postgres.Entity](r.db).
-		Joins(clause.Has("Document"), nil).
-		Where("entities.alias = ?", alias).
-		Take(ctx)
+	entity, err := r.getEntity(ctx, "entities.alias = ?", alias)
 	if err != nil {
 		span.RecordError(err)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, domain.NotFoundError{Resource: "entity"}
-		}
-		return nil, err
 	}
-
-	var proof concrnt.Proof
-	err = json.Unmarshal([]byte(entity.Document.Proof), &proof)
-	if err != nil {
-		return nil, err
-	}
-
-	signedDocument := concrnt.SignedDocument{
-		Document: entity.Document.Document,
-		Proof:    proof,
-	}
-
-	return &domain.Entity{
-		ID:             entity.ID,
-		Domain:         entity.Domain,
-		Alias:          entity.Alias,
-		TagString:      entity.Tag,
-		SignedDocument: &signedDocument,
-	}, nil
+	return entity, err
 }

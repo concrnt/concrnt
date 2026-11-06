@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt/chunkline"
@@ -31,7 +33,7 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	}
 
 	var firstChunk *int64
-	first, found, err := queryOne[struct {
+	first, found, err := spannerdb.QueryOne[struct {
 		RecordCreatedAt time.Time `spanner:"record_created_at"`
 	}](ctx, r.client.Single(), spanner.Statement{
 		SQL: `SELECT record_created_at FROM record_keys
@@ -56,7 +58,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 
 	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
 
-	rows, err := queryAll[struct {
+	rows, err := spannerdb.QueryAll[struct {
 		URI          string     `spanner:"uri"`
 		MaxCreatedAt *time.Time `spanner:"max_created_at"`
 	}](ctx, r.client.Single(), spanner.Statement{
@@ -102,7 +104,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 
 	const memberSelect = "SELECT uri, parent_uri, record_id, record_created_at, redirect, clean_on_update FROM record_keys WHERE parent_uri = @parent AND record_created_at < @chunk_date "
 	params := map[string]any{"parent": uri, "chunk_date": chunkDate, "limit": int64(defaultChunkSize)}
-	members, err := queryAll[recordKeyRow](ctx, r.client.Single(), spanner.Statement{
+	members, err := spannerdb.QueryAll[recordKeyRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    memberSelect + "ORDER BY record_created_at DESC LIMIT @limit",
 		Params: params,
 	})
@@ -116,7 +118,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	// diverge (e.g. backdated records) and would skip the window scan.
 	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
 		params["prev_chunk_date"] = prevChunkDate
-		members, err = queryAll[recordKeyRow](ctx, r.client.Single(), spanner.Statement{
+		members, err = spannerdb.QueryAll[recordKeyRow](ctx, r.client.Single(), spanner.Statement{
 			SQL:    memberSelect + "AND record_created_at >= @prev_chunk_date ORDER BY record_created_at DESC",
 			Params: params,
 		})

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
@@ -26,7 +28,7 @@ type recordKeyRow struct {
 var recordKeyColumns = []string{"uri", "parent_uri", "record_id", "record_created_at", "redirect", "clean_on_update"}
 
 // readRecordKey reads the key row of uri; nil when there is none.
-func readRecordKey(ctx context.Context, q reader, uri string) (*recordKeyRow, error) {
+func readRecordKey(ctx context.Context, q spannerdb.Reader, uri string) (*recordKeyRow, error) {
 	row, err := q.ReadRow(ctx, "record_keys", spanner.Key{uri}, recordKeyColumns)
 	if isNotFound(err) {
 		return nil, nil
@@ -167,7 +169,7 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		row, found, err := queryOne[struct {
+		row, found, err := spannerdb.QueryOne[struct {
 			URI string `spanner:"uri"`
 		}](ctx, r.client.Single(), spanner.Statement{
 			SQL:    "SELECT uri FROM record_keys WHERE record_id = @id",
@@ -214,7 +216,7 @@ func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 // over the union of their ancestor chains.
 func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[string][]concrnt.Policy, error) {
 	return repoutil.PolicyStacks(cckvs, repoutil.HierarchyOf, func(uris []string) (map[string]repoutil.PolicyLayer, error) {
-		entries, err := queryAll[struct {
+		entries, err := spannerdb.QueryAll[struct {
 			URI           string   `spanner:"uri"`
 			Policy        *string  `spanner:"policy"`
 			Distributions []string `spanner:"distributions"`
@@ -298,7 +300,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 // signedDocumentsByID reads commit logs by id, each with the key currently
 // pointing at it (if any), in one statement.
 func (r *Repository) signedDocumentsByID(ctx context.Context, ids []string) (map[string]concrnt.SignedDocument, error) {
-	rows, err := queryAll[struct {
+	rows, err := spannerdb.QueryAll[struct {
 		ID       string  `spanner:"id"`
 		Document string  `spanner:"document"`
 		Proof    string  `spanner:"proof"`

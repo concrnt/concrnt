@@ -220,13 +220,13 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 		return 0, err
 	}
 
-	b := newBulk(ctx, r.client)
+	b := fs.NewBulk(ctx, r.client)
 	for _, refs := range targets {
 		for _, ref := range refs {
-			b.delete(ref)
+			b.Delete(ref)
 		}
 	}
-	if err := b.end(); err != nil {
+	if err := b.End(); err != nil {
 		span.RecordError(err)
 		return 0, err
 	}
@@ -245,11 +245,11 @@ func (r *Repository) commitDependents(ctx context.Context, id string) ([]*firest
 	}
 	for _, keySnap := range keySnaps {
 		refs = append(refs, keySnap.Ref)
-		assocs, err := r.associationsOf(ctx, str(keySnap.Data(), "uri"))
+		assocSnaps, err := r.col(fs.ColAssociations).Where("targetURI", "==", str(keySnap.Data(), "uri")).Select("unique").Documents(ctx).GetAll()
 		if err != nil {
-			return nil, err
+			return nil, fs.QueryErr(err)
 		}
-		refs = append(refs, assocs...)
+		refs = append(refs, associationRefs(r.client, assocSnaps)...)
 	}
 
 	assocSnap, err := r.col(fs.ColAssociations).Doc(id).Get(ctx)
@@ -273,16 +273,6 @@ func (r *Repository) commitDependents(ctx context.Context, id string) ([]*firest
 		}
 	}
 	return refs, nil
-}
-
-// associationsOf lists the association documents targeting a key and their
-// uniqueness markers.
-func (r *Repository) associationsOf(ctx context.Context, targetURI string) ([]*firestore.DocumentRef, error) {
-	snaps, err := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("unique").Documents(ctx).GetAll()
-	if err != nil {
-		return nil, fs.QueryErr(err)
-	}
-	return associationRefs(r.client, snaps), nil
 }
 
 func associationRefs(client *firestore.Client, snaps []*firestore.DocumentSnapshot) []*firestore.DocumentRef {

@@ -31,7 +31,7 @@ func (r *EntityMetaRepository) SaveMeta(ctx context.Context, meta domain.EntityM
 	defer span.End()
 
 	err := upsert(ctx, r.col().Doc(meta.ID), map[string]any{
-		"inviter": deref(meta.Inviter),
+		"inviter": Deref(meta.Inviter),
 		"info":    meta.Info,
 		"mDate":   firestore.ServerTimestamp,
 	})
@@ -57,7 +57,7 @@ func (r *EntityMetaRepository) GetMeta(ctx context.Context, ccid string) (*domai
 	if err := decode(snap, &meta); err != nil {
 		return nil, err
 	}
-	return &domain.EntityMeta{ID: ccid, Inviter: strPtr(meta.Inviter), Info: meta.Info}, nil
+	return &domain.EntityMeta{ID: ccid, Inviter: StrPtr(meta.Inviter), Info: meta.Info}, nil
 }
 
 // UpdateMetaInfo replaces only info, preserving inviter.
@@ -121,7 +121,7 @@ func (r *EntityMetaRepository) ListMetas(ctx context.Context, owner string) ([]d
 		if err := decode(snap, &meta); err != nil {
 			return nil, err
 		}
-		result = append(result, domain.EntityMeta{ID: snap.Ref.ID, Inviter: strPtr(meta.Inviter), Info: meta.Info})
+		result = append(result, domain.EntityMeta{ID: snap.Ref.ID, Inviter: StrPtr(meta.Inviter), Info: meta.Info})
 	}
 	return result, nil
 }

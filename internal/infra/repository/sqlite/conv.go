@@ -21,14 +21,6 @@ func Time(us int64) time.Time {
 	return time.UnixMicro(us).UTC()
 }
 
-func MicrosPtr(t *time.Time) *int64 {
-	if t == nil {
-		return nil
-	}
-	us := t.UnixMicro()
-	return &us
-}
-
 func nowMicros() int64 {
 	return Micros(time.Now())
 }

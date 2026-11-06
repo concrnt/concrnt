@@ -87,15 +87,16 @@ type subscriptionDoc struct {
 	MDate        time.Time `firestore:"mDate"`
 }
 
-// strPtr maps the empty string back to the nil the domain uses for "unset".
-func strPtr(s string) *string {
+// StrPtr maps the empty string back to the nil the domain uses for "unset".
+func StrPtr(s string) *string {
 	if s == "" {
 		return nil
 	}
 	return &s
 }
 
-func deref(s *string) string {
+// Deref is the inverse of StrPtr.
+func Deref(s *string) string {
 	if s == nil {
 		return ""
 	}

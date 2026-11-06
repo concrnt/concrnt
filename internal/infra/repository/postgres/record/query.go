@@ -8,6 +8,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
+	"gorm.io/gorm"
 )
 
 func (r *Repository) QueryByPrefix(
@@ -25,28 +26,7 @@ func (r *Repository) QueryByPrefix(
 	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).
 		Where(uriPrefixMatch, likeEscaper.Replace(prefix)+"%")
 
-	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
-	}
-	if author != "" {
-		query = query.Where("r.author = ?", author)
-	}
-	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
-	}
-	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
-	}
-
-	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
-	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
-	}
-
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
+	query = orderLimit(recordFilters(query, schema, author, since, until), order, limit)
 
 	rows, err := scanRecordRows(query)
 	if err != nil {
@@ -126,42 +106,13 @@ func (r *Repository) QueryByParent(
 
 	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false)
 
-	// The owner root (cckv://<owner>) has no record_keys row and its top-level
-	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
-	// matched by URI prefix instead (CIP-5 §3.1).
-	parsedParent, err := concrnt.ParseCCURI(parent)
+	query, err := parentPredicate(query, parent)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
-	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
-	}
 
-	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
-	}
-	if author != "" {
-		query = query.Where("r.author = ?", author)
-	}
-	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
-	}
-	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
-	}
-
-	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
-	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
-	}
-
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
+	query = orderLimit(recordFilters(query, schema, author, since, until), order, limit)
 
 	rows, err := scanRecordRows(query)
 	if err != nil {
@@ -188,23 +139,13 @@ func (r *Repository) QueryByParentOrderByKey(
 
 	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), true)
 
-	parsedParent, err := concrnt.ParseCCURI(parent)
+	query, err := parentPredicate(query, parent)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
-	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
-	}
 
-	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
-	}
-	if author != "" {
-		query = query.Where("r.author = ?", author)
-	}
+	query = recordFilters(query, schema, author, nil, nil)
 	// byte order (CONTRACT.md "Key order"): the collation is forced on the
 	// bounds and the ordering alike so the (parent_id, uri COLLATE "C") index
 	// serves both
@@ -231,4 +172,50 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	return queryRows(rows)
+}
+
+// recordFilters adds the schema, author and createdAt window of a listing
+// over joined records (r).
+func recordFilters(query *gorm.DB, schema, author string, since, until *time.Time) *gorm.DB {
+	if schema != "" {
+		query = query.Where("r.schema = ?", schema)
+	}
+	if author != "" {
+		query = query.Where("r.author = ?", author)
+	}
+	if since != nil {
+		query = query.Where("r.created_at >= ?", *since)
+	}
+	if until != nil {
+		query = query.Where("r.created_at <= ?", *until)
+	}
+	return query
+}
+
+// orderLimit orders a listing by (created_at, id) and bounds the page.
+func orderLimit(query *gorm.DB, order string, limit int) *gorm.DB {
+	if order == "desc" {
+		query = query.Order("r.created_at DESC, r.document_id DESC")
+	} else {
+		query = query.Order("r.created_at ASC, r.document_id ASC")
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	return query
+}
+
+// parentPredicate restricts a listing to parent's direct children. The
+// owner root (cckv://<owner>) has no record_keys row and its top-level keys
+// carry parent_id NULL (getOrCreateParentRecordKey), so the root is matched
+// by URI prefix instead (CIP-5 §3.1).
+func parentPredicate(query *gorm.DB, parent string) (*gorm.DB, error) {
+	parsedParent, err := concrnt.ParseCCURI(parent)
+	if err != nil {
+		return nil, err
+	}
+	if parsedParent.Key == "" {
+		return query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%"), nil
+	}
+	return query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent), nil
 }

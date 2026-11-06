@@ -50,7 +50,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 		Owner:     owner,
 		Author:    author,
 		Schema:    schema,
-		Variant:   deref(variant),
+		Variant:   fs.Deref(variant),
 		Unique:    unique,
 		CreatedAt: createdAt,
 	}.toMap())

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
@@ -20,7 +22,7 @@ func newInspector(client *spanner.Client) repotest.Inspector {
 }
 
 func (i *inspector) Commit(ctx context.Context, id string) (*repotest.CommitState, error) {
-	commit, found, err := queryOne[commitLogRow](ctx, i.client.Single(), spanner.Statement{
+	commit, found, err := spannerdb.QueryOne[commitLogRow](ctx, i.client.Single(), spanner.Statement{
 		SQL: commitLogSelect + " WHERE id = @id", Params: map[string]any{"id": id},
 	})
 	if err != nil || !found {
@@ -49,7 +51,7 @@ func (i *inspector) SetCommitCDate(ctx context.Context, id string, cDate time.Ti
 }
 
 func (i *inspector) Record(ctx context.Context, documentID string) (*repotest.RecordState, error) {
-	rec, found, err := queryOne[struct {
+	rec, found, err := spannerdb.QueryOne[struct {
 		Owner         string    `spanner:"owner"`
 		Schema        string    `spanner:"schema"`
 		Redirect      *string   `spanner:"redirect"`
@@ -92,7 +94,7 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 }
 
 func (i *inspector) Entity(ctx context.Context, ccid string) (*repotest.EntityState, error) {
-	entity, found, err := queryOne[struct {
+	entity, found, err := spannerdb.QueryOne[struct {
 		DocumentID string    `spanner:"document_id"`
 		Domain     string    `spanner:"domain"`
 		CreatedAt  time.Time `spanner:"created_at"`
@@ -110,7 +112,7 @@ func (i *inspector) Entity(ctx context.Context, ccid string) (*repotest.EntitySt
 }
 
 func (i *inspector) Association(ctx context.Context, documentID string) (*repotest.AssociationState, error) {
-	assoc, found, err := queryOne[struct {
+	assoc, found, err := spannerdb.QueryOne[struct {
 		Owner   string  `spanner:"owner"`
 		Author  string  `spanner:"author"`
 		Variant *string `spanner:"variant"`
@@ -136,7 +138,7 @@ func (i *inspector) AssociationCountByUnique(ctx context.Context, unique string)
 }
 
 func (i *inspector) ackState(ctx context.Context, table ackTable, from, to, schema string) (*repotest.AckState, error) {
-	ack, found, err := queryOne[struct {
+	ack, found, err := spannerdb.QueryOne[struct {
 		ID        string    `spanner:"id"`
 		Valid     bool      `spanner:"valid"`
 		CreatedAt time.Time `spanner:"created_at"`

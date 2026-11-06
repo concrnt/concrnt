@@ -30,29 +30,24 @@ func modelToDomainNotification(m Subscription) domain.NotificationSubscription {
 	}
 }
 
-func domainToModelNotification(d domain.NotificationSubscription) Subscription {
-	m := Subscription{
-		VendorID:     d.VendorID,
-		Owner:        d.Owner,
-		Schemas:      JSONStrings(d.Schemas),
-		Prefixes:     JSONStrings(d.Prefixes),
-		Subscription: d.Subscription,
-	}
-	// a zero date is left for the hook to stamp
-	if !d.CDate.IsZero() {
-		m.CDate = Micros(d.CDate)
-	}
-	if !d.MDate.IsZero() {
-		m.MDate = Micros(d.MDate)
-	}
-	return m
-}
-
 func (r *NotificationRepository) Subscribe(ctx context.Context, subscription domain.NotificationSubscription) (domain.NotificationSubscription, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()
 
-	model := domainToModelNotification(subscription)
+	model := Subscription{
+		VendorID:     subscription.VendorID,
+		Owner:        subscription.Owner,
+		Schemas:      JSONStrings(subscription.Schemas),
+		Prefixes:     JSONStrings(subscription.Prefixes),
+		Subscription: subscription.Subscription,
+	}
+	// a zero date is left for the hook to stamp
+	if !subscription.CDate.IsZero() {
+		model.CDate = Micros(subscription.CDate)
+	}
+	if !subscription.MDate.IsZero() {
+		model.MDate = Micros(subscription.MDate)
+	}
 	if err := r.db.WithContext(ctx).Save(&model).Error; err != nil {
 		span.RecordError(err)
 		return domain.NotificationSubscription{}, err

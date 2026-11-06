@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
@@ -34,7 +36,7 @@ func (r *Repository) CreateEntity(
 	// newer document replaces the stored one; an equal or older one is a
 	// no-op. The read locks the row, so concurrent writers serialise (one
 	// aborts and re-runs) and converge on the same winner.
-	old, found, err := queryOne[struct {
+	old, found, err := spannerdb.QueryOne[struct {
 		CreatedAt time.Time `spanner:"created_at"`
 	}](ctx, stx, spanner.Statement{
 		SQL:    "SELECT created_at FROM entities WHERE ccid = @ccid",
@@ -104,7 +106,7 @@ const entitySelect = `SELECT e.ccid AS ccid, e.alias AS alias, e.domain AS domai
 	FROM entities e JOIN commit_logs c ON c.id = e.document_id `
 
 func (r *Repository) getEntity(ctx context.Context, where string, params map[string]any) (*domain.Entity, error) {
-	entity, found, err := queryOne[entityRow](ctx, r.client.Single(), spanner.Statement{SQL: entitySelect + where, Params: params})
+	entity, found, err := spannerdb.QueryOne[entityRow](ctx, r.client.Single(), spanner.Statement{SQL: entitySelect + where, Params: params})
 	if err != nil {
 		return nil, err
 	}

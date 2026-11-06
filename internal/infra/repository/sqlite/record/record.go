@@ -86,11 +86,12 @@ func (r *Repository) CreateRecord(
 	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
 
 	// RecordKeyを作る
+	createdAtMicros := sqlitedb.Micros(createdAt)
 	rk := sqlitedb.RecordKey{
 		URI:             key,
 		ParentID:        pid,
 		RecordID:        &documentID,
-		RecordCreatedAt: sqlitedb.MicrosPtr(&createdAt),
+		RecordCreatedAt: &createdAtMicros,
 		Redirect:        redirect,
 		CleanOnUpdate:   cleanOnUpdate,
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
@@ -35,8 +37,8 @@ func joinRecords(left bool) string {
 	return recordRowSelect + join + " records r ON r.id = rk.record_id " + join + " commit_logs c ON c.id = rk.record_id "
 }
 
-func scanRecordRows(ctx context.Context, q reader, sql string, params map[string]any) ([]recordRow, error) {
-	return queryAll[recordRow](ctx, q, spanner.Statement{SQL: sql, Params: params})
+func scanRecordRows(ctx context.Context, q spannerdb.Reader, sql string, params map[string]any) ([]recordRow, error) {
+	return spannerdb.QueryAll[recordRow](ctx, q, spanner.Statement{SQL: sql, Params: params})
 }
 
 // signedDocument builds the signed document of a row holding a record.

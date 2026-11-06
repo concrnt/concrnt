@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+
 	"cloud.google.com/go/spanner"
 
 	"github.com/concrnt/concrnt"
@@ -84,7 +86,7 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
 	defer span.End()
 
-	logs, err := queryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{
+	logs, err := spannerdb.QueryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    commitLogSelect + " WHERE owner = @owner ORDER BY c_date ASC",
 		Params: map[string]any{"owner": owner},
 	})
@@ -118,7 +120,7 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	where = timeRange(where, params, "c_date", since, until)
 	sql := commitLogSelect + " WHERE " + strings.Join(where, " AND ") + orderLimit("c_date", "id", order, limit, params)
 
-	logs, err := queryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
+	logs, err := spannerdb.QueryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -145,7 +147,7 @@ func (r *Repository) CountGcCandidates(ctx context.Context, cutoffID string) (in
 
 func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]ucrecord.CommitLogEntry, error) {
 	params := map[string]any{"cutoff": cutoffID, "after": afterID, "limit": int64(limit)}
-	logs, err := queryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{
+	logs, err := spannerdb.QueryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{
 		SQL:    commitLogSelect + " WHERE gc_candidate AND id < @cutoff AND id > @after ORDER BY id ASC LIMIT @limit",
 		Params: params,
 	})
@@ -212,7 +214,7 @@ func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLog
 		sql += " LIMIT @limit"
 		params["limit"] = int64(page.Limit)
 	}
-	logs, err := queryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
+	logs, err := spannerdb.QueryAll[commitLogRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
 		return nil, err
 	}
