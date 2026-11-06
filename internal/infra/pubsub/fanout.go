@@ -3,6 +3,7 @@ package pubsub
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 
@@ -79,7 +80,7 @@ func (f *fanout) dispatch(channel string, event concrnt.Event) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, sub := range f.subs {
-		if !sub.matches(channel) {
+		if sub.prefixes != nil && !slices.ContainsFunc(sub.prefixes, func(p string) bool { return strings.HasPrefix(channel, p) }) {
 			continue
 		}
 		select {
@@ -89,18 +90,6 @@ func (f *fanout) dispatch(channel string, event concrnt.Event) {
 			slog.Warn("pubsub: subscriber is not keeping up, event dropped", slog.String("channel", channel))
 		}
 	}
-}
-
-func (s *subscriber) matches(channel string) bool {
-	if s.prefixes == nil {
-		return true
-	}
-	for _, prefix := range s.prefixes {
-		if strings.HasPrefix(channel, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 // addGapHook registers fn to run after the backend subscription was lost

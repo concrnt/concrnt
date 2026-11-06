@@ -114,7 +114,15 @@ func (s *PolicyService) ResolvePolicyURL(ctx context.Context, policyURL string) 
 			return policy.Policy{}, err
 		}
 		if time.Since(cached.fetchedAt) > policyFreshFor {
-			s.refreshPolicyURL(policyURL)
+			// refetch in the background, once at a time per URL; a failed
+			// fetch keeps the stale copy and the next stale read retries
+			s.refreshMu.Lock()
+			refreshing := s.refreshing[policyURL]
+			s.refreshing[policyURL] = true
+			s.refreshMu.Unlock()
+			if !refreshing {
+				go s.refreshPolicyURL(policyURL)
+			}
 		}
 		return policy20251223, nil
 	}
@@ -133,33 +141,20 @@ func (s *PolicyService) ResolvePolicyURL(ctx context.Context, policyURL string) 
 	return policy20251223, nil
 }
 
-// refreshPolicyURL fetches policyURL again in the background, once at a
-// time per URL; a failed fetch keeps the stale copy and is retried by the
-// next stale read.
 func (s *PolicyService) refreshPolicyURL(policyURL string) {
-	s.refreshMu.Lock()
-	if s.refreshing[policyURL] {
+	defer func() {
+		s.refreshMu.Lock()
+		delete(s.refreshing, policyURL)
 		s.refreshMu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), policyHTTP.Timeout)
+	defer cancel()
+	policyBytes, err := s.fetchPolicyURL(ctx, policyURL)
+	if err != nil {
+		slog.Warn("policy: refresh failed, keeping the stale copy", slog.String("url", policyURL), slog.String("error", err.Error()))
 		return
 	}
-	s.refreshing[policyURL] = true
-	s.refreshMu.Unlock()
-
-	go func() {
-		defer func() {
-			s.refreshMu.Lock()
-			delete(s.refreshing, policyURL)
-			s.refreshMu.Unlock()
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), policyHTTP.Timeout)
-		defer cancel()
-		policyBytes, err := s.fetchPolicyURL(ctx, policyURL)
-		if err != nil {
-			slog.Warn("policy: refresh failed, keeping the stale copy", slog.String("url", policyURL), slog.String("error", err.Error()))
-			return
-		}
-		s.cache.Set(policyURL, cachedPolicy{policy: policyBytes, fetchedAt: time.Now()}, policyStaleFor)
-	}()
+	s.cache.Set(policyURL, cachedPolicy{policy: policyBytes, fetchedAt: time.Now()}, policyStaleFor)
 }
 
 // fetchPolicyURL downloads the policy document and returns the JSON of the

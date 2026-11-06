@@ -136,8 +136,8 @@ func (uc *Usecase) enqueueEventDelivery(ctx context.Context, job DeliveryJob) er
 	local := false
 	if parsed, err := concrnt.ParseCCURI(job.ResolveURI); err == nil && job.Event != nil {
 		if concrnt.IsCCID(parsed.Owner) {
-			entity, err := uc.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
-			local = err == nil && entity.Domain == uc.config.FQDN
+			isLocal, err := uc.IsLocalEntityByCCID(ctx, parsed.Owner)
+			local = err == nil && isLocal
 		} else {
 			local = parsed.Owner == uc.config.FQDN
 		}

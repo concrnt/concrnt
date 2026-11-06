@@ -16,11 +16,7 @@ import (
 	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
 	"github.com/concrnt/concrnt/internal/domain"
-	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
-	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
-	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
-	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
-	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
+	"github.com/concrnt/concrnt/internal/infra/aggregate/stores"
 	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
 	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
@@ -342,42 +338,9 @@ func main() {
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
-	// the count cache store, built here like the repositories: "" means the
-	// store matching the record database
-	var aggregateStore aggregate.Store
-	switch conf.Backends.Aggregate.Store {
-	case "postgres":
-		if db == nil {
-			panic("backends.aggregate.store postgres needs the postgres database")
-		}
-		aggregateStore = aggpostgres.New(db)
-	case "spanner":
-		if spannerClient == nil {
-			panic("backends.aggregate.store spanner needs the spanner database")
-		}
-		aggregateStore = aggspanner.New(spannerClient)
-	case "firestore":
-		if firestoreClient == nil {
-			panic("backends.aggregate.store firestore needs the firestore database")
-		}
-		aggregateStore = aggfirestore.New(firestoreClient)
-	case "redis":
-		aggregateStore = aggredis.New(redis)
-	case "memcached":
-		aggregateStore = aggmemcached.New(mc, "")
-	case "":
-		switch {
-		case db != nil:
-			aggregateStore = aggpostgres.New(db)
-		case spannerClient != nil:
-			aggregateStore = aggspanner.New(spannerClient)
-		case firestoreClient != nil:
-			aggregateStore = aggfirestore.New(firestoreClient)
-		default:
-			aggregateStore = aggredis.New(redis)
-		}
-	default:
-		panic("unknown backends.aggregate.store " + conf.Backends.Aggregate.Store + " (postgres, spanner, firestore, redis, memcached)")
+	aggregateStore, err := stores.Open(conf.Backends.Aggregate.Store, db, spannerClient, firestoreClient, redis, mc)
+	if err != nil {
+		panic(err.Error())
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
@@ -431,8 +394,7 @@ func main() {
 		if err != nil {
 			return concrnt.SignedDocument{}, false, nil
 		}
-		entity, err := recordUC.GetEntity(ctx, concrnt.CCURI{Scheme: "cckv", Owner: parsed.Owner}.String())
-		if err != nil || entity.Domain != domainConfig.FQDN {
+		if local, err := recordUC.IsLocalEntityByCCID(ctx, parsed.Owner); err != nil || !local {
 			return concrnt.SignedDocument{}, false, nil
 		}
 		// like the resolve endpoint, read without a requester
