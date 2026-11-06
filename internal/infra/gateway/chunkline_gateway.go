@@ -17,6 +17,7 @@ import (
 
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/patrickmn/go-cache"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
@@ -128,16 +129,53 @@ type resolver struct {
 	manifests *cache.Cache // in-process copies, in front of mc
 }
 
-func (r *resolver) localManifest(timeline string) (chunkline.Manifest, bool) {
-	x, found := r.manifests.Get(manifestCacheKey(timeline))
-	if !found {
-		return chunkline.Manifest{}, false
+// storeManifest keeps a freshly fetched manifest in both tiers.
+func (r *resolver) storeManifest(span trace.Span, timeline string, manifest chunkline.Manifest) {
+	r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
+	bytes, err := json.Marshal(manifest)
+	if err != nil {
+		span.RecordError(fmt.Errorf("failed to marshal manifest for caching for %s: %w", timeline, err))
+		return
 	}
-	return x.(chunkline.Manifest), true
+	if err := r.mc.Set(&memcache.Item{Key: manifestCacheKey(timeline), Value: bytes, Expiration: manifestCacheTTL}); err != nil {
+		span.RecordError(fmt.Errorf("failed to set manifest in cache for %s: %w", timeline, err))
+	}
 }
 
-func (r *resolver) keepManifest(timeline string, manifest chunkline.Manifest) {
-	r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
+// endpointFor renders one of timeline's manifest URL templates with vars
+// and resolves it against the timeline; a relative result lives on the
+// timeline's host over https.
+func (r *resolver) endpointFor(ctx context.Context, timeline, template string, vars map[string]string) (*url.URL, error) {
+	relPath, err := concrnt.RenderURITemplate(template, vars)
+	if err != nil {
+		return nil, fmt.Errorf("failed to render URI template for timeline %s: %w", timeline, err)
+	}
+	rel, err := url.Parse(relPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URI template for timeline %s: %w", timeline, err)
+	}
+	base, err := url.Parse(timeline)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timeline URI %s: %w", timeline, err)
+	}
+	endpoint := base.ResolveReference(rel)
+	if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+		host, err := r.client.ResolveResourceHost(ctx, timeline)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve host for timeline %s: %w", timeline, err)
+		}
+		endpoint.Scheme = "https"
+		endpoint.Host = host
+	}
+	return endpoint, nil
+}
+
+// queueRequest files timeline's endpoint under its host for fetchFromOrigins.
+func queueRequest(requestsByDomain map[string]map[string]string, timeline string, endpoint *url.URL) {
+	if requestsByDomain[endpoint.Host] == nil {
+		requestsByDomain[endpoint.Host] = map[string]string{}
+	}
+	requestsByDomain[endpoint.Host][timeline] = endpoint.String()
 }
 
 func (r *resolver) fetchManifest(ctx context.Context, timeline string) (chunkline.Manifest, error) {
@@ -234,12 +272,11 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 	ctx, span := tracer.Start(ctx, "ChunklineResolver.resolveTimeline")
 	defer span.End()
 
-	if manifest, found := r.localManifest(timeline); found {
-		return manifest, nil
+	if x, found := r.manifests.Get(manifestCacheKey(timeline)); found {
+		return x.(chunkline.Manifest), nil
 	}
 
-	cacheKey := manifestCacheKey(timeline)
-	item, err := r.mc.Get(cacheKey)
+	item, err := r.mc.Get(manifestCacheKey(timeline))
 	if err == nil {
 		var manifest chunkline.Manifest
 		err := json.Unmarshal(item.Value, &manifest)
@@ -248,7 +285,7 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 		} else if manifest.ChunkSize > 0 {
 			// an invalid cached manifest is a miss, so it never reaches a
 			// Time2Chunk division
-			r.keepManifest(timeline, manifest)
+			r.manifests.Set(manifestCacheKey(timeline), manifest, cache.DefaultExpiration)
 			return manifest, nil
 		}
 	} else if !errors.Is(err, memcache.ErrCacheMiss) {
@@ -271,23 +308,7 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 		span.RecordError(err)
 		return chunkline.Manifest{}, err
 	}
-	r.keepManifest(timeline, manifest)
-
-	bytes, err := json.Marshal(manifest)
-	if err != nil {
-		span.RecordError(fmt.Errorf("failed to marshal manifest for caching for %s: %w", timeline, err))
-	} else {
-		cacheItem := &memcache.Item{
-			Key:        cacheKey,
-			Value:      bytes,
-			Expiration: manifestCacheTTL,
-		}
-		err = r.mc.Set(cacheItem)
-		if err != nil {
-			span.RecordError(fmt.Errorf("failed to set manifest in cache for %s: %w", timeline, err))
-		}
-	}
-
+	r.storeManifest(span, timeline, manifest)
 	return manifest, nil
 }
 
@@ -298,8 +319,8 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 	result := make(map[string]chunkline.Manifest)
 	keys := make([]string, 0, len(timelines))
 	for _, tl := range timelines {
-		if manifest, found := r.localManifest(tl); found {
-			result[tl] = manifest
+		if x, found := r.manifests.Get(manifestCacheKey(tl)); found {
+			result[tl] = x.(chunkline.Manifest)
 			continue
 		}
 		keys = append(keys, manifestCacheKey(tl))
@@ -328,14 +349,12 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 				remaining = append(remaining, tl)
 				continue
 			}
-			// invalid manifest cached before validation existed: treat as a
-			// miss (see resolveTimeline)
-			if manifest.ChunkSize <= 0 {
+			if manifest.ChunkSize <= 0 { // an invalid cached manifest is a miss
 				remaining = append(remaining, tl)
 				continue
 			}
 			result[tl] = manifest
-			r.keepManifest(tl, manifest)
+			r.manifests.Set(manifestCacheKey(tl), manifest, cache.DefaultExpiration)
 		} else {
 			remaining = append(remaining, tl)
 		}
@@ -355,27 +374,10 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 			continue
 		}
 		result[tl] = manifest
-		r.keepManifest(tl, manifest)
-
-		bytes, err := json.Marshal(manifest)
-		if err != nil {
-			span.RecordError(fmt.Errorf("failed to marshal manifest for caching for %s: %w", tl, err))
-			continue
-		}
-
-		cacheItem := &memcache.Item{
-			Key:        manifestCacheKey(tl),
-			Value:      bytes,
-			Expiration: manifestCacheTTL,
-		}
-		err = r.mc.Set(cacheItem)
-		if err != nil {
-			span.RecordError(fmt.Errorf("failed to set manifest in cache for %s: %w", tl, err))
-		}
+		r.storeManifest(span, tl, manifest)
 	}
 
 	return result, nil
-
 }
 
 // GetRemovedItems serves QueryDescending's per-timeline lists of recently
@@ -459,33 +461,10 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 				continue // origin doesn't track removals
 			}
 
-			relPath, err := concrnt.RenderURITemplate(manifest.Removed, map[string]string{})
+			endpoint, err := r.endpointFor(ctx, tl, manifest.Removed, map[string]string{})
 			if err != nil {
-				slog.Error("chunkline removed: failed to render removed URI", slog.String("timeline", tl), slog.String("error", err.Error()))
+				slog.Error("chunkline removed: no removed endpoint", slog.String("timeline", tl), slog.String("error", err.Error()))
 				continue
-			}
-
-			rel, err := url.Parse(relPath)
-			if err != nil {
-				slog.Error("chunkline removed: invalid removed URI template", slog.String("timeline", tl), slog.String("error", err.Error()))
-				continue
-			}
-
-			base, err := url.Parse(tl)
-			if err != nil {
-				slog.Error("chunkline removed: invalid timeline URI", slog.String("timeline", tl), slog.String("error", err.Error()))
-				continue
-			}
-
-			endpoint := base.ResolveReference(rel)
-			if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
-				host, err := r.client.ResolveResourceHost(ctx, tl)
-				if err != nil {
-					slog.Error("chunkline removed: failed to resolve host", slog.String("timeline", tl), slog.String("error", err.Error()))
-					continue
-				}
-				endpoint.Scheme = "https"
-				endpoint.Host = host
 			}
 
 			if _, uri, ok := r.localCall(endpoint, "removed"); ok {
@@ -499,11 +478,7 @@ func (r *resolver) GetRemovedItems(ctx context.Context, timelines []string) (map
 				continue
 			}
 
-			domain := endpoint.Host
-			if _, exists := requestsByDomain[domain]; !exists {
-				requestsByDomain[domain] = make(map[string]string)
-			}
-			requestsByDomain[domain][tl] = endpoint.String()
+			queueRequest(requestsByDomain, tl, endpoint)
 		}
 
 		bodies := r.fetchFromOrigins(ctx, "removed", requestsByDomain, func(err error) {
@@ -635,35 +610,10 @@ func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, unti
 			continue
 		}
 
-		relPath, err := concrnt.RenderURITemplate(manifest.Descending.Iterator, map[string]string{
-			"chunk": fmt.Sprintf("%d", chunkID),
-		})
+		endpoint, err := r.endpointFor(ctx, tl, manifest.Descending.Iterator, map[string]string{"chunk": strconv.FormatInt(chunkID, 10)})
 		if err != nil {
-			span.RecordError(fmt.Errorf("failed to render iterator URI for timeline %s: %w", tl, err))
+			span.RecordError(err)
 			continue
-		}
-
-		rel, err := url.Parse(relPath)
-		if err != nil {
-			span.RecordError(fmt.Errorf("invalid iterator URI template for timeline %s: %w", tl, err))
-			continue
-		}
-
-		base, err := url.Parse(tl)
-		if err != nil {
-			span.RecordError(fmt.Errorf("invalid timeline URI %s: %w", tl, err))
-			continue
-		}
-
-		endpoint := base.ResolveReference(rel)
-		if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
-			host, err := r.client.ResolveResourceHost(ctx, tl)
-			if err != nil {
-				span.RecordError(fmt.Errorf("failed to resolve host for timeline %s: %w", tl, err))
-				continue
-			}
-			endpoint.Scheme = "https"
-			endpoint.Host = host
 		}
 
 		remainings[tl] = chunkID
@@ -672,11 +622,7 @@ func (r *resolver) LookupChunkItrs(ctx context.Context, timelines []string, unti
 			continue
 		}
 
-		domain := endpoint.Host
-		if _, exists := requestsByDomain[domain]; !exists {
-			requestsByDomain[domain] = make(map[string]string)
-		}
-		requestsByDomain[domain][tl] = endpoint.String()
+		queueRequest(requestsByDomain, tl, endpoint)
 	}
 
 	if len(remainings) == 0 {
@@ -831,34 +777,10 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 			continue
 		}
 
-		refPath, err := concrnt.RenderURITemplate(manifest.Descending.Body, map[string]string{
-			"chunk": itr,
-		})
+		endpoint, err := r.endpointFor(ctx, tl, manifest.Descending.Body, map[string]string{"chunk": itr})
 		if err != nil {
-			span.RecordError(fmt.Errorf("invalid body URI template for timeline %s: %w", tl, err))
+			span.RecordError(err)
 			continue
-		}
-		ref, err := url.Parse(refPath)
-		if err != nil {
-			span.RecordError(fmt.Errorf("invalid body URI template for timeline %s: %w", tl, err))
-			continue
-		}
-
-		base, err := url.Parse(tl)
-		if err != nil {
-			span.RecordError(fmt.Errorf("invalid timeline URI %s: %w", tl, err))
-			continue
-		}
-
-		endpoint := base.ResolveReference(ref)
-		if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
-			host, err := r.client.ResolveResourceHost(ctx, tl)
-			if err != nil {
-				span.RecordError(fmt.Errorf("failed to resolve host for timeline %s: %w", tl, err))
-				continue
-			}
-			endpoint.Scheme = "https"
-			endpoint.Host = host
 		}
 
 		remaining[tl] = itr
@@ -873,11 +795,7 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 			continue
 		}
 
-		domain := endpoint.Host
-		if _, exists := requestsByDomain[domain]; !exists {
-			requestsByDomain[domain] = make(map[string]string)
-		}
-		requestsByDomain[domain][tl] = endpoint.String()
+		queueRequest(requestsByDomain, tl, endpoint)
 	}
 
 	if len(remaining) == 0 {
