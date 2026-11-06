@@ -2,8 +2,6 @@ package record
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -11,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/utils"
 )
 
 // The resolved document cache. A record's row changes only by a commit to
@@ -26,8 +25,7 @@ var documentCacheRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 }, []string{"result"})
 
 func documentCacheKey(uri string) string {
-	sum := sha256.Sum256([]byte(uri))
-	return "doc:" + hex.EncodeToString(sum[:])
+	return "doc:" + utils.SHA256Hex(uri)
 }
 
 // signedDocumentCached is repo.GetSignedDocument behind the shared cache; a

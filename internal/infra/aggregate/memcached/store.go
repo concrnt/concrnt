@@ -15,19 +15,18 @@ package memcached
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
-	"strconv"
 	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
 
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
+	"github.com/concrnt/concrnt/internal/utils"
 )
 
 const (
@@ -94,15 +93,10 @@ func expiration(at, now time.Time) int32 {
 	return secs
 }
 
-func hash(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])
-}
-
 // Keys are hashed: aggregate keys may be longer than memcached's 250 bytes
 // and contain spaces.
 func (s *Store) genKey(scope string) string {
-	return s.ns + "gen:" + hash(scope)[:32]
+	return s.ns + "gen:" + utils.SHA256Hex(scope)[:32]
 }
 
 func (s *Store) globalGenKey() string { return s.genKey("") }
@@ -116,7 +110,7 @@ func (s *Store) itemKey(key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return s.ns + "e:" + hash(gens[gk]+"\x00"+gens[dk]+"\x00"+key), nil
+	return s.ns + "e:" + utils.SHA256Hex(gens[gk]+"\x00"+gens[dk]+"\x00"+key), nil
 }
 
 // generations returns the values of the generation keys, from the process
@@ -138,21 +132,11 @@ func (s *Store) generations(keys ...string) (map[string]string, error) {
 		return out, nil
 	}
 
-	items, err := s.mc.GetMulti(stale)
+	fetched, err := utils.Generations(s.mc, stale)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate memcached: read generations: %w", err)
 	}
-	for _, k := range stale {
-		if it, ok := items[k]; ok {
-			out[k] = string(it.Value)
-			continue
-		}
-		v, err := s.createGeneration(k)
-		if err != nil {
-			return nil, err
-		}
-		out[k] = v
-	}
+	maps.Copy(out, fetched)
 
 	s.mu.Lock()
 	for _, k := range stale {
@@ -160,29 +144,6 @@ func (s *Store) generations(keys ...string) (map[string]string, error) {
 	}
 	s.mu.Unlock()
 	return out, nil
-}
-
-// newGeneration is unique enough that a recreated generation key never
-// brings back the entries of an earlier one.
-func newGeneration() string {
-	return strconv.FormatInt(time.Now().UnixNano(), 36) + "-" + strconv.FormatUint(rand.Uint64(), 36)
-}
-
-func (s *Store) createGeneration(key string) (string, error) {
-	v := newGeneration()
-	err := s.mc.Add(&memcache.Item{Key: key, Value: []byte(v)})
-	if err == nil {
-		return v, nil
-	}
-	if !errors.Is(err, memcache.ErrNotStored) {
-		return "", fmt.Errorf("aggregate memcached: create generation: %w", err)
-	}
-	// another process created it first
-	it, err := s.mc.Get(key)
-	if err != nil {
-		return "", fmt.Errorf("aggregate memcached: read generation: %w", err)
-	}
-	return string(it.Value), nil
 }
 
 func (s *Store) Get(_ context.Context, key string) (*aggregate.Entry, bool, error) {
@@ -330,7 +291,7 @@ func (s *Store) InvalidateAll(_ context.Context) error {
 }
 
 func (s *Store) moveGeneration(gk string) error {
-	if err := s.mc.Set(&memcache.Item{Key: gk, Value: []byte(newGeneration())}); err != nil {
+	if err := utils.MoveGeneration(s.mc, gk); err != nil {
 		return fmt.Errorf("aggregate memcached: move generation: %w", err)
 	}
 	s.mu.Lock()

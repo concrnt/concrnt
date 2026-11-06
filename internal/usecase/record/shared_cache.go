@@ -3,8 +3,10 @@ package record
 import (
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // SharedCache is the cache shared by every replica (memcached): entities,
@@ -54,4 +56,69 @@ func (uc *Usecase) sharedCacheDelete(key string) error {
 		return err
 	}
 	return nil
+}
+
+// cachedMulti serves keys from the in-process copy, then the shared cache,
+// then origin, which is called once with the keys missing from both and
+// returns a value per key. Each key counts once in metric (local, hit,
+// miss, or error when the shared cache was unreachable). A shared hit is
+// copied in-process; an origin value is stored in both tiers, in the shared
+// one only after a non-error read (a write to an unreachable cache only
+// costs another timeout).
+func cachedMulti[T any](uc *Usecase, metric *prometheus.CounterVec, keys []string, localTTL time.Duration, sharedTTL int32, origin func(missing []string) (map[string]T, error)) (map[string]T, error) {
+	out := make(map[string]T, len(keys))
+	var remote []string
+	for _, key := range keys {
+		if x, found := uc.cache.Get(key); found {
+			metric.WithLabelValues("local").Inc()
+			out[key] = x.(T)
+			continue
+		}
+		remote = append(remote, key)
+	}
+	if len(remote) == 0 {
+		return out, nil
+	}
+
+	items, sharedErr := uc.sharedCache.GetMulti(remote)
+	if sharedErr != nil {
+		metric.WithLabelValues("error").Add(float64(len(remote)))
+		items = nil
+	}
+	var missing []string
+	for _, key := range remote {
+		if item, ok := items[key]; ok {
+			var v T
+			if json.Unmarshal(item.Value, &v) == nil {
+				metric.WithLabelValues("hit").Inc()
+				uc.cache.Set(key, v, localTTL)
+				out[key] = v
+				continue
+			}
+		}
+		if sharedErr == nil {
+			metric.WithLabelValues("miss").Inc()
+		}
+		missing = append(missing, key)
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+
+	fetched, err := origin(missing)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range missing {
+		v, ok := fetched[key]
+		if !ok {
+			continue
+		}
+		out[key] = v
+		uc.cache.Set(key, v, localTTL)
+		if sharedErr == nil {
+			uc.sharedCacheSet(key, v, sharedTTL)
+		}
+	}
+	return out, nil
 }

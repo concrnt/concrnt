@@ -36,11 +36,9 @@ func TestGetSignedUsesDocumentCache(t *testing.T) {
 	ctx := context.Background()
 	key := "cckv://con1owner/home/post1"
 	repo := &documentRepo{docs: map[string]string{key: `{"kind":"record","key":"` + key + `","schema":"https://schema.example/post.json"}`}}
-	cache := newFakeEntityCache()
-	reader := New(repo, nil, nil, &domain.Config{FQDN: "example.com"}, nil, nil, nopPolicyService{}, nil, nil)
-	reader.SetSharedCache(cache)
-	writer := New(repo, nil, nil, &domain.Config{FQDN: "example.com"}, nil, nil, nopPolicyService{}, nil, nil)
-	writer.SetSharedCache(cache)
+	cache := newFakeSharedCache()
+	reader := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
+	writer := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
 
 	for range 3 {
 		sd, err := reader.GetSigned(ctx, key)

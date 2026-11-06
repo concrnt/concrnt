@@ -244,30 +244,20 @@ func (uc *Usecase) getEntityByCCID(ctx context.Context, ccid string) (*domain.En
 		return uc.repo.GetEntityByCCID(ctx, ccid)
 	}
 
-	if x, found := uc.cache.Get(entityCacheKey(ccid)); found {
-		entityCacheRequests.WithLabelValues("local").Inc()
-		entity := x.(domain.Entity)
-		return &entity, nil
-	}
-
-	var cached cachedEntity
-	result := uc.sharedCacheGet(entityCacheKey(ccid), &cached)
-	entityCacheRequests.WithLabelValues(result).Inc()
-	if result == "hit" {
-		cached.Entity.SignedDocument = cached.SignedDocument
-		uc.cache.Set(entityCacheKey(ccid), cached.Entity, entityLocalTTL)
-		return &cached.Entity, nil
-	}
-
-	entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
+	key := entityCacheKey(ccid)
+	cached, err := cachedMulti(uc, entityCacheRequests, []string{key}, entityLocalTTL, entityCacheTTL, func([]string) (map[string]cachedEntity, error) {
+		entity, err := uc.repo.GetEntityByCCID(ctx, ccid)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]cachedEntity{key: {Entity: *entity, SignedDocument: entity.SignedDocument}}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	uc.cache.Set(entityCacheKey(ccid), *entity, entityLocalTTL)
-	if result == "miss" {
-		uc.sharedCacheSet(entityCacheKey(ccid), cachedEntity{Entity: *entity, SignedDocument: entity.SignedDocument}, entityCacheTTL)
-	}
-	return entity, nil
+	entity := cached[key].Entity
+	entity.SignedDocument = cached[key].SignedDocument
+	return &entity, nil
 }
 
 const entityRecheckTTL = time.Hour

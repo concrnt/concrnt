@@ -54,12 +54,6 @@ func (r *policyRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uri
 	return stacks, nil
 }
 
-func newPolicyCacheUsecase(repo Repository, cache SharedCache) *Usecase {
-	uc := New(repo, nil, nil, &domain.Config{FQDN: "example.com"}, nil, nil, nil, nil, nil)
-	uc.SetSharedCache(cache)
-	return uc
-}
-
 const policyOwner = "con1policyowner"
 
 // A stack is fetched once per generation: the second lookup is served from
@@ -68,9 +62,9 @@ const policyOwner = "con1policyowner"
 func TestPolicyStackCachedAcrossReplicas(t *testing.T) {
 	ctx := context.Background()
 	repo := &policyRepo{layers: map[string]concrnt.Policy{"cckv://" + policyOwner + "/home": {}}}
-	cache := newFakeEntityCache()
-	writer := newPolicyCacheUsecase(repo, cache)
-	reader := newPolicyCacheUsecase(repo, cache)
+	cache := newFakeSharedCache()
+	writer := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
+	reader := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
 
 	key := "cckv://" + policyOwner + "/home/post1"
 	stack, err := writer.policyStack(ctx, key)
@@ -91,9 +85,9 @@ func TestPolicyStackCachedAcrossReplicas(t *testing.T) {
 func TestPolicyStackInvalidationIsPerOwner(t *testing.T) {
 	ctx := context.Background()
 	repo := &policyRepo{layers: map[string]concrnt.Policy{}}
-	cache := newFakeEntityCache()
-	writer := newPolicyCacheUsecase(repo, cache)
-	reader := newPolicyCacheUsecase(repo, cache)
+	cache := newFakeSharedCache()
+	writer := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
+	reader := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, cache)
 
 	mine := "cckv://" + policyOwner + "/home/post1"
 	other := "cckv://con1otherowner/home/post1"
@@ -116,7 +110,7 @@ func TestPolicyStackInvalidationIsPerOwner(t *testing.T) {
 func TestPolicyStackCCFSBypassesCache(t *testing.T) {
 	ctx := context.Background()
 	repo := &policyRepo{layers: map[string]concrnt.Policy{}}
-	uc := newPolicyCacheUsecase(repo, newFakeEntityCache())
+	uc := newCachedUsecase(&domain.Config{FQDN: "example.com"}, repo, newFakeSharedCache())
 
 	uri := "ccfs://" + policyOwner + "/concrnt/cdid"
 	for range 2 {

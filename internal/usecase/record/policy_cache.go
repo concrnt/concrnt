@@ -2,18 +2,16 @@ package record
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"fmt"
+	"maps"
+	"slices"
 
-	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/patrickmn/go-cache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/utils"
 )
 
 // The policy stack cache. A record's stack (CIP-12 §5.3) is assembled from
@@ -40,11 +38,6 @@ func policyGenKey(owner string) string {
 	return "policy-gen:" + owner
 }
 
-func policyStackKey(gen, cckv string) string {
-	sum := sha256.Sum256([]byte(cckv))
-	return "policy-stack:" + gen + ":" + hex.EncodeToString(sum[:])
-}
-
 // policyStack is repo.GetHierarchicalRecordPolicies behind the cache.
 func (uc *Usecase) policyStack(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	stacks, err := uc.policyStacks(ctx, []string{uri})
@@ -56,193 +49,88 @@ func (uc *Usecase) policyStack(ctx context.Context, uri string) ([]concrnt.Polic
 
 // policyStacks is repo.GetHierarchicalRecordPoliciesMulti behind the cache;
 // every input URI has an entry. A ccfs URI (an association's document)
-// has no cached form and goes to the repository.
+// has no cached form and goes to the repository on its own.
 func (uc *Usecase) policyStacks(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
-	if uc.sharedCache == nil {
-		return uc.policyStacksFromRepo(ctx, uris)
-	}
-
 	stacks := make(map[string][]concrnt.Policy, len(uris))
 	owners := map[string]string{}
-	var direct, cached []string
-	for _, uri := range uris {
-		parsed, err := concrnt.ParseCCURI(uri)
-		if err != nil {
-			return nil, err
-		}
-		if parsed.Scheme != "cckv" {
-			direct = append(direct, uri)
-			continue
-		}
-		owners[uri] = parsed.Owner
-		cached = append(cached, uri)
-	}
-
-	if len(direct) > 0 {
-		fromRepo, err := uc.policyStacksFromRepo(ctx, direct)
-		if err != nil {
-			return nil, err
-		}
-		for uri, stack := range fromRepo {
-			stacks[uri] = stack
-		}
-	}
-	if len(cached) == 0 {
-		return stacks, nil
-	}
-
-	gens, err := uc.policyGenerations(owners)
-	if err != nil {
-		policyCacheRequests.WithLabelValues("error").Add(float64(len(cached)))
-		fromRepo, err := uc.policyStacksFromRepo(ctx, cached)
-		if err != nil {
-			return nil, err
-		}
-		for uri, stack := range fromRepo {
-			stacks[uri] = stack
-		}
-		return stacks, nil
-	}
-
-	var remote []string
-	remoteKeys := map[string]string{}
-	for _, uri := range cached {
-		key := policyStackKey(gens[owners[uri]], uri)
-		if x, found := uc.cache.Get(key); found {
-			policyCacheRequests.WithLabelValues("local").Inc()
-			stacks[uri] = x.([]concrnt.Policy)
-			continue
-		}
-		remote = append(remote, uri)
-		remoteKeys[uri] = key
-	}
-	if len(remote) == 0 {
-		return stacks, nil
-	}
-
-	keys := make([]string, 0, len(remote))
-	for _, uri := range remote {
-		keys = append(keys, remoteKeys[uri])
-	}
-	items, err := uc.sharedCache.GetMulti(keys)
-	if err != nil {
-		policyCacheRequests.WithLabelValues("error").Add(float64(len(remote)))
-		items = nil
-	}
-	var missing []string
-	for _, uri := range remote {
-		item, ok := items[remoteKeys[uri]]
-		if ok {
-			var stack []concrnt.Policy
-			if json.Unmarshal(item.Value, &stack) == nil {
-				policyCacheRequests.WithLabelValues("hit").Inc()
-				uc.cache.Set(remoteKeys[uri], stack, 0)
-				stacks[uri] = stack
-				continue
-			}
-		}
-		if err == nil {
-			policyCacheRequests.WithLabelValues("miss").Inc()
-		}
-		missing = append(missing, uri)
-	}
-	if len(missing) == 0 {
-		return stacks, nil
-	}
-
-	fromRepo, err := uc.policyStacksFromRepo(ctx, missing)
-	if err != nil {
-		return nil, err
-	}
-	for _, uri := range missing {
-		stack := fromRepo[uri]
-		if stack == nil {
-			stack = []concrnt.Policy{}
-		}
-		stacks[uri] = stack
-		uc.cache.Set(remoteKeys[uri], stack, 0)
-		uc.sharedCacheSet(remoteKeys[uri], stack, policyStackTTL)
-	}
-	return stacks, nil
-}
-
-// policyStacksFromRepo fetches the cckv URIs in one statement and every
-// other URI (ccfs) on its own.
-func (uc *Usecase) policyStacksFromRepo(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
-	stacks := make(map[string][]concrnt.Policy, len(uris))
 	var cckvs []string
 	for _, uri := range uris {
 		parsed, err := concrnt.ParseCCURI(uri)
 		if err != nil {
 			return nil, err
 		}
-		if parsed.Scheme == "cckv" {
-			cckvs = append(cckvs, uri)
-			continue
-		}
-		stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, uri)
-		if err != nil {
-			return nil, err
-		}
-		stacks[uri] = stack
-	}
-	if len(cckvs) > 0 {
-		fromRepo, err := uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, cckvs)
-		if err != nil {
-			return nil, err
-		}
-		for uri, stack := range fromRepo {
-			stacks[uri] = stack
-		}
-	}
-	return stacks, nil
-}
-
-// policyGenerations reads the current generation of every owner in owners
-// (uri -> owner), issuing one for an owner that has none. A missing
-// generation never falls back to a fixed value: stacks cached under an
-// earlier, evicted generation must not come back.
-func (uc *Usecase) policyGenerations(owners map[string]string) (map[string]string, error) {
-	distinct := map[string]bool{}
-	keys := []string{}
-	for _, owner := range owners {
-		if !distinct[owner] {
-			distinct[owner] = true
-			keys = append(keys, policyGenKey(owner))
-		}
-	}
-	items, err := uc.sharedCache.GetMulti(keys)
-	if err != nil {
-		return nil, err
-	}
-	gens := make(map[string]string, len(distinct))
-	for owner := range distinct {
-		if item, ok := items[policyGenKey(owner)]; ok {
-			gens[owner] = string(item.Value)
-			continue
-		}
-		gen := newPolicyGeneration()
-		err := uc.sharedCache.Add(&memcache.Item{Key: policyGenKey(owner), Value: []byte(gen)})
-		if errors.Is(err, memcache.ErrNotStored) {
-			item, err := uc.sharedCache.Get(policyGenKey(owner))
+		if parsed.Scheme != "cckv" {
+			stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, uri)
 			if err != nil {
 				return nil, err
 			}
-			gen = string(item.Value)
-		} else if err != nil {
+			stacks[uri] = stack
+			continue
+		}
+		owners[uri] = parsed.Owner
+		cckvs = append(cckvs, uri)
+	}
+	if len(cckvs) == 0 {
+		return stacks, nil
+	}
+
+	fromRepo := func(uris []string) error {
+		found, err := uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, uris)
+		if err != nil {
+			return err
+		}
+		maps.Copy(stacks, found)
+		return nil
+	}
+	if uc.sharedCache == nil {
+		return stacks, fromRepo(cckvs)
+	}
+
+	genKeys := []string{}
+	for _, owner := range owners {
+		if !slices.Contains(genKeys, policyGenKey(owner)) {
+			genKeys = append(genKeys, policyGenKey(owner))
+		}
+	}
+	gens, err := utils.Generations(uc.sharedCache, genKeys)
+	if err != nil {
+		policyCacheRequests.WithLabelValues("error").Add(float64(len(cckvs)))
+		return stacks, fromRepo(cckvs)
+	}
+
+	keys := make([]string, 0, len(cckvs))
+	uriOf := make(map[string]string, len(cckvs))
+	for _, uri := range cckvs {
+		key := "policy-stack:" + gens[policyGenKey(owners[uri])] + ":" + utils.SHA256Hex(uri)
+		keys = append(keys, key)
+		uriOf[key] = uri
+	}
+	cached, err := cachedMulti(uc, policyCacheRequests, keys, cache.DefaultExpiration, policyStackTTL, func(missing []string) (map[string][]concrnt.Policy, error) {
+		uris := make([]string, 0, len(missing))
+		for _, key := range missing {
+			uris = append(uris, uriOf[key])
+		}
+		found, err := uc.repo.GetHierarchicalRecordPoliciesMulti(ctx, uris)
+		if err != nil {
 			return nil, err
 		}
-		gens[owner] = gen
+		out := make(map[string][]concrnt.Policy, len(missing))
+		for _, key := range missing {
+			stack := found[uriOf[key]]
+			if stack == nil {
+				stack = []concrnt.Policy{}
+			}
+			out[key] = stack
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return gens, nil
-}
-
-func newPolicyGeneration() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		panic(fmt.Sprintf("crypto/rand: %v", err))
+	for key, stack := range cached {
+		stacks[uriOf[key]] = stack
 	}
-	return hex.EncodeToString(b[:])
+	return stacks, nil
 }
 
 // policyLayerAt reports whether stack has a layer of its own at uri, i.e.
@@ -264,7 +152,7 @@ func (uc *Usecase) policyStacksInvalidated(owner string) PostProcessAction {
 		if uc.sharedCache == nil {
 			return nil
 		}
-		if err := uc.sharedCache.Set(&memcache.Item{Key: policyGenKey(owner), Value: []byte(newPolicyGeneration())}); err != nil {
+		if err := utils.MoveGeneration(uc.sharedCache, policyGenKey(owner)); err != nil {
 			return fmt.Errorf("invalidate policy stacks of %s: %w", owner, err)
 		}
 		return nil

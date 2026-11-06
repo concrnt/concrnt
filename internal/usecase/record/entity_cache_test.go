@@ -7,70 +7,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
-
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/schemas"
 )
-
-type fakeEntityCache struct {
-	mu    sync.Mutex
-	items map[string][]byte
-}
-
-func newFakeEntityCache() *fakeEntityCache {
-	return &fakeEntityCache{items: map[string][]byte{}}
-}
-
-func (c *fakeEntityCache) Get(key string) (*memcache.Item, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	value, ok := c.items[key]
-	if !ok {
-		return nil, memcache.ErrCacheMiss
-	}
-	return &memcache.Item{Key: key, Value: value}, nil
-}
-
-func (c *fakeEntityCache) GetMulti(keys []string) (map[string]*memcache.Item, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	items := map[string]*memcache.Item{}
-	for _, key := range keys {
-		if value, ok := c.items[key]; ok {
-			items[key] = &memcache.Item{Key: key, Value: value}
-		}
-	}
-	return items, nil
-}
-
-func (c *fakeEntityCache) Add(item *memcache.Item) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.items[item.Key]; ok {
-		return memcache.ErrNotStored
-	}
-	c.items[item.Key] = item.Value
-	return nil
-}
-
-func (c *fakeEntityCache) Set(item *memcache.Item) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.items[item.Key] = item.Value
-	return nil
-}
-
-func (c *fakeEntityCache) Delete(key string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.items[key]; !ok {
-		return memcache.ErrCacheMiss
-	}
-	delete(c.items, key)
-	return nil
-}
 
 // entityStoreRepo keeps entities the way the real stores do: CreateEntity
 // is accept-if-newer and GetEntityByCCID returns the stored document.
@@ -132,12 +72,6 @@ func (r *entityStoreRepo) lookupCount() int {
 	return r.lookups
 }
 
-func newEntityCacheUsecase(cfg *domain.Config, repo Repository, cache SharedCache) *Usecase {
-	uc := New(repo, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, nopPolicyService{}, nil, nil)
-	uc.SetSharedCache(cache)
-	return uc
-}
-
 func entityDocAt(t *testing.T, party ackParty, host string, createdAt time.Time) concrnt.SignedDocument {
 	t.Helper()
 	return signTestDocument(t, concrnt.Document[schemas.Entity]{
@@ -153,7 +87,7 @@ func TestGetEntityServesHitsFromCache(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	party := newAckParty(t, remoteEntityHost)
 	repo := newEntityStoreRepo()
-	uc := newEntityCacheUsecase(cfg, repo, newFakeEntityCache())
+	uc := newCachedUsecase(cfg, repo, newFakeSharedCache())
 	ctx := context.Background()
 
 	doc := entityDocAt(t, party, remoteEntityHost, time.Now().Add(-time.Hour).UTC().Truncate(time.Second))
@@ -167,6 +101,7 @@ func TestGetEntityServesHitsFromCache(t *testing.T) {
 		t.Fatalf("GetEntity: %v", err)
 	}
 	lookups := repo.lookupCount()
+	uc.cache.Flush() // the second lookup must come from the shared cache
 
 	second, err := uc.GetEntity(ctx, uri)
 	if err != nil {
@@ -186,8 +121,8 @@ func TestGetEntityServesHitsFromCache(t *testing.T) {
 func TestGetEntityDoesNotCacheNotFound(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	repo := newEntityStoreRepo()
-	cache := newFakeEntityCache()
-	uc := newEntityCacheUsecase(cfg, repo, cache)
+	cache := newFakeSharedCache()
+	uc := newCachedUsecase(cfg, repo, cache)
 	uri := concrnt.CCURI{Scheme: "cckv", Owner: "con1unknown"}.String()
 
 	for range 2 {
@@ -209,9 +144,9 @@ func TestEntityCommitInvalidatesSharedCache(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	party := newAckParty(t, remoteEntityHost)
 	repo := newEntityStoreRepo()
-	cache := newFakeEntityCache()
-	writer := newEntityCacheUsecase(cfg, repo, cache)
-	reader := newEntityCacheUsecase(cfg, repo, cache)
+	cache := newFakeSharedCache()
+	writer := newCachedUsecase(cfg, repo, cache)
+	reader := newCachedUsecase(cfg, repo, cache)
 	ctx := context.Background()
 	uri := concrnt.CCURI{Scheme: "cckv", Owner: party.ccid}.String()
 	storedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
@@ -254,8 +189,8 @@ func TestGetEntityLocalCopySkipsSharedCache(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	party := newAckParty(t, remoteEntityHost)
 	repo := newEntityStoreRepo()
-	cache := newFakeEntityCache()
-	uc := newEntityCacheUsecase(cfg, repo, cache)
+	cache := newFakeSharedCache()
+	uc := newCachedUsecase(cfg, repo, cache)
 	ctx := context.Background()
 	uri := concrnt.CCURI{Scheme: "cckv", Owner: party.ccid}.String()
 

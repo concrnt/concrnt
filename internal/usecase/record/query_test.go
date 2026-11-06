@@ -41,11 +41,7 @@ func (r *queryRepo) QueryByParentOrderByKey(ctx context.Context, parent, schema,
 }
 
 func (r *queryRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
-	stacks := map[string][]concrnt.Policy{}
-	for _, uri := range uris {
-		stacks[uri] = []concrnt.Policy{}
-	}
-	return stacks, nil
+	return emptyStacks(uris), nil
 }
 
 func keyOnlyRow(key string) QueryRow {
