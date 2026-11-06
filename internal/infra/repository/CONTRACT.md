@@ -16,7 +16,7 @@ the contract's meaning never depends on it.
 | C1 | No joins assumed | Every read method must be satisfiable as "one collection, equality filters, at most one range condition, an ordering" or as a get by id(s). Fields a query needs live on the key side, denormalised. |
 | C2 | Aggregates are caches | Counts are derived values recomputable from the primary data. Request paths read them through the aggregate layer (`internal/usecase/aggregate`); the repository only exposes the expensive `Compute*` recomputation, which nothing but the aggregate layer and `conctl op aggregate-verify` may call. A write adjusts an existing cache entry or recomputes; it never trusts an increment for correctness. |
 | C3 | No auto-increment in the contract | Contract identifiers are CDIDs, URI hashes and client-generated random ids. A backend's serial ids never leak out. |
-| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. The read methods take no `tx` and return **committed** state: inside `fn` they do not see what `fn` has written so far (on Postgres and SQLite they run on another connection, on Spanner as a single-use read), so a usecase never relies on reading its own uncommitted writes. Whether a backend's own write methods see their earlier statements in the same transaction is the backend's business. Keep one transaction's writes bounded (Spanner caps at 80,000 mutations including index entries and cascaded rows, Firestore at 10 MiB per commit; Firestore's former 500-write cap is gone); a range delete removes 500 targets in the commit and the rest page by page in `RecordRangeDelete` jobs. |
+| C4 | Transactions are `RunInTx(ctx, fn)` | `fn` may run more than once (contention retry), reaches the store only through the `tx` it is handed, and has no side effects of its own. The read methods take no `tx` and return **committed** state: inside `fn` they do not see what `fn` has written so far (on Postgres and SQLite they run on another connection, on Spanner as a single-use read), so a usecase never relies on reading its own uncommitted writes. Whether a backend's own write methods see their earlier statements in the same transaction is the backend's business. Keep one transaction's writes bounded (Spanner caps at 80,000 mutations including index entries and cascaded rows, Firestore at 10 MiB per commit); a range delete removes 500 targets in the commit and the rest page by page in `RecordRangeDelete` jobs. |
 | C5 | Indexes are the backend's own | The method table below names the access path (the C1 shape) each method issues; that table is the only cross-backend description. Each backend declares its indexes in its own schema (the gorm tags in `postgres/models.go` and `sqlite/models.go`, the DDL in `spanner/schema.go`, the shape registry in `firestore/indexes.go` that generates `deploy/firestore/firestore.indexes.json`) and pins the resulting index set in a test (`pg_indexes` / `sqlite_master` / `INFORMATION_SCHEMA.INDEXES` / the generated file), so a path added here lands in every backend's schema and test. Models, tables and index definitions are never shared between backends. |
 | C6 | Uniqueness is explicit | Contract-level uniqueness (association `unique`, ack `(from, to, schema)`) is "a second write of the same key is a no-op / rejected", verified by repotest, however the backend enforces it. |
 | C7 | repotest defines the contract | A backend that does not pass `repotest` does not implement the contract. Change repotest before changing the contract. |
@@ -40,126 +40,121 @@ Commit log ids (time-kind CDIDs: fixed-length lowercase base32) and the
 
 ## Method inventory
 
-Classification of every method against the principles. "shape" is the C1
-reading of the method: `get(x)` is a lookup by identifier, `eq` an equality
-filter, `range` the single range condition, `order` the ordering; `tx` marks
-a method that only runs inside `RunInTx`.
-
-Verdicts: **keep** — as is; **rename** — same semantics, new name
-(phase 2); **add** — new in phase 2; **bug** — contract semantics fixed in
-phase 2 (`behavior:` in the PR).
+Every method against the principles. "shape" is the C1 reading of the
+method: `get(x)` is a lookup by identifier, `eq` an equality filter,
+`range` the single range condition, `order` the ordering; `tx` marks a
+method that only runs inside `RunInTx`.
 
 ### `record.Repository` (`internal/usecase/record/usecase.go`)
 
 #### Transactions
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `RunInTx(ctx, fn)` | Runs `fn` atomically; retries on backend contention (Postgres 40001/40P01, SQLite BUSY, Spanner ABORTED); `fn` may run more than once (C4). | keep |
+| Method | Shape / semantics |
+|---|---|
+| `RunInTx(ctx, fn)` | Runs `fn` atomically; retries on backend contention (Postgres 40001/40P01, SQLite BUSY, Spanner ABORTED); `fn` may run more than once (C4). |
 
 #### Commit log
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, a duplicate id leaves the row as first written and returns `ErrAlreadyCommitted` (the commit path's redelivery check: no read precedes the insert). `c_date` (receipt time) is set by the backend. | keep |
-| `HasCommitLog(id)` | get(id) → exists. Tooling and tests. | keep |
-| `GetAllCommitLogs(owner)` | eq(owner), order(c_date asc). Dump of one owner. | keep |
-| `QueryCommitLogs(owner?, since, until, limit, order)` | eq(owner)?, range(c_date), order(c_date, id). Replication cursor; `QueryRow.CreatedAt` is `c_date`. Ownerless rows carry no CCFS. | keep |
-| `MarkCommitLogGcCandidate(tx, id)` | tx; set flag by id. | keep |
-| `MarkCommitLogsGcCandidateByOwner(owner)` | eq(owner) → set flag; idempotent. Not transactional (unregister). | keep |
-| `CountGcCandidates(cutoffID)` | eq(gc_candidate), range(id < cutoff) → count. Offline only. | keep |
-| `ListGcCandidates(cutoffID, afterID, limit)` | eq(gc_candidate), range(afterID < id < cutoff), order(id). Offline only. | keep |
-| `DeleteCommitLogs(ids)` | tx-free multi-delete by id; everything hanging off a commit (record, key, ack, acked, association, entity) goes with it; returns the number removed. Not atomic over the whole list: a backend with a per-commit write limit (Spanner) deletes in batches. Offline only; callers invalidate aggregates afterwards. | keep |
-| `ListCommitLogs(page)` | eq(owner)?, range(id), order(id asc), limit. Offline paging. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `CreateCommitLog(tx, id, ip, document, proof, owner)` | tx; insert by id, a duplicate id leaves the row as first written and returns `ErrAlreadyCommitted` (the commit path's redelivery check: no read precedes the insert). `c_date` (receipt time) is set by the backend. |
+| `GetAllCommitLogs(owner)` | eq(owner), order(c_date asc). Dump of one owner. |
+| `QueryCommitLogs(owner?, since, until, limit, order)` | eq(owner)?, range(c_date), order(c_date, id). Replication cursor; `QueryRow.CreatedAt` is `c_date`. Ownerless rows carry no CCFS. |
+| `MarkCommitLogGcCandidate(tx, id)` | tx; set flag by id. |
+| `MarkCommitLogsGcCandidateByOwner(owner)` | eq(owner) → set flag; idempotent. Not transactional (unregister). |
+| `CountGcCandidates(cutoffID)` | eq(gc_candidate), range(id < cutoff) → count. Offline only. |
+| `ListGcCandidates(cutoffID, afterID, limit)` | eq(gc_candidate), range(afterID < id < cutoff), order(id). Offline only. |
+| `DeleteCommitLogs(ids)` | tx-free multi-delete by id; everything hanging off a commit (record, key, ack, acked, association, entity) goes with it; returns the number removed. Not atomic over the whole list: a backend with a per-commit write limit (Spanner) deletes in batches. Offline only; callers invalidate aggregates afterwards. |
+| `ListCommitLogs(page)` | eq(owner)?, range(id), order(id asc), limit. Offline paging. |
 
 #### Records and keys
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `CreateRecord(tx, documentID, key, owner, author, schema, onUpdate, policies, distributions, redirect, createdAt)` | tx; accept-if-newer on `createdAt` per key (equal/older → `false`); creates placeholder parent keys up the chain; `onUpdate != "retain"` forgets the previous generation (record deleted, its commit flagged). The key row carries everything list queries and chunkline need (`recordCreatedAt`, `redirect`, …) so no read has to join the record (C1, T2.4). | keep |
-| `GetSignedDocument(uri)` | get(cckv key) or get(ccfs id); fills both `CCKV` and `CCFS` when known; placeholder key → not found. | keep |
-| `GetSignedDocuments(uris)` | multi-get over a mixed batch of cckv / ccfs URIs; a URI that resolves to nothing is absent from the map, not an error. Replaces the per-destination loop of the delete sweep (C1 round-trip budget). | add (T2.4) |
-| `GetHierarchicalRecordPolicies(uri)` | get(every ancestor key of uri, root first); emits a layer for each level that has a policy or distributes; ccfs input is mapped to its key first. The ancestor set is computed from the URI, not discovered by a join. | keep |
-| `GetHierarchicalRecordPoliciesMulti(uris)` | the same for several cckv URIs with one fetch of the union of their ancestor chains; every input has an entry. A listing checks a whole page with one call (C1 round-trip budget). | add (T2.4) |
-| `GetDistributions(uri)` | — | removed (T2.4): the stored distributions are the document's own `distributes`, which the caller already holds. |
-| `GetTimelineRemoval(keyURI)` | get(key) + get(parent key) → `(parent uri, chunkline item id)`; empty for keys that never appear in a chunkline body. | keep |
-| `DeleteRecordByKey(tx, uri)` | tx; delete the record the key points at (associations targeting the key go with it). | keep |
-| `DeleteRecordByDocumentID(tx, id)` | tx; delete by id. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `CreateRecord(tx, documentID, key, owner, author, schema, onUpdate, policies, distributions, redirect, createdAt)` | tx; accept-if-newer on `createdAt` per key (equal/older → `false`); creates placeholder parent keys up the chain; `onUpdate != "retain"` forgets the previous generation (record deleted, its commit flagged). The key row carries everything list queries and chunkline need (`recordCreatedAt`, `redirect`, …) so no read has to join the record (C1). |
+| `GetSignedDocument(uri)` | get(cckv key) or get(ccfs id); fills both `CCKV` and `CCFS` when known; placeholder key → not found. |
+| `GetSignedDocuments(uris)` | multi-get over a mixed batch of cckv / ccfs URIs; a URI that resolves to nothing is absent from the map, not an error. The delete sweep checks every destination with one call (C1 round-trip budget). |
+| `GetHierarchicalRecordPolicies(uri)` | get(every ancestor key of uri, root first); emits a layer for each level that has a policy or distributes; ccfs input is mapped to its key first. The ancestor set is computed from the URI, not discovered by a join. |
+| `GetHierarchicalRecordPoliciesMulti(uris)` | the same for several cckv URIs with one fetch of the union of their ancestor chains; every input has an entry. A listing checks a whole page with one call (C1 round-trip budget). |
+| `GetTimelineRemoval(keyURI)` | get(key) + get(parent key) → `(parent uri, chunkline item id)`; empty for keys that never appear in a chunkline body. |
+| `DeleteRecordByKey(tx, uri)` | tx; delete the record the key points at (associations targeting the key go with it). |
+| `DeleteRecordByDocumentID(tx, id)` | tx; delete by id. |
 
 #### List queries (CIP-5)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `QueryByPrefix(prefix, schema?, author?, since, until, limit, order)` | range(key starts with prefix) ∧ eq(schema)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). Only keys holding a record. `prefix` is a literal: a backend using `LIKE` escapes `%`/`_`/`\` (bug: Postgres did not). | bug (T2.6) |
-| `QueryByParent(parent, schema?, author?, since, until, limit, order)` | eq(parent) ∧ … as above; the owner root (`cckv://<owner>`) is a valid parent and lists top-level keys that hold a record. | keep |
-| `QueryByParentOrderByKey(parent, schema?, author?, sinceKey, untilKey, limit, order)` | eq(parent), range(key, inclusive bounds), order(key, **byte order**). Placeholder (intermediate) keys come back as key-only rows unless a record filter (schema/author) drops them. | bug (byte order, T2.3) |
-| `QueryRecordSubtree(base, includeSelf, afterKey, limit)` | range(key = base ∨ key starts with base + "/") ∧ range(key > afterKey)?, order(key, byte order), limit. The exact set a range delete removes; the cursor and limit page it one transaction at a time (phase 3: `RecordRangeDelete` jobs). | add (cursor, limit) |
+| Method | Shape / semantics |
+|---|---|
+| `QueryByPrefix(prefix, schema?, author?, since, until, limit, order)` | range(key starts with prefix) ∧ eq(schema)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). Only keys holding a record. `prefix` is a literal: a backend using `LIKE` escapes `%`/`_`/`\`. |
+| `QueryByParent(parent, schema?, author?, since, until, limit, order)` | eq(parent) ∧ … as above; the owner root (`cckv://<owner>`) is a valid parent and lists top-level keys that hold a record. |
+| `QueryByParentOrderByKey(parent, schema?, author?, sinceKey, untilKey, limit, order)` | eq(parent), range(key, inclusive bounds), order(key, **byte order**). Placeholder (intermediate) keys come back as key-only rows unless a record filter (schema/author) drops them. |
+| `QueryRecordSubtree(base, includeSelf, afterKey, limit)` | range(key = base ∨ key starts with base + "/") ∧ range(key > afterKey)?, order(key, byte order), limit. The exact set a range delete removes; the cursor and limit page it one transaction at a time (`RecordRangeDelete` jobs). |
 
 #### Associations
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `CreateAssociation(tx, documentID, targetURI, owner, author, schema, variant, unique, createdAt)` | tx; `false` when `documentID` or `unique` already exists (C6). The target key must exist. | keep |
-| `DeleteAssociation(tx, documentID)` | tx; delete by id. | keep |
-| `GetAssociatedRecords(targetURI, schema?, variant?, author?, since, until, limit, order)` | eq(target) ∧ eq(schema)? ∧ eq(variant)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). CCFS is composed from the association's owner. | keep |
-| `GetAssociatedRecordCountsBySchema(targetURI)` / `GetAssociatedRecordCountsByVariant(targetURI, schema)` → `ComputeAssociationCounts` | eq(target) → `map[schema]map[variant]count`, each variant carrying the earliest association `createdAt` (its order). One computation serves both reads; the per-schema counts are the sums. Expensive scan; aggregate layer only (C2). | rename + merge (T2.2) |
+| Method | Shape / semantics |
+|---|---|
+| `CreateAssociation(tx, documentID, targetURI, owner, author, schema, variant, unique, createdAt)` | tx; `false` when `documentID` or `unique` already exists (C6). The target key must exist. |
+| `DeleteAssociation(tx, documentID)` | tx; delete by id. |
+| `ListAssociationAuthors(targetURI, limit)` | eq(target) → up to `limit` distinct authors, unordered (exactly `limit` may be incomplete). Aggregate layer only (C2). |
+| `GetAssociatedRecords(targetURI, schema?, variant?, author?, since, until, limit, order)` | eq(target) ∧ eq(schema)? ∧ eq(variant)? ∧ eq(author)? ∧ range(createdAt), order(createdAt, id). CCFS is composed from the association's owner. |
+| `ComputeAssociationCounts(targetURI)` | eq(target) → `map[schema]map[variant]count`, each variant carrying the earliest association `createdAt` (its order). One computation serves both reads; the per-schema counts are the sums. Expensive scan; aggregate layer only (C2). |
 
 #### Acks (CIP-10)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `Acknowledge` / `UnAcknowledge(tx, documentID, from, to, schema, createdAt)` | tx; acker-side state keyed by `(from, to, schema)`, accept-if-newer on `createdAt` (equal/older → `false`). `true` means the state row moved, **not** that validity flipped. | keep |
-| `Acknowledged` / `UnAcknowledged(…)` | tx; the same on the target-side state. | keep |
-| `GetAcknowledgeRecords(from \| to, schema?, since, until, limit, order)` | exactly one of from/to: eq(from ∨ to) ∧ eq(valid) ∧ eq(schema)? ∧ range(createdAt), order(createdAt, id). Serves the side this server holds. | keep |
-| `GetAcknowledgeRecordCounts(from \| to, schema?)` → `ComputeAcknowledgeCounts` | eq(from ∨ to) ∧ eq(valid) ∧ eq(schema)? → `map[schema]count`. Aggregate layer only (C2). | rename (T2.2) |
+| Method | Shape / semantics |
+|---|---|
+| `Acknowledge` / `UnAcknowledge(tx, documentID, from, to, schema, createdAt)` | tx; acker-side state keyed by `(from, to, schema)`, accept-if-newer on `createdAt` (equal/older → `false`). `true` means the state row moved, **not** that validity flipped. |
+| `Acknowledged` / `UnAcknowledged(…)` | tx; the same on the target-side state. |
+| `GetAcknowledgeRecords(from \| to, schema?, since, until, limit, order)` | exactly one of from/to: eq(from ∨ to) ∧ eq(valid) ∧ eq(schema)? ∧ range(createdAt), order(createdAt, id). Serves the side this server holds. |
+| `ComputeAcknowledgeCounts(from \| to, schema?)` | eq(from ∨ to) ∧ eq(valid) ∧ eq(schema)? → `map[schema]count`. Aggregate layer only (C2). |
 
 #### Entities
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `CreateEntity(tx, ccid, alias, domain, documentID, createdAt)` | tx; accept-if-newer on `createdAt` per ccid. | keep |
-| `GetEntityByCCID(ccid)` | get(ccid) + its signed document. | keep |
-| `GetEntityByAlias(alias)` | eq(alias) → one entity + its signed document. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `CreateEntity(tx, ccid, alias, domain, documentID, createdAt)` | tx; accept-if-newer on `createdAt` per ccid. |
+| `GetEntityByCCID(ccid)` | get(ccid) + its signed document. |
+| `GetEntityByAlias(alias)` | eq(alias) → one entity + its signed document. |
 
 #### Chunkline views (CIP-11)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `GetChunklineManifest(uri)` | get(key) + eq(parent) order(recordCreatedAt asc) limit 1 → first chunk. | keep |
-| `LookupLocalItrs(uris, chunkID)` | per uri: eq(parent) ∧ range(recordCreatedAt < cutoff), order desc, limit 1 → chunk id. One statement on SQL backends, N bounded point queries elsewhere. | keep |
-| `LoadLocalBody(uri, chunkID)` | eq(parent) ∧ range(recordCreatedAt), order desc; reads only key-side fields (`recordCreatedAt`, `redirect`), never the record. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `GetChunklineManifest(uri)` | get(key) + eq(parent) order(recordCreatedAt asc) limit 1 → first chunk. |
+| `LookupLocalItrs(uris, chunkID)` | per uri: eq(parent) ∧ range(recordCreatedAt < cutoff), order desc, limit 1 → chunk id. One statement on SQL backends, N bounded point queries elsewhere. |
+| `LoadLocalBody(uri, chunkID)` | eq(parent) ∧ range(recordCreatedAt), order desc; reads only key-side fields (`recordCreatedAt`, `redirect`), never the record. |
 
 ### `usecase.EntityMetaRepository` (`internal/usecase/entitymeta.go`)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `SaveMeta(meta)` | upsert by ccid (inviter and info). | keep |
-| `GetMeta(ccid)` | get(ccid); `domain.NotFoundError` when absent. | keep |
-| `UpdateMetaInfo(ccid, info)` | update info only; `domain.NotFoundError` when absent. | keep |
-| `DeleteMeta(ccid)` | delete by ccid; idempotent. | keep |
-| `ListMetas(owner?)` | all, or eq(ccid). Offline dump. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `SaveMeta(meta)` | upsert by ccid (inviter and info). |
+| `GetMeta(ccid)` | get(ccid); `domain.NotFoundError` when absent. |
+| `UpdateMetaInfo(ccid, info)` | update info only; `domain.NotFoundError` when absent. |
+| `DeleteMeta(ccid)` | delete by ccid; idempotent. |
+| `ListMetas(owner?)` | all, or eq(ccid). Offline dump. |
 
 ### `server.Repository` (`internal/usecase/server/server.go`)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `Resolve(identifier, hint)` | get(fqdn) or eq(csid) in the local cache; on a miss fetches the well-known through the client (csid needs `hint`) and upserts it by fqdn. | keep |
-| `List()` | all cached well-knowns (rows with an empty well-known are skipped). | keep |
+| Method | Shape / semantics |
+|---|---|
+| `Resolve(identifier, hint)` | get(fqdn) or eq(csid) in the local cache; on a miss fetches the well-known through the client (csid needs `hint`) and upserts it by fqdn. |
+| `List()` | all cached well-knowns (rows with an empty well-known are skipped). |
 
 ### `notification.Repository` (`internal/usecase/notification/notification.go`)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `Subscribe(subscription)` | upsert by `(vendorID, owner)`. | keep |
-| `List()` | all. | keep |
-| `Get(vendorID, owner)` | get; `domain.NotFoundError` when absent. | keep |
-| `Delete(vendorID, owner)` | delete; idempotent. | keep |
+| Method | Shape / semantics |
+|---|---|
+| `Subscribe(subscription)` | upsert by `(vendorID, owner)`. |
+| `List()` | all. |
+| `Get(vendorID, owner)` | get; `domain.NotFoundError` when absent. |
+| `Delete(vendorID, owner)` | delete; idempotent. |
 
 ### `abuse.Repository` (`internal/usecase/abuse/abuse.go`)
 
-| Method | Shape / semantics | Verdict |
-|---|---|---|
-| `CreateAbuseReport(report, reporter, ip)` | append-only insert; the report's id is backend-internal (C3: it never leaves the repository). | keep |
+| Method | Shape / semantics |
+|---|---|
+| `CreateAbuseReport(report, reporter, ip)` | append-only insert; the report's id is backend-internal (C3: it never leaves the repository). |
 
 ### Identifiers crossing the contract (C3)
 

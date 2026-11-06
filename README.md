@@ -83,7 +83,8 @@ go test ./... -run TestName -v                   # a single test
 
 `go build` / `go vet` / `go test` are the tools of record; there is no Makefile or lint
 config. `.github/workflows/test.yml` runs `go vet ./...` and `go test ./... -count=1`
-(dockertest included) on every pull request and on pushes to `develop`.
+(dockertest included) on every pull request and on pushes to `develop`; the
+Spanner and Firestore suites run in their own jobs.
 `cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
 (`.github/workflows/docker-publish.yml`), which publishes multi-arch images on `v*.*.*`
 tags and pushes to `main`.
@@ -248,18 +249,20 @@ backend's package, and every backend passes the same contract suites
   fails in production (the startup probe logs it).
 
 `backends.aggregate` selects where the count caches live (`postgres` or
-`spanner` table, `firestore` collection, or `redis`); see `MIGRATION.md` for
-the operational notes.
+`spanner` table, `firestore` collection, `redis` or `memcached`); see
+`MIGRATION.md` for the operational notes.
 
 `conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
 `migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,
 `import-commitlog`, `gc-commitlog`, `dump-/import-subscriptions`,
 `aggregate-*`) work on every backend.
 
-Entities are cached in memcached (`entity:<ccid>`, 60 s) for every backend.
-Entity commits invalidate the entry, but `conctl` edits of the `entities`
-table (a changed `tag`, `delete-user`, `gc-commitlog`) do not reach the
-cache and take effect within that TTL.
+Entities (`entity:<ccid>`, 60 s plus a 5 s in-process copy), resolved
+documents (`doc:<hash>`, 1 h) and policy stacks (`policy-stack:<gen>:<hash>`,
+1 h under a per-owner generation) are cached in memcached for every backend.
+Commits invalidate their entries, but `conctl` edits of the tables (a
+changed `tag`, `delete-user`, `gc-commitlog`) do not reach the cache and
+take effect within those TTLs.
 
 ### Migration
 

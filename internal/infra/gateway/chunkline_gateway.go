@@ -246,9 +246,8 @@ func (r *resolver) resolveTimeline(ctx context.Context, timeline string) (chunkl
 		if err != nil {
 			span.RecordError(fmt.Errorf("failed to unmarshal cached manifest for %s: %w", timeline, err))
 		} else if manifest.ChunkSize > 0 {
-			// ChunkSize <= 0 means an invalid manifest cached before this
-			// validation existed — treat it as a miss so it can't reach a
-			// Time2Chunk division (the 7-day TTL is too long to wait out)
+			// an invalid cached manifest is a miss, so it never reaches a
+			// Time2Chunk division
 			r.keepManifest(timeline, manifest)
 			return manifest, nil
 		}

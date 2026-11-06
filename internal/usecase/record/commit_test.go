@@ -761,10 +761,10 @@ func documentIDOf(t *testing.T, sd concrnt.SignedDocument) string {
 }
 
 // A document already in commit_logs was fully applied once: redelivery is a
-// no-op success, nothing reaches the repository again. This is the replay
-// guard — deleted and superseded documents stay in commit_logs, so a captured
-// copy can't be replayed back in — while a fresh document at the same cckv
-// key has a different CDID and commits normally.
+// no-op success, the insert reports it and the transaction rolls back. This
+// is the replay guard — deleted and superseded documents stay in
+// commit_logs, so a captured copy can't be replayed back in — while a fresh
+// document at the same cckv key has a different CDID and commits normally.
 func TestCommitSkipsAlreadyCommittedDocument(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}

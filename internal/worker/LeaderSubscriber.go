@@ -71,10 +71,9 @@ type SubState struct {
 // PubSub carries events between replicas. Subscribe delivers the events of
 // the channels starting with one of prefixes on response until ctx is done;
 // SubscribeAll delivers every event. Delivery may be dropped for a
-// subscriber that does not drain response, so callers buffer it. A backend
-// whose server does cheap subject matching (NATS) may subscribe per caller;
-// one whose matching is per connection and linear in the patterns (Redis)
-// holds one subscription per replica and fans out in-process.
+// subscriber that does not drain response, so callers buffer it. Redis
+// matches patterns per connection, linearly, so the backend holds one
+// subscription per replica and fans out in-process.
 type PubSub interface {
 	Publish(ctx context.Context, channel string, event concrnt.Event) error
 	Subscribe(ctx context.Context, prefixes []string, response chan<- concrnt.Event) error

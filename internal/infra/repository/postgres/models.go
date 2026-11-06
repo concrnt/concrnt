@@ -41,7 +41,7 @@ type CommitLog struct {
 // Indexes:
 //   - PRIMARY KEY (id): internal key identity; used by parent_id references and
 //     associations.target_id joins in record.Repository.GetAssociatedRecords and
-//     ComputeAssociationCounts*.
+//     ComputeAssociationCounts.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
 //     record.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
@@ -53,7 +53,7 @@ type CommitLog struct {
 //     and record joins; used by record.Repository.GetHierarchicalRecordPolicies,
 //     policiesFor and signedDocumentsByID.
 //   - idx_record_keys_parent_id_record_id (parent_id, record_id): parent member
-//     lookup and record preload joins; used by record.Repository.QueryByParent.
+//     lookup; used by record.Repository.QueryByParent.
 //   - idx_record_keys_parent_created_at_record_id
 //     (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL
 //     AND record_created_at IS NOT NULL: timeline/chunkline range scans without

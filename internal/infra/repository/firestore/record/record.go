@@ -50,8 +50,7 @@ func (r *Repository) CreateRecord(
 	}
 	// one round trip reads (and locks) the key and every ancestor
 	// placeholder; the serializable validation at commit closes the
-	// fresh-key race the same way the SQL backends' row lock + conditional
-	// upsert did
+	// fresh-key race (the SQL backends' row lock + conditional upsert)
 	states, err := t.readAll(refs)
 	if err != nil {
 		span.RecordError(err)

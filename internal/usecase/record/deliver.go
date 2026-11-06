@@ -127,9 +127,9 @@ func (uc *Usecase) createReferenceDistributionActions(ctx context.Context, ip st
 }
 
 // enqueueEventDelivery delivers a realtime event job. When the channel's
-// owner lives on this server the event is published right away: queued
-// behind federation jobs it reached local subscribers tens of seconds late
-// under load, and Deliver would do nothing remote for a local host anyway.
+// owner lives on this server the event is published right away instead of
+// waiting behind federation jobs in the queue (Deliver would do nothing
+// remote for a local host anyway).
 func (uc *Usecase) enqueueEventDelivery(ctx context.Context, job DeliveryJob) error {
 	// Deliver's host resolution, with the owner from the entity cache instead
 	// of a resolve request; an unknown owner goes through the queue

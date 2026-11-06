@@ -40,14 +40,14 @@ type migration struct {
 //     (author, created_at, id) for the schema / author filters of
 //     QueryByPrefix and QueryByParent.
 //   - record_keys: PK (uri) resolution, prefix scans (STARTS_WITH on the key)
-//     and the owner-root branch of QueryByParent*;
+//     and the owner-root branch of QueryByParent / QueryByParentOrderByKey;
 //     idx_record_keys_parent_created_at_record_id NULL_FILTERED
 //     (parent_uri, record_created_at DESC, record_id) chunkline scans and
 //     QueryByParent; idx_record_keys_record_id UNIQUE NULL_FILTERED reverse
 //     ccfs-to-cckv lookups; idx_record_keys_parent_uri_uri (parent_uri, uri)
 //     QueryByParentOrderByKey including placeholders.
 //   - associations: PK (id) interleaved; (target_uri) GetAssociatedRecords
-//     and the Compute* counts; (target_uri, schema, variant, author) and
+//     and ComputeAssociationCounts; (target_uri, schema, variant, author) and
 //     (target_uri, schema, variant, created_at) for the filtered variants;
 //     UNIQUE (unique_key) idempotent association writes.
 //   - acks / ackeds: PK (id) interleaved; UNIQUE (from_ccid, to_ccid, schema)
@@ -202,8 +202,8 @@ var migrations = []migration{
 		) PRIMARY KEY (key), ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`,
 	}},
 	// acks are read by from and ackeds by to: the other side's indexes and
-	// the schema ones were never scanned. A fresh database never had them
-	// (the baseline above no longer creates them), hence IF EXISTS.
+	// the schema ones were never scanned; IF EXISTS because the baseline
+	// does not create them
 	{2, "drop_unused_ack_indexes", []string{
 		`DROP INDEX IF EXISTS idx_acks_to_valid_created_at`,
 		`DROP INDEX IF EXISTS idx_acks_schema_valid_created_at`,

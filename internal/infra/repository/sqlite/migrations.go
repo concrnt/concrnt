@@ -34,8 +34,7 @@ type migration struct {
 }
 
 // The numbered steps are what AutoMigrate cannot express (backfills, index
-// rebuilds, raw DDL). SQLite shipped on AutoMigrate alone, so the first real
-// step gets version 1.
+// rebuilds, raw DDL).
 var migrations = []migration{
 	// acks are read by from and ackeds by to: the other side's indexes and
 	// the schema ones were never scanned, and the gc flag index is rebuilt

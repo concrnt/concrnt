@@ -47,7 +47,7 @@ func (m *CommitLog) BeforeCreate(*gorm.DB) error {
 // Indexes:
 //   - PRIMARY KEY (id): internal key identity; used by parent_id references and
 //     associations.target_id joins in record.Repository.GetAssociatedRecords and
-//     ComputeAssociationCounts*.
+//     ComputeAssociationCounts.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
 //     record.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
@@ -58,7 +58,7 @@ func (m *CommitLog) BeforeCreate(*gorm.DB) error {
 //     and record joins; used by record.Repository.GetHierarchicalRecordPolicies,
 //     policiesFor and signedDocumentsByID.
 //   - idx_record_keys_parent_id_record_id (parent_id, record_id): parent member
-//     lookup and record preload joins; used by record.Repository.QueryByParent.
+//     lookup; used by record.Repository.QueryByParent.
 //   - idx_record_keys_parent_created_at_record_id
 //     (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL
 //     AND record_created_at IS NOT NULL: timeline/chunkline range scans without
@@ -262,9 +262,7 @@ type Entity struct {
 
 	DocumentID string    `json:"id" gorm:"type:text;not null"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
-	// document createdAt: the accept-if-newer key (CIP-3 §3.4). Postgres holds
-	// the epoch on rows written before the column existed; 0 is the same
-	// instant here, so any real document replaces them.
+	// document createdAt: the accept-if-newer key (CIP-3 §3.4)
 	CreatedAt int64 `json:"createdAt" gorm:"type:integer;not null;default:0"`
 
 	CDate int64 `json:"cdate" gorm:"->;<-:create;type:integer;not null"`

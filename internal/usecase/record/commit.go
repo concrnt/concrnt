@@ -242,8 +242,8 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil
 	})
 	if errors.Is(err, ErrAlreadyCommitted) {
-		// a redelivery: the commit log's insert found the id (there is no
-		// read before it), the transaction rolled back and nothing changed
+		// a redelivery: the commit log's insert found the id, the
+		// transaction rolled back and nothing changed
 		return &sd, nil
 	}
 	if err != nil && !errors.Is(err, errCommitNoop) {

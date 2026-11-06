@@ -23,7 +23,8 @@ dropping it is always safe and never needs a log replay.
   policy on `expiresAt` (`deploy/firestore/README.md`); until it is
   enabled they stay on disk, ignored.
 - Existing databases get no pre-computed counts; the first read of each
-  target computes it (one `GROUP BY` over that target's associations).
+  target computes it (one `GROUP BY` over that target's associations, plus
+  one author listing when the target has at most 1000 of them).
 
 ## Moving between backends (log replay)
 
@@ -89,9 +90,9 @@ Notes:
   devnet dump landed 24k commits in 85 minutes, the last batches at 4
   minutes per 400 lines): rehearse a migration against a real database.
 - The round trip Postgres → SQLite → Postgres was verified this way on a
-  218k-commit devnet dump; see the phase 2 pull request for the numbers.
-  Postgres → Spanner (Omni) → Postgres: see the phase 3 pull request.
+  218k-commit devnet dump; see PR #115 for the numbers.
+  Postgres → Spanner (Omni) → Postgres: see PR #125.
   Postgres → Firestore (emulator) → Postgres was verified on the first
   23,911 commits / 167 metas of that dump (the emulator's pace, see above):
   the Firestore dump is a subset of the source and the Postgres dump
-  replayed from it is identical, line for line; see the phase 4 pull request.
+  replayed from it is identical, line for line; see PR #124.

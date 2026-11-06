@@ -435,7 +435,7 @@ func main() {
 		if err != nil || entity.Domain != domainConfig.FQDN {
 			return concrnt.SignedDocument{}, false, nil
 		}
-		// the resolve endpoint this replaces answers without a requester
+		// like the resolve endpoint, read without a requester
 		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
 		if errors.Is(err, domain.ErrNotFound) {
 			// this server is the owner's home: the HTTP path would ask this
