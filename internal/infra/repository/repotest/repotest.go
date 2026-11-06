@@ -120,8 +120,8 @@ type AckState struct {
 	CreatedAt  time.Time
 }
 
-// ErrTestRollback aborts a RunInTx closure so nothing it wrote persists.
-var ErrTestRollback = errors.New("test rollback")
+// errTestRollback aborts a RunInTx closure so nothing it wrote persists.
+var errTestRollback = errors.New("test rollback")
 
 // foreignTx is a RepositoryTx of a type no backend recognises; every write
 // method must reject it.
@@ -129,10 +129,10 @@ type foreignTx struct{}
 
 func (foreignTx) IsRepositoryTx() {}
 
-// WithCommit runs fn inside a commit transaction that already holds the
+// withCommit runs fn inside a commit transaction that already holds the
 // commit log for sd, recorded under owner (the single entity every commit is
 // attributed to).
-func WithCommit(t *testing.T, ctx context.Context, repo record.Repository, id string, ip string, sd concrnt.SignedDocument, owner string, fn func(tx record.RepositoryTx) error) {
+func withCommit(t *testing.T, ctx context.Context, repo record.Repository, id string, ip string, sd concrnt.SignedDocument, owner string, fn func(tx record.RepositoryTx) error) {
 	t.Helper()
 
 	require.NoError(t, repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
@@ -143,8 +143,8 @@ func WithCommit(t *testing.T, ctx context.Context, repo record.Repository, id st
 	}))
 }
 
-// InTx runs fn in a transaction and commits it; fn reports failures through t.
-func InTx(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
+// inTx runs fn in a transaction and commits it; fn reports failures through t.
+func inTx(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
 	t.Helper()
 	require.NoError(t, repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
 		fn(tx)
@@ -152,19 +152,19 @@ func InTx(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx 
 	}))
 }
 
-// InTxRollback runs fn in a transaction that is always rolled back, so only
+// inTxRollback runs fn in a transaction that is always rolled back, so only
 // the values fn observed matter.
-func InTxRollback(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
+func inTxRollback(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
 	t.Helper()
 	err := repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
 		fn(tx)
-		return ErrTestRollback
+		return errTestRollback
 	})
-	require.ErrorIs(t, err, ErrTestRollback)
+	require.ErrorIs(t, err, errTestRollback)
 }
 
-// Ptr returns a pointer to v.
-func Ptr[T any](v T) *T {
+// ptr returns a pointer to v.
+func ptr[T any](v T) *T {
 	return &v
 }
 
@@ -197,7 +197,7 @@ func CreateChunklineRecord(t *testing.T, ctx context.Context, repo record.Reposi
 		CreatedAt: createdAt,
 	})
 
-	WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 		_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
 		return err
 	})

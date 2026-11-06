@@ -20,20 +20,16 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/concrnt/concrnt/client"
-	"github.com/concrnt/concrnt/internal/domain"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 type Repository struct {
 	client *firestore.Client
-	cl     *client.Client
-	config domain.Config
 }
 
-func New(client *firestore.Client, cl *client.Client, config domain.Config) ucrecord.Repository {
-	return &Repository{client: client, cl: cl, config: config}
+func New(client *firestore.Client) ucrecord.Repository {
+	return &Repository{client: client}
 }
 
 var tracer = otel.Tracer("repository")
@@ -57,7 +53,7 @@ func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.Repository
 	attempts := 0
 	err := r.client.RunTransaction(ctx, func(_ context.Context, ftx *firestore.Transaction) error {
 		attempts++
-		tx := newRecordTx(r.client, ftx)
+		tx := newRecordTx(ftx)
 		if err := fn(tx); err != nil {
 			return err
 		}

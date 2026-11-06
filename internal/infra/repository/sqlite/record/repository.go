@@ -15,19 +15,15 @@ import (
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
-	"github.com/concrnt/concrnt/client"
-	"github.com/concrnt/concrnt/internal/domain"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 type Repository struct {
-	db     *gorm.DB
-	client *client.Client
-	config domain.Config
+	db *gorm.DB
 }
 
-func New(db *gorm.DB, cl *client.Client, config domain.Config) ucrecord.Repository {
-	return &Repository{db: db, client: cl, config: config}
+func New(db *gorm.DB) ucrecord.Repository {
+	return &Repository{db: db}
 }
 
 var tracer = otel.Tracer("repository")

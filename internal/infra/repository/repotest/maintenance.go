@@ -34,7 +34,7 @@ func seedMaintenanceCommit(t *testing.T, ctx context.Context, repo record.Reposi
 		Schema:    "https://schema.example/post.json",
 		CreatedAt: createdAt,
 	})
-	WithCommit(t, ctx, repo, id, "10.0.0."+string(rune('1'+n)), sd, owner, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, id, "10.0.0."+string(rune('1'+n)), sd, owner, func(tx record.RepositoryTx) error {
 		_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
 		return err
 	})
@@ -54,7 +54,7 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	old2 := seedMaintenanceCommit(t, ctx, repo, owner, 1, base.Add(time.Hour))
 	recent := seedMaintenanceCommit(t, ctx, repo, owner, 2, base.Add(3*time.Hour))
 	oldKept := seedMaintenanceCommit(t, ctx, repo, owner, 3, base.Add(30*time.Minute))
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		for _, id := range []string{old1, old2, recent} {
 			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, id))
 		}

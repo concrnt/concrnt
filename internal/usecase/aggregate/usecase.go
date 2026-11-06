@@ -22,9 +22,6 @@ type Definition[V any, D any] struct {
 	Name    string
 	Compute func(ctx context.Context, target string) (V, error)
 	Apply   func(cur V, delta D) V
-	// TTL and MaxDeltas override the usecase defaults when non-zero.
-	TTL       time.Duration
-	MaxDeltas int
 }
 
 type Usecase struct {
@@ -42,20 +39,6 @@ func New(store Store, ttl time.Duration, maxDeltas int) *Usecase {
 		maxDeltas = DefaultMaxDeltas
 	}
 	return &Usecase{store: store, ttl: ttl, maxDeltas: maxDeltas}
-}
-
-func (uc *Usecase) ttlOf(ttl time.Duration) time.Duration {
-	if ttl > 0 {
-		return ttl
-	}
-	return uc.ttl
-}
-
-func (uc *Usecase) maxDeltasOf(n int) int {
-	if n > 0 {
-		return n
-	}
-	return uc.maxDeltas
 }
 
 // Get is the read-through: the cached value, or a fresh computation that is
@@ -111,7 +94,7 @@ func Touch[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], ta
 		return errors.Join(err, uc.store.Invalidate(ctx, key))
 	}
 	if ok {
-		if entry.Deltas > uc.maxDeltasOf(def.MaxDeltas) {
+		if entry.Deltas > uc.maxDeltas {
 			return uc.store.Invalidate(ctx, key)
 		}
 		return nil
@@ -141,7 +124,7 @@ func Seed[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], tar
 	if err != nil {
 		return err
 	}
-	_, err = uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: time.Now()}, uc.ttlOf(def.TTL))
+	_, err = uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: time.Now()}, uc.ttl)
 	return err
 }
 
@@ -183,7 +166,7 @@ func computeAndPut[V, D any](ctx context.Context, uc *Usecase, def *Definition[V
 	if err != nil {
 		return value, false, err
 	}
-	won, err := uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: asOf}, uc.ttlOf(def.TTL))
+	won, err := uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: asOf}, uc.ttl)
 	if err != nil {
 		slog.Warn("aggregate: store rejected a computed value", slog.String("name", def.Name), slog.String("error", err.Error()))
 		return value, false, err

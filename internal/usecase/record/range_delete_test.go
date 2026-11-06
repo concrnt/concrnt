@@ -113,9 +113,6 @@ func (r *rangeDeleteRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, 
 	r.commitLogOwners[id] = owner
 	return nil
 }
-func (r *rangeDeleteRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return false, nil
-}
 func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error {
 	r.gcFlagged = append(r.gcFlagged, documentID)
 	return nil

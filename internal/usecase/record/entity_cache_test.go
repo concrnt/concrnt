@@ -91,10 +91,6 @@ func (r *entityStoreRepo) RunInTx(ctx context.Context, fn func(tx RepositoryTx) 
 	return fn(&recordingTx{})
 }
 
-func (r *entityStoreRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return false, nil
-}
-
 func (r *entityStoreRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()

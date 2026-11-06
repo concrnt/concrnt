@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/domain"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -23,7 +22,7 @@ func TestRunInTxRetriesOnBusy(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 	require.NoError(t, sqlitedb.Migrate(ctx, db))
-	repo := New(db.DB, nil, domain.Config{})
+	repo := New(db.DB)
 
 	holding := make(chan struct{})
 	released := make(chan struct{})
@@ -52,8 +51,8 @@ func TestRunInTxRetriesOnBusy(t *testing.T) {
 	<-released
 
 	for _, id := range []string{"busy-holder", "busy-waiter"} {
-		has, err := repo.HasCommitLog(ctx, id)
+		commit, err := newInspector(db.DB).Commit(ctx, id)
 		require.NoError(t, err)
-		require.True(t, has, "%s must be committed", id)
+		require.NotNil(t, commit, "%s must be committed", id)
 	}
 }

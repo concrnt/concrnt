@@ -3,37 +3,15 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
-	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
-
-func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
-	defer span.End()
-
-	var commitLog sqlitedb.CommitLog
-	err := r.db.WithContext(ctx).
-		Select("id").
-		Where("id = ?", id).
-		Take(&commitLog).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, nil
-	}
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-
-	return true, nil
-}
 
 func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.RepositoryTx, id string, ip string, document string, proof any, owner string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")

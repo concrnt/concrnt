@@ -127,9 +127,12 @@ func (r *NotificationRepository) Delete(ctx context.Context, vendorID, owner str
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Delete")
 	defer span.End()
 
-	_, err := update(ctx, r.client, spanner.Statement{
-		SQL:    "DELETE FROM subscriptions WHERE vendor_id = @vendor_id AND owner = @owner",
-		Params: map[string]any{"vendor_id": vendorID, "owner": owner},
+	_, err := r.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		_, err := tx.Update(ctx, spanner.Statement{
+			SQL:    "DELETE FROM subscriptions WHERE vendor_id = @vendor_id AND owner = @owner",
+			Params: map[string]any{"vendor_id": vendorID, "owner": owner},
+		})
+		return err
 	})
 	if err != nil {
 		span.RecordError(err)

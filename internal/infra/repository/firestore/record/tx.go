@@ -32,7 +32,6 @@ type pendingWrite struct {
 // the same document are coalesced so a document is written at most once
 // per commit.
 type recordTx struct {
-	c     *firestore.Client
 	ftx   *firestore.Transaction
 	ops   map[string]*pendingWrite
 	order []string
@@ -40,8 +39,8 @@ type recordTx struct {
 
 func (*recordTx) IsRepositoryTx() {}
 
-func newRecordTx(c *firestore.Client, ftx *firestore.Transaction) *recordTx {
-	return &recordTx{c: c, ftx: ftx, ops: map[string]*pendingWrite{}}
+func newRecordTx(ftx *firestore.Transaction) *recordTx {
+	return &recordTx{ftx: ftx, ops: map[string]*pendingWrite{}}
 }
 
 // docState is one document as the transaction sees it: the committed data

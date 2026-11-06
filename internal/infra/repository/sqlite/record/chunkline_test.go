@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
@@ -23,7 +22,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	db := openDB(t).DB
 
 	ctx := context.Background()
-	recordRepo := New(db, nil, domain.Config{})
+	recordRepo := New(db)
 	chunklineRepo := recordRepo
 
 	parentURI := "cckv://con2owner/timeline"

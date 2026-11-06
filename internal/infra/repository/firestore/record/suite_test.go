@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
@@ -21,11 +20,11 @@ func TestMain(m *testing.M) {
 func openBackend(t *testing.T) repotest.Backend {
 	t.Helper()
 	client := testutil.CreateFirestore(t)
-	cl, _ := repotest.PeerClient(t)
+	cl := repotest.PeerClient(t)
 	return repotest.Backend{
-		Record:       New(client, nil, domain.Config{}),
+		Record:       New(client),
 		EntityMeta:   fsrepo.NewEntityMetaRepository(client),
-		Server:       fsrepo.NewServerRepository(&domain.Config{FQDN: "local.example"}, client, cl),
+		Server:       fsrepo.NewServerRepository(client, cl),
 		Notification: fsrepo.NewNotificationRepository(client),
 		Abuse:        fsrepo.NewAbuseRepository(client),
 		Inspect:      newInspector(client),

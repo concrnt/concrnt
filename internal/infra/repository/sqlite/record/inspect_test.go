@@ -77,7 +77,7 @@ func (i *inspector) RecordKey(ctx context.Context, uri string) (*repotest.KeySta
 	}
 	return &repotest.KeyState{
 		RecordID:        key.RecordID,
-		RecordCreatedAt: sqlitedb.TimePtr(key.RecordCreatedAt),
+		RecordCreatedAt: timePtr(key.RecordCreatedAt),
 		Redirect:        key.Redirect,
 	}, nil
 }
@@ -151,4 +151,12 @@ func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
 	var count int64
 	err := i.db.WithContext(ctx).Model(&sqlitedb.AbuseReport{}).Count(&count).Error
 	return count, err
+}
+
+func timePtr(us *int64) *time.Time {
+	if us == nil {
+		return nil
+	}
+	t := sqlitedb.Time(*us)
+	return &t
 }

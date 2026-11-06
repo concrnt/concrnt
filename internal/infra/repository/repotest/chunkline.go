@@ -20,7 +20,6 @@ func RunChunklineSuite(t *testing.T, open func(t *testing.T) Backend) {
 func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Record
 
 	parentURI := "cckv://con1owner/timeline"
 	createdAt10 := time.Unix(10*600+10, 0).UTC()
@@ -34,16 +33,16 @@ func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 	parent := mustRecordKey(t, ctx, be.Inspect, parentURI)
 	require.Nil(t, parent.RecordCreatedAt)
 
-	manifest, err := chunklineRepo.GetChunklineManifest(ctx, parentURI)
+	manifest, err := be.Record.GetChunklineManifest(ctx, parentURI)
 	require.NoError(t, err)
 	require.NotNil(t, manifest.FirstChunk)
 	require.EqualValues(t, 10, *manifest.FirstChunk)
 
-	itrs, err := chunklineRepo.LookupLocalItrs(ctx, []string{parentURI}, 11)
+	itrs, err := be.Record.LookupLocalItrs(ctx, []string{parentURI}, 11)
 	require.NoError(t, err)
 	require.EqualValues(t, 11, itrs[parentURI])
 
-	body, err := chunklineRepo.LoadLocalBody(ctx, parentURI, 11)
+	body, err := be.Record.LoadLocalBody(ctx, parentURI, 11)
 	require.NoError(t, err)
 	require.Len(t, body, 2)
 	require.Equal(t, parentURI+"/record-11", body[0].Href)
@@ -58,7 +57,6 @@ func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Record
 
 	parentURI := "cckv://con3owner/timeline"
 	chunkStart := time.Unix(30*600, 0).UTC()
@@ -69,11 +67,11 @@ func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 	CreateChunklineRecord(t, ctx, recordRepo, "boundary-mid", parentURI+"/boundary-mid", inChunk)
 	CreateChunklineRecord(t, ctx, recordRepo, "boundary-next", parentURI+"/boundary-next", nextChunkStart)
 
-	itrs, err := chunklineRepo.LookupLocalItrs(ctx, []string{parentURI}, 30)
+	itrs, err := be.Record.LookupLocalItrs(ctx, []string{parentURI}, 30)
 	require.NoError(t, err)
 	require.EqualValues(t, 30, itrs[parentURI])
 
-	body, err := chunklineRepo.LoadLocalBody(ctx, parentURI, 30)
+	body, err := be.Record.LoadLocalBody(ctx, parentURI, 30)
 	require.NoError(t, err)
 	require.Len(t, body, 2)
 	require.Equal(t, parentURI+"/boundary-mid", body[0].Href)
@@ -83,12 +81,11 @@ func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 func testChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T, be Backend) {
 	ctx := context.Background()
 	recordRepo := be.Record
-	chunklineRepo := be.Record
 
 	feedURI := "cckv://con4owner/timeline"
 	CreateChunklineRecord(t, ctx, recordRepo, "empty-feed", feedURI, time.Unix(40*600, 0).UTC())
 
-	manifest, err := chunklineRepo.GetChunklineManifest(ctx, feedURI)
+	manifest, err := be.Record.GetChunklineManifest(ctx, feedURI)
 	require.NoError(t, err)
 	require.Nil(t, manifest.FirstChunk)
 }

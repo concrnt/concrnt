@@ -31,7 +31,6 @@ func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("CreateRecordFreshKeyConditionalUpsert", func(t *testing.T) { testCreateRecordFreshKeyConditionalUpsert(t, open(t)) })
 	t.Run("GetAllCommitLogsByOwner", func(t *testing.T) { testGetAllCommitLogsByOwner(t, open(t)) })
 	t.Run("QueryByParentOrderByKey", func(t *testing.T) { testRecordQueryByParentOrderByKey(t, open(t)) })
-	t.Run("HasCommitLog", func(t *testing.T) { testHasCommitLog(t, open(t)) })
 	t.Run("GetSignedDocumentByCCFS", func(t *testing.T) { testGetSignedDocumentByCCFS(t, open(t)) })
 	t.Run("GetSignedDocuments", func(t *testing.T) { testGetSignedDocuments(t, open(t)) })
 	t.Run("HierarchicalRecordPoliciesMulti", func(t *testing.T) { testHierarchicalRecordPoliciesMulti(t, open(t)) })
@@ -44,6 +43,19 @@ func testRecordWrites(t *testing.T, be Backend) {
 	in := be.Inspect
 
 	key := "cckv://con1owner/timeline/post-1"
+
+	t.Run("commit log first write wins", func(t *testing.T) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
+			require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+			require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"), record.ErrAlreadyCommitted)
+		})
+		require.Equal(t, "{}", mustCommit(t, ctx, in, "has-1").Document)
+
+		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+			require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-2", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
+		})
+		require.False(t, commitExists(t, ctx, in, "has-2"), "a rolled-back write leaves nothing behind")
+	})
 
 	t.Run("create and update record", func(t *testing.T) {
 		createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
@@ -58,7 +70,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Distributes: &distributions,
 		})
 		onUpdate := "forget"
-		WithCommit(t, ctx, repo, "record-1-old", "127.0.0.1", oldSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "record-1-old", "127.0.0.1", oldSD, "con1owner", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateRecord(ctx, tx, "record-1-old", key, "con1owner", "con1owner", "https://schema.example/post.json", &onUpdate, nil, distributions, nil, createdAt)
 			require.True(t, applied)
 			return err
@@ -97,7 +109,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.v2.json",
 			CreatedAt: newCreatedAt,
 		})
-		WithCommit(t, ctx, repo, "record-2-new", "127.0.0.1", newSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "record-2-new", "127.0.0.1", newSD, "con1owner", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateRecord(ctx, tx, "record-2-new", key, "con1owner", "con1owner", "https://schema.example/post.v2.json", &onUpdate, nil, []string{}, nil, newCreatedAt)
 			require.True(t, applied)
 			return err
@@ -120,7 +132,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 
 		// accept-if-newer: a replayed older (or identical) document must not
 		// roll the key back, and must not tombstone the stored newer version.
-		InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
 			applied, err := repo.CreateRecord(ctx, tx, "record-0-stale", key, "con1owner", "con1owner", "https://schema.example/post.json", &onUpdate, nil, distributions, nil, createdAt)
 			require.NoError(t, err)
 			require.False(t, applied)
@@ -147,7 +159,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			forgets  bool
 		}{
 			{"default", nil, true},
-			{"retain", Ptr("retain"), false},
+			{"retain", ptr("retain"), false},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				key := "cckv://con1owner/timeline/onupdate-" + tc.name
@@ -164,7 +176,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 						CreatedAt: createdAt,
 						OnUpdate:  tc.onUpdate,
 					})
-					WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+					withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 						applied, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", tc.onUpdate, nil, []string{}, nil, createdAt)
 						require.True(t, applied)
 						return err
@@ -195,9 +207,9 @@ func testRecordWrites(t *testing.T, be Backend) {
 				Author:    "con1entity",
 				Schema:    schemas.EntityURL,
 				CreatedAt: createdAt,
-				OnUpdate:  Ptr("forget"),
+				OnUpdate:  ptr("forget"),
 			})
-			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1entity", func(tx record.RepositoryTx) error {
+			withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1entity", func(tx record.RepositoryTx) error {
 				applied, err := repo.CreateEntity(ctx, tx, "con1entity", nil, "example.com", id, createdAt)
 				require.True(t, applied)
 				return err
@@ -213,7 +225,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 
 		// CIP-3 §3.4: the key is createdAt alone — an equal-createdAt
 		// document is a no-op whatever its id, an older one too
-		InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, "entity-9-same-time", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1entity"))
 			applied, err := repo.CreateEntity(ctx, tx, "con1entity", nil, "other.example.net", "entity-9-same-time", time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC))
 			require.NoError(t, err)
@@ -252,7 +264,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			targetURI: targetSD,
 		}
 
-		WithCommit(t, ctx, repo, "reference-record", "127.0.0.1", refSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "reference-record", "127.0.0.1", refSD, "con1owner", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, "reference-record", "cckv://con1owner/timeline/ref-1", "con1owner", "con1owner", "https://schema.example/target.json", nil, nil, []string{}, &targetURI, targetCreatedAt)
 			return err
 		})
@@ -271,7 +283,6 @@ func testRecordWrites(t *testing.T, be Backend) {
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
-		chunklineRepo := be.Record
 
 		// plain record: item ID is the record key URI
 		timeline, itemID, err := repo.GetTimelineRemoval(ctx, key)
@@ -294,7 +305,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			require.NotNil(t, recordKey.RecordCreatedAt)
 			chunkID := recordKey.RecordCreatedAt.Unix() / 600
 
-			items, err := chunklineRepo.LoadLocalBody(ctx, "cckv://con1owner/timeline", chunkID)
+			items, err := be.Record.LoadLocalBody(ctx, "cckv://con1owner/timeline", chunkID)
 			require.NoError(t, err)
 			ids := make([]string, 0, len(items))
 			for _, item := range items {
@@ -328,7 +339,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 		associationUnique := fmt.Sprintf("%x", xxh3.HashString("con1owner"+"con1author"+key+variant))
 		associationCreatedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 		var inserted bool
-		WithCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
 			var err error
 			inserted, err = repo.CreateAssociation(ctx, tx, "association-record", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
 			return err
@@ -345,7 +356,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 
 		// duplicate deliveries are silent no-ops: the same document re-sent
 		// (primary-key conflict)...
-		WithCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
 			var err error
 			inserted, err = repo.CreateAssociation(ctx, tx, "association-record", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
 			return err
@@ -354,7 +365,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 
 		// ...and the same logical association re-signed under a new document id
 		// (unique-key conflict)
-		WithCommit(t, ctx, repo, "association-record-retry", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "association-record-retry", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
 			var err error
 			inserted, err = repo.CreateAssociation(ctx, tx, "association-record-retry", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
 			return err
@@ -391,7 +402,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			}
 			sd := ackDoc(kind, createdAt)
 			var applied bool
-			InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+			inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
 				require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, "con1author"))
 				transition := repo.Acknowledge
 				if unack {
@@ -404,7 +415,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			return applied
 		}
 
-		WithCommit(t, ctx, repo, "ack-1-on", "127.0.0.1", ackDoc("ack", ackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "ack-1-on", "127.0.0.1", ackDoc("ack", ackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
 			applied, err := repo.Acknowledge(ctx, tx, "ack-1-on", "con1author", "con1owner", ackSchema, ackCreatedAt)
 			require.True(t, applied)
 			return err
@@ -423,7 +434,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 		require.Equal(t, "ack-1-on", ackState().DocumentID)
 
 		unackCreatedAt := ackCreatedAt.Add(time.Hour)
-		WithCommit(t, ctx, repo, "ack-2-off", "127.0.0.1", ackDoc("unack", unackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "ack-2-off", "127.0.0.1", ackDoc("unack", unackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
 			applied, err := repo.UnAcknowledge(ctx, tx, "ack-2-off", "con1author", "con1owner", ackSchema, unackCreatedAt)
 			require.True(t, applied)
 			return err
@@ -442,7 +453,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 		// ...and after a newer ack (t2), an unack replayed from before it (t1)
 		// must not roll the state back either.
 		reackCreatedAt := ackCreatedAt.Add(24 * time.Hour)
-		WithCommit(t, ctx, repo, "ack-3-on", "127.0.0.1", ackDoc("ack", reackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "ack-3-on", "127.0.0.1", ackDoc("ack", reackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
 			applied, err := repo.Acknowledge(ctx, tx, "ack-3-on", "con1author", "con1owner", ackSchema, reackCreatedAt)
 			require.True(t, applied)
 			return err
@@ -465,7 +476,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			CreatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC),
 		})
 
-		InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, "rollback-record", "127.0.0.1", rollbackSD.Document, rollbackSD.Proof, "con1owner"))
 			_, err := repo.CreateRecord(ctx, tx, "rollback-record", rollbackKey, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC))
 			require.NoError(t, err)
@@ -485,7 +496,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC),
 		})
-		WithCommit(t, ctx, repo, "delete-target", "127.0.0.1", deleteTargetSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "delete-target", "127.0.0.1", deleteTargetSD, "con1owner", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, "delete-target", deleteKey, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC))
 			return err
 		})
@@ -496,7 +507,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Author:    "con1author",
 			CreatedAt: time.Date(2026, 6, 8, 8, 9, 10, 0, time.UTC),
 		})
-		WithCommit(t, ctx, repo, "delete-commit", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "delete-commit", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
 			return repo.DeleteRecordByKey(ctx, tx, deleteKey)
 		})
 
@@ -517,14 +528,14 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC),
 		})
-		WithCommit(t, ctx, repo, "gc-flag", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "gc-flag", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 			return nil
 		})
 
 		commit := mustCommit(t, ctx, in, "gc-flag")
 		require.False(t, commit.GcCandidate)
 
-		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "gc-flag"))
 			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "no-such-commit"))
 		})
@@ -543,7 +554,7 @@ func testRecordWrites(t *testing.T, be Backend) {
 			Href: &href,
 		}
 
-		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "127.0.0.1", "first", proof, "con1owner"))
 			// a re-delivery of the same id is ignored wholesale: document, proof
 			// and owner all stay as first written, and the caller is told
@@ -633,7 +644,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/item.json",
 			CreatedAt: createdAt,
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
 			return err
 		})
@@ -649,7 +660,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		CreatedAt: createdAt,
 		Associate: &keys[1],
 	})
-	WithCommit(t, ctx, repo, "subtree-association", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "subtree-association", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
 		_, err := repo.CreateAssociation(ctx, tx, "subtree-association", keys[1], "con1owner", "con1author", "https://schema.example/comment.json", &variant, "subtree-unique", createdAt)
 		return err
 	})
@@ -720,7 +731,7 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 			Author:    "con1owner",
 			CreatedAt: createdAt,
 		})
-		WithCommit(t, ctx, repo, "subtree-delete", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, "subtree-delete", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
 			for _, uri := range urisOf(sds) {
 				if err := repo.DeleteRecordByKey(ctx, tx, uri); err != nil {
 					return err
@@ -782,7 +793,7 @@ func testRecordQueryAuthorFilter(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/item.json",
 			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, id, e.key, "con1owner", e.author, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
 			return err
 		})
@@ -828,7 +839,7 @@ func testRecordQueryAuthorFilter(t *testing.T, be Backend) {
 				Schema:    "https://schema.example/item.json",
 				CreatedAt: createdAt.Add(time.Duration(10+i) * time.Second),
 			})
-			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+			withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 				_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1alice", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(10+i)*time.Second))
 				return err
 			})
@@ -864,7 +875,7 @@ func testHierarchicalRecordPoliciesRootFirst(t *testing.T, be Backend) {
 			CreatedAt: createdAt,
 		})
 		p := policyJSON
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1powner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1powner", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateRecord(ctx, tx, id, key, "con1powner", "con1powner", "https://schema.example/post.json", nil, &p, []string{}, nil, createdAt)
 			require.True(t, applied)
 			return err
@@ -911,7 +922,7 @@ func testHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: createdAt,
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1downer", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1downer", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateRecord(ctx, tx, id, tc.key, "con1downer", "con1downer", "https://schema.example/post.json", nil, tc.policies, tc.distributions, nil, createdAt)
 			require.True(t, applied)
 			return err
@@ -949,7 +960,7 @@ func testCreateRecordAppliesOverParentPlaceholder(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: createdAt,
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1ph", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1ph", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateRecord(ctx, tx, id, key, "con1ph", "con1ph", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
 			require.True(t, applied)
 			return err
@@ -1024,11 +1035,11 @@ func testCreateRecordFreshKeyConditionalUpsert(t *testing.T, be Backend) {
 					return err
 				}
 				if !applied {
-					return ErrTestRollback
+					return errTestRollback
 				}
 				return nil
 			})
-			if errors.Is(err, ErrTestRollback) {
+			if errors.Is(err, errTestRollback) {
 				err = nil
 			}
 			done <- outcome{applied: applied, err: err}
@@ -1066,7 +1077,7 @@ func testGetAllCommitLogsByOwner(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: time.Now(),
 		})
-		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, owner))
 		})
 	}
@@ -1112,7 +1123,7 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/item.json",
 			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
 			return err
 		})
@@ -1195,7 +1206,7 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 				Schema:    "https://schema.example/item.json",
 				CreatedAt: createdAt,
 			})
-			WithCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
+			withCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
 				_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
 				return err
 			})
@@ -1230,34 +1241,6 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 	})
 }
 
-func testHasCommitLog(t *testing.T, be Backend) {
-	ctx := context.Background()
-	repo := be.Record
-
-	has, err := repo.HasCommitLog(ctx, "has-1")
-	require.NoError(t, err)
-	require.False(t, has)
-
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-		// a duplicate id changes nothing and is reported
-		require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"), record.ErrAlreadyCommitted)
-	})
-
-	has, err = repo.HasCommitLog(ctx, "has-1")
-	require.NoError(t, err)
-	require.True(t, has)
-	require.Equal(t, "{}", mustCommit(t, ctx, be.Inspect, "has-1").Document, "the first write wins")
-
-	// a rolled-back write leaves nothing behind
-	InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-		require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-2", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-	})
-	has, err = repo.HasCommitLog(ctx, "has-2")
-	require.NoError(t, err)
-	require.False(t, has)
-}
-
 // A ccfs URI resolves through the commit log: the document comes back with
 // its CCKV filled in when a key currently points at it, and without one
 // otherwise (a commit that never was or no longer is a record). A cckv
@@ -1277,11 +1260,11 @@ func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
 		Schema:    "https://schema.example/note.json",
 		CreatedAt: createdAt,
 	})
-	WithCommit(t, ctx, repo, "ccfs-record", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "ccfs-record", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 		_, err := repo.CreateRecord(ctx, tx, "ccfs-record", key, "con1owner", "con1owner", "https://schema.example/note.json", nil, nil, []string{}, nil, createdAt)
 		return err
 	})
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, "ccfs-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
 	})
 
@@ -1339,7 +1322,7 @@ func testGetSignedDocuments(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: createdAt,
 		})
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
 			return err
 		})
@@ -1347,7 +1330,7 @@ func testGetSignedDocuments(t *testing.T, be Backend) {
 	}
 	sd1 := seed("multi-1", "cckv://con1owner/posts/p1")
 	sd2 := seed("multi-2", "cckv://con1owner/posts/p2")
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, "multi-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
 	})
 
@@ -1416,11 +1399,11 @@ func testHierarchicalRecordPoliciesMulti(t *testing.T, be Backend) {
 		var distributions []string
 		switch i {
 		case 0:
-			policies = Ptr(policyJSON)
+			policies = ptr(policyJSON)
 		case 1:
 			distributions = dist
 		}
-		WithCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1multi", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1multi", func(tx record.RepositoryTx) error {
 			_, err := repo.CreateRecord(ctx, tx, id, key, "con1multi", "con1multi", "https://schema.example/post.json", nil, policies, distributions, nil, createdAt)
 			return err
 		})
@@ -1465,7 +1448,7 @@ func testGetEntityByCCIDAndAlias(t *testing.T, be Backend) {
 		Schema:    schemas.EntityURL,
 		CreatedAt: createdAt,
 	})
-	WithCommit(t, ctx, repo, "entity-lookup", "127.0.0.1", sd, ccid, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "entity-lookup", "127.0.0.1", sd, ccid, func(tx record.RepositoryTx) error {
 		applied, err := repo.CreateEntity(ctx, tx, ccid, &alias, "example.com", "entity-lookup", createdAt)
 		require.True(t, applied)
 		return err

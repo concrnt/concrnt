@@ -18,13 +18,12 @@ import (
 // ServerRepository is the write-through cache of remote servers' well-known
 // documents.
 type ServerRepository struct {
-	config *domain.Config
 	client *firestore.Client
 	cl     *client.Client
 }
 
-func NewServerRepository(config *domain.Config, fs *firestore.Client, cl *client.Client) server.Repository {
-	return &ServerRepository{config: config, client: fs, cl: cl}
+func NewServerRepository(fs *firestore.Client, cl *client.Client) server.Repository {
+	return &ServerRepository{client: fs, cl: cl}
 }
 
 func serverDocToDomain(m *serverDoc) (*domain.Server, error) {

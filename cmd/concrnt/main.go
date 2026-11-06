@@ -270,9 +270,9 @@ func main() {
 
 		db = pg
 		databaseReady = sqlDB.PingContext
-		recordRepo = pgrecord.New(pg, cl, domainConfig, pool.MaxConcurrentTx)
+		recordRepo = pgrecord.New(pg, pool.MaxConcurrentTx)
 		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
-		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
+		serverRepo = postgres.NewServerRepository(pg, cl)
 		notificationRepo = postgres.NewNotificationRepository(pg)
 		abuseRepo = postgres.NewAbuseRepository(pg)
 	case "sqlite":
@@ -288,9 +288,9 @@ func main() {
 
 		// db stays nil: the aggregate store takes a gorm handle as Postgres
 		databaseReady = lite.Ready
-		recordRepo = sqliterecord.New(lite.DB, cl, domainConfig)
+		recordRepo = sqliterecord.New(lite.DB)
 		entityMetaRepo = sqlite.NewEntityMetaRepository(lite.DB)
-		serverRepo = sqlite.NewServerRepository(&domainConfig, lite.DB, cl)
+		serverRepo = sqlite.NewServerRepository(lite.DB, cl)
 		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
 		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
 	case "spanner":
@@ -309,9 +309,9 @@ func main() {
 			_, err := sp.Single().Query(ctx, gspanner.Statement{SQL: "SELECT 1"}).Next()
 			return err
 		}
-		recordRepo = spannerrecord.New(sp, cl, domainConfig)
+		recordRepo = spannerrecord.New(sp)
 		entityMetaRepo = spannerrepo.NewEntityMetaRepository(sp)
-		serverRepo = spannerrepo.NewServerRepository(&domainConfig, sp, cl)
+		serverRepo = spannerrepo.NewServerRepository(sp, cl)
 		notificationRepo = spannerrepo.NewNotificationRepository(sp)
 		abuseRepo = spannerrepo.NewAbuseRepository(sp)
 	case "firestore":
@@ -328,9 +328,9 @@ func main() {
 
 		firestoreClient = fsc
 		databaseReady = fsrepo.NewReadiness(fsc, firestoreReadinessTTL).Check
-		recordRepo = fsrecord.New(fsc, cl, domainConfig)
+		recordRepo = fsrecord.New(fsc)
 		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
-		serverRepo = fsrepo.NewServerRepository(&domainConfig, fsc, cl)
+		serverRepo = fsrepo.NewServerRepository(fsc, cl)
 		notificationRepo = fsrepo.NewNotificationRepository(fsc)
 		abuseRepo = fsrepo.NewAbuseRepository(fsc)
 	default:

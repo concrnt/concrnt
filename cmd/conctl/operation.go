@@ -98,9 +98,9 @@ func newOperationContext() (*operationContext, error) {
 			return nil, fmt.Errorf("failed to connect database: %w", err)
 		}
 		op.DB = db
-		op.Record = pgrecord.New(db, cl, globalConfig, pool.MaxConcurrentTx)
+		op.Record = pgrecord.New(db, pool.MaxConcurrentTx)
 		op.EntityMeta = postgres.NewEntityMetaRepository(db)
-		op.Server = postgres.NewServerRepository(&globalConfig, db, cl)
+		op.Server = postgres.NewServerRepository(db, cl)
 		op.Notification = postgres.NewNotificationRepository(db)
 		op.close = func() error {
 			sqlDB, err := db.DB()
@@ -114,9 +114,9 @@ func newOperationContext() (*operationContext, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to open database: %w", err)
 		}
-		op.Record = sqliterecord.New(lite.DB, cl, globalConfig)
+		op.Record = sqliterecord.New(lite.DB)
 		op.EntityMeta = sqlite.NewEntityMetaRepository(lite.DB)
-		op.Server = sqlite.NewServerRepository(&globalConfig, lite.DB, cl)
+		op.Server = sqlite.NewServerRepository(lite.DB, cl)
 		op.Notification = sqlite.NewNotificationRepository(lite.DB)
 		op.close = lite.Close
 	case "spanner":
@@ -125,9 +125,9 @@ func newOperationContext() (*operationContext, error) {
 			return nil, fmt.Errorf("failed to connect database: %w", err)
 		}
 		op.spanner = sp
-		op.Record = spannerrecord.New(sp, cl, globalConfig)
+		op.Record = spannerrecord.New(sp)
 		op.EntityMeta = spannerrepo.NewEntityMetaRepository(sp)
-		op.Server = spannerrepo.NewServerRepository(&globalConfig, sp, cl)
+		op.Server = spannerrepo.NewServerRepository(sp, cl)
 		op.Notification = spannerrepo.NewNotificationRepository(sp)
 		op.close = func() error {
 			sp.Close()
@@ -139,9 +139,9 @@ func newOperationContext() (*operationContext, error) {
 			return nil, fmt.Errorf("failed to connect database: %w", err)
 		}
 		op.firestore = fsc
-		op.Record = fsrecord.New(fsc, cl, globalConfig)
+		op.Record = fsrecord.New(fsc)
 		op.EntityMeta = fsrepo.NewEntityMetaRepository(fsc)
-		op.Server = fsrepo.NewServerRepository(&globalConfig, fsc, cl)
+		op.Server = fsrepo.NewServerRepository(fsc, cl)
 		op.Notification = fsrepo.NewNotificationRepository(fsc)
 		op.close = fsc.Close
 	default:

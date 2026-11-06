@@ -16,19 +16,6 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
-	defer span.End()
-
-	// a projection to no fields avoids pulling the 32 KiB document body
-	snaps, err := r.col(fs.ColCommits).Where(firestore.DocumentID, "==", r.col(fs.ColCommits).Doc(id)).Select().Limit(1).Documents(ctx).GetAll()
-	if err != nil {
-		span.RecordError(err)
-		return false, fs.QueryErr(err)
-	}
-	return len(snaps) > 0, nil
-}
-
 // CreateCommitLog stamps cDate with the server time of the commit. First
 // write wins, like INSERT ... ON CONFLICT DO NOTHING: a re-delivery of the
 // same id is ignored wholesale.

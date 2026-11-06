@@ -7,11 +7,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// AutoMigrateTables creates the tables, constraints and indexes the models
+// autoMigrateTables creates the tables, constraints and indexes the models
 // declare. It is additive, so Migrate runs it at every start after the
 // numbered steps: a new column or index only needs its tag. Changing an
 // existing index or column needs a step that drops it by name first.
-func AutoMigrateTables(db *gorm.DB) error {
+func autoMigrateTables(db *gorm.DB) error {
 	return db.AutoMigrate(
 		&CommitLog{},
 		&Record{},
@@ -54,7 +54,7 @@ var migrations = []migration{
 	}},
 }
 
-// Migrate applies the pending numbered steps, then AutoMigrateTables, in one
+// Migrate applies the pending numbered steps, then autoMigrateTables, in one
 // IMMEDIATE transaction (the writer lock serialises concurrent starters).
 func Migrate(ctx context.Context, db *DB) error {
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -86,6 +86,6 @@ func Migrate(ctx context.Context, db *DB) error {
 			}
 		}
 
-		return AutoMigrateTables(tx)
+		return autoMigrateTables(tx)
 	})
 }

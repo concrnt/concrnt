@@ -55,7 +55,7 @@ func testAckedAcceptIfNewer(t *testing.T, be Backend) {
 	}
 	commit := func(id, kind string, createdAt time.Time) {
 		t.Helper()
-		WithCommit(t, ctx, repo, id, "127.0.0.1", mirror(kind, createdAt), to, func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, id, "127.0.0.1", mirror(kind, createdAt), to, func(tx record.RepositoryTx) error {
 			transition := repo.Acknowledged
 			if kind == "unacked" {
 				transition = repo.UnAcknowledged
@@ -74,7 +74,7 @@ func testAckedAcceptIfNewer(t *testing.T, be Backend) {
 		t.Helper()
 		sd := mirror(kind, createdAt)
 		var applied bool
-		InTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, to))
 			transition := repo.Acknowledged
 			if kind == "unacked" {
@@ -147,21 +147,21 @@ func testGetAcknowledgeRecordsServesHeldSide(t *testing.T, be Backend) {
 	}
 
 	// local acker → local target: this server holds both the ack and the acked
-	WithCommit(t, ctx, repo, "ack-local", "127.0.0.1", doc("ack", localAcker, local), localAcker, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "ack-local", "127.0.0.1", doc("ack", localAcker, local), localAcker, func(tx record.RepositoryTx) error {
 		_, err := repo.Acknowledge(ctx, tx, "ack-local", localAcker, local, schema, at)
 		return err
 	})
-	WithCommit(t, ctx, repo, "acked-local", "127.0.0.1", doc("acked", localAcker, local), local, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "acked-local", "127.0.0.1", doc("acked", localAcker, local), local, func(tx record.RepositoryTx) error {
 		_, err := repo.Acknowledged(ctx, tx, "acked-local", localAcker, local, schema, at)
 		return err
 	})
 	// local acker → remote target: only the ack is here
-	WithCommit(t, ctx, repo, "ack-outbound", "127.0.0.1", doc("ack", localAcker, remoteTarget), localAcker, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "ack-outbound", "127.0.0.1", doc("ack", localAcker, remoteTarget), localAcker, func(tx record.RepositoryTx) error {
 		_, err := repo.Acknowledge(ctx, tx, "ack-outbound", localAcker, remoteTarget, schema, at.Add(time.Hour))
 		return err
 	})
 	// remote acker → local target: only the acked is here
-	WithCommit(t, ctx, repo, "acked-inbound", "127.0.0.1", doc("acked", remoteAcker, local), local, func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "acked-inbound", "127.0.0.1", doc("acked", remoteAcker, local), local, func(tx record.RepositoryTx) error {
 		_, err := repo.Acknowledged(ctx, tx, "acked-inbound", remoteAcker, local, schema, at.Add(2*time.Hour))
 		return err
 	})
@@ -188,7 +188,7 @@ func testGetAcknowledgeRecordsServesHeldSide(t *testing.T, be Backend) {
 	require.Equal(t, []string{"acked:" + remoteAcker + ">" + local, "acked:" + localAcker + ">" + local}, ids(rows), "to-filtered listing is the target's acked documents, newest first")
 
 	// the until window applies to the held side's createdAt
-	rows, err = repo.GetAcknowledgeRecords(ctx, "", local, "", nil, Ptr(at.Add(time.Minute)), 0, "desc")
+	rows, err = repo.GetAcknowledgeRecords(ctx, "", local, "", nil, ptr(at.Add(time.Minute)), 0, "desc")
 	require.NoError(t, err)
 	require.Equal(t, []string{"acked:" + localAcker + ">" + local}, ids(rows), "until must window the to-side listing")
 

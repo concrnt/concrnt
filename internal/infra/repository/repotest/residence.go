@@ -111,7 +111,7 @@ func testResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T, be Backend) {
 
 	seed := func(id string, owner string) {
 		t.Helper()
-		InTx(t, ctx, be.Record, func(tx record.RepositoryTx) {
+		inTx(t, ctx, be.Record, func(tx record.RepositoryTx) {
 			require.NoError(t, be.Record.CreateCommitLog(ctx, tx, id, "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, owner))
 		})
 	}

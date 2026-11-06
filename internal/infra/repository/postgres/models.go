@@ -14,7 +14,7 @@ import (
 // Indexes:
 //   - PRIMARY KEY (id): canonical commit/document lookup; used by record,
 //     entity, ack, association foreign keys and direct ccfs lookups in
-//     record.Repository.GetSignedDocument/HasCommitLog/DeleteCommitLogs, and
+//     record.Repository.GetSignedDocument/DeleteCommitLogs, and
 //     as the cursor of ListCommitLogs/ListGcCandidates (id < cutoff, id > after).
 //   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump and
 //     replication scans; used by record.Repository.GetAllCommitLogs,
@@ -43,7 +43,7 @@ type CommitLog struct {
 //     associations.target_id joins in record.Repository.GetAssociatedRecords and
 //     ComputeAssociationCounts*.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
-//     record.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
+//     record.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
 //     GetChunklineManifest/LookupLocalItrs/LoadLocalBody, and association target
 //     lookups. Its default collation cannot serve LIKE 'x%'.
@@ -195,14 +195,13 @@ type Association struct {
 //   - idx_servers_cs_id (cs_id): CSID cache lookup; used by
 //     ServerRepository.GetAndCacheByCSID.
 type Server struct {
-	ID          string    `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
-	CSID        string    `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
-	Tag         string    `json:"tag" gorm:"type:text"`
-	Layer       string    `json:"layer" gorm:"type:text"`
-	WellKnown   string    `json:"wellKnown" gorm:"type:jsonb"`
-	CDate       time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
-	MDate       time.Time `json:"mdate" gorm:"autoUpdateTime"`
-	LastScraped time.Time `json:"lastScraped" gorm:"type:timestamp with time zone"`
+	ID        string    `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
+	CSID      string    `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
+	Tag       string    `json:"tag" gorm:"type:text"`
+	Layer     string    `json:"layer" gorm:"type:text"`
+	WellKnown string    `json:"wellKnown" gorm:"type:jsonb"`
+	CDate     time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
+	MDate     time.Time `json:"mdate" gorm:"autoUpdateTime"`
 }
 
 // Indexes:

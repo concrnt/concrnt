@@ -23,10 +23,6 @@ import (
 
 type stubRecordRepo struct{ Repository }
 
-func (stubRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return false, nil
-}
-
 // entityLookups is the entity slice of Repository the residence fakes serve.
 type entityLookups interface {
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
@@ -54,7 +50,7 @@ func (stubResidenceRepo) GetEntityByCCID(ctx context.Context, ccid string) (*dom
 
 // recordingRecordRepo satisfies the write path of Repository in memory
 // and records which mutations were attempted. commitLogs seeds the ids
-// HasCommitLog answers true for (already-committed documents); storedSD, when
+// CreateCommitLog reports as already committed; storedSD, when
 // set, is what GetSignedDocument serves for every key (a pre-existing record);
 // storedCreatedAt, when set, is the createdAt of the document the repository
 // already holds for whatever CreateEntity / CreateRecord write — both report
@@ -301,7 +297,7 @@ func signedCommitDocument(t *testing.T, kind string) concrnt.SignedDocument {
 func TestCommitUnresolvableRequesterReturnsError(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	uc := New(
-		withEntities{stubRecordRepo{}, stubResidenceRepo{}},
+		withEntities{nil, stubResidenceRepo{}},
 		nil,
 		newTestServerUsecase(cfg),
 		cfg,

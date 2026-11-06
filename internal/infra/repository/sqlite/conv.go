@@ -29,14 +29,6 @@ func MicrosPtr(t *time.Time) *int64 {
 	return &us
 }
 
-func TimePtr(us *int64) *time.Time {
-	if us == nil {
-		return nil
-	}
-	t := Time(*us)
-	return &t
-}
-
 func nowMicros() int64 {
 	return Micros(time.Now())
 }

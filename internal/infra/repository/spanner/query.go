@@ -48,14 +48,3 @@ func queryOne[T any](ctx context.Context, q reader, stmt spanner.Statement) (v T
 	}
 	return v, true, row.ToStruct(&v)
 }
-
-// update runs one DML statement in its own read-write transaction.
-func update(ctx context.Context, client *spanner.Client, stmt spanner.Statement) (int64, error) {
-	var affected int64
-	_, err := client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		var err error
-		affected, err = tx.Update(ctx, stmt)
-		return err
-	})
-	return affected, err
-}

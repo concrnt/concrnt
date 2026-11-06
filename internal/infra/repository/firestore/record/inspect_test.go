@@ -142,3 +142,16 @@ func (i *inspector) AckCount(ctx context.Context) (int64, error) {
 func (i *inspector) AbuseReportCount(ctx context.Context) (int64, error) {
 	return i.count(ctx, i.client.Collection(fs.ColAbuseReports).Query)
 }
+
+func recordFromMap(m map[string]any) recordDoc {
+	createdAt, _ := timeAt(m, "createdAt")
+	return recordDoc{
+		Owner:         str(m, "owner"),
+		Author:        str(m, "author"),
+		Schema:        str(m, "schema"),
+		Redirect:      str(m, "redirect"),
+		Policies:      str(m, "policies"),
+		Distributions: strs(m, "distributions"),
+		CreatedAt:     createdAt.UTC(),
+	}
+}

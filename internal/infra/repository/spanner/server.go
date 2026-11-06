@@ -14,13 +14,12 @@ import (
 )
 
 type ServerRepository struct {
-	config *domain.Config
 	client *spanner.Client
 	cl     *client.Client
 }
 
-func NewServerRepository(config *domain.Config, client *spanner.Client, cl *client.Client) server.Repository {
-	return &ServerRepository{config: config, client: client, cl: cl}
+func NewServerRepository(client *spanner.Client, cl *client.Client) server.Repository {
+	return &ServerRepository{client: client, cl: cl}
 }
 
 type serverRow struct {

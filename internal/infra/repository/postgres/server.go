@@ -15,14 +15,12 @@ import (
 )
 
 type ServerRepository struct {
-	config *domain.Config
 	db     *gorm.DB
 	client *client.Client
 }
 
-func NewServerRepository(config *domain.Config, db *gorm.DB, cl *client.Client) server.Repository {
+func NewServerRepository(db *gorm.DB, cl *client.Client) server.Repository {
 	return &ServerRepository{
-		config: config,
 		db:     db,
 		client: cl,
 	}

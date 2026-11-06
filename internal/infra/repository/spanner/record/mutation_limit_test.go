@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -81,7 +80,7 @@ func seedBigTimeline(t *testing.T, ctx context.Context, repo ucrecord.Repository
 func TestMutationLimitPagedRangeDelete(t *testing.T) {
 	ctx := context.Background()
 	client, _ := testutil.CreateSpanner(t)
-	repo := New(client, nil, domain.Config{})
+	repo := New(client)
 	start := time.Now()
 	seedBigTimeline(t, ctx, repo)
 	t.Logf("seeded %d records in %s", bigChildren, time.Since(start))
@@ -129,7 +128,7 @@ func TestMutationLimitPagedRangeDelete(t *testing.T) {
 	n, err := repo.CountGcCandidates(ctx, "~")
 	require.NoError(t, err)
 	require.Zero(t, n)
-	has, err := repo.HasCommitLog(ctx, "big-00000")
+	commit, err := newInspector(client).Commit(ctx, "big-00000")
 	require.NoError(t, err)
-	require.False(t, has)
+	require.Nil(t, commit)
 }

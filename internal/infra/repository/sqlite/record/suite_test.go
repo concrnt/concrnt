@@ -7,7 +7,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
@@ -27,11 +26,11 @@ func openDB(t *testing.T) *sqlitedb.DB {
 func openBackend(t *testing.T) repotest.Backend {
 	t.Helper()
 	db := openDB(t).DB
-	cl, _ := repotest.PeerClient(t)
+	cl := repotest.PeerClient(t)
 	return repotest.Backend{
-		Record:       New(db, nil, domain.Config{}),
+		Record:       New(db),
 		EntityMeta:   sqlitedb.NewEntityMetaRepository(db),
-		Server:       sqlitedb.NewServerRepository(&domain.Config{FQDN: "local.example"}, db, cl),
+		Server:       sqlitedb.NewServerRepository(db, cl),
 		Notification: sqlitedb.NewNotificationRepository(db),
 		Abuse:        sqlitedb.NewAbuseRepository(db),
 		Inspect:      newInspector(db),

@@ -19,11 +19,15 @@ import (
 func Migrate(ctx context.Context, admin *database.DatabaseAdminClient, client *spanner.Client) error {
 	dbPath := client.DatabaseName()
 
-	hasTable, err := tableExists(ctx, client, "schema_migrations")
-	if err != nil {
+	probe := client.Single().Query(ctx, spanner.Statement{
+		SQL: "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '' AND TABLE_NAME = 'schema_migrations'",
+	})
+	_, err := probe.Next()
+	probe.Stop()
+	if err != nil && err != iterator.Done {
 		return err
 	}
-	if !hasTable {
+	if err == iterator.Done {
 		if err := applyDDL(ctx, admin, dbPath, []string{`CREATE TABLE IF NOT EXISTS schema_migrations (
 			version INT64 NOT NULL,
 			name STRING(MAX) NOT NULL,
@@ -70,17 +74,4 @@ func applyDDL(ctx context.Context, admin *database.DatabaseAdminClient, dbPath s
 		return err
 	}
 	return op.Wait(ctx)
-}
-
-func tableExists(ctx context.Context, client *spanner.Client, table string) (bool, error) {
-	it := client.Single().Query(ctx, spanner.Statement{
-		SQL:    "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '' AND TABLE_NAME = @name",
-		Params: map[string]any{"name": table},
-	})
-	defer it.Stop()
-	_, err := it.Next()
-	if err == iterator.Done {
-		return false, nil
-	}
-	return err == nil, err
 }

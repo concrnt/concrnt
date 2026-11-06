@@ -517,7 +517,7 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 		return nil, nil
 	}
 
-	parentRK, err := GetRecordKeyByURI(ctx, db, parentURI)
+	parentRK, err := getRecordKeyByURI(ctx, db, parentURI)
 	if err != nil {
 		if errors.Is(err, domain.NotFoundError{}) {
 
@@ -549,7 +549,7 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 
 			// 別トランザクションが先に作成済み（競合）なら ID は 0 のまま → 再取得
 			if newRecordKey.ID == 0 {
-				return GetRecordKeyByURI(ctx, db, parentURI)
+				return getRecordKeyByURI(ctx, db, parentURI)
 			}
 
 			return &newRecordKey, nil
@@ -563,8 +563,8 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	return parentRK, nil
 }
 
-func GetRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*sqlitedb.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetRecordKeyByURI")
+func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*sqlitedb.RecordKey, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
 	defer span.End()
 
 	var recordKey sqlitedb.RecordKey

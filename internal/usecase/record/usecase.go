@@ -46,7 +46,6 @@ type Repository interface {
 	UnAcknowledged(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error)
 
 	// Read
-	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
 	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
 	// that resolves to nothing is absent from the map, not an error.

@@ -40,7 +40,7 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 			Schema:    "https://schema.example/post.json",
 			CreatedAt: received,
 		})
-		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, owner))
 		})
 		require.NoError(t, be.Inspect.SetCommitCDate(ctx, id, received))
@@ -123,7 +123,7 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 	})
 
 	t.Run("gc candidates are still replicated", func(t *testing.T) {
-		InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "a-1"))
 		})
 		require.True(t, mustCommit(t, ctx, be.Inspect, "a-1").GcCandidate)

@@ -161,19 +161,6 @@ func (d recordDoc) toMap() map[string]any {
 	}
 }
 
-func recordFromMap(m map[string]any) recordDoc {
-	createdAt, _ := timeAt(m, "createdAt")
-	return recordDoc{
-		Owner:         str(m, "owner"),
-		Author:        str(m, "author"),
-		Schema:        str(m, "schema"),
-		Redirect:      str(m, "redirect"),
-		Policies:      str(m, "policies"),
-		Distributions: strs(m, "distributions"),
-		CreatedAt:     createdAt.UTC(),
-	}
-}
-
 // record_keys/{keyID(uri)}
 type recordKeyDoc struct {
 	URI       string

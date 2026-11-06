@@ -11,8 +11,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
-	"github.com/concrnt/concrnt/client"
-	"github.com/concrnt/concrnt/internal/domain"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -20,9 +18,7 @@ import (
 // records and keys, associations, acks, entities with their registration
 // state, and the chunkline views, all over one connection.
 type Repository struct {
-	db     *gorm.DB
-	client *client.Client
-	config domain.Config
+	db *gorm.DB
 	// txSlots caps the transactions running at once. A transaction pins one
 	// pooled connection and the reads fn issues take a second one (C4:
 	// reads return committed state), so the cap must stay at half the pool
@@ -32,9 +28,9 @@ type Repository struct {
 
 // New builds the repository over db, whose pool must hold at least
 // 2*maxConcurrentTx connections.
-func New(db *gorm.DB, cl *client.Client, config domain.Config, maxConcurrentTx int) ucrecord.Repository {
+func New(db *gorm.DB, maxConcurrentTx int) ucrecord.Repository {
 	txSlotCapacity.Set(float64(maxConcurrentTx))
-	return &Repository{db: db, client: cl, config: config, txSlots: make(chan struct{}, maxConcurrentTx)}
+	return &Repository{db: db, txSlots: make(chan struct{}, maxConcurrentTx)}
 }
 
 var tracer = otel.Tracer("repository")

@@ -47,7 +47,7 @@ func seedAssociations(t *testing.T, ctx context.Context, repo record.Repository,
 		Schema:    "https://schema.example/post.json",
 		CreatedAt: targetCreatedAt,
 	})
-	WithCommit(t, ctx, repo, "assoc-target", "127.0.0.1", targetSD, "con1owner", func(tx record.RepositoryTx) error {
+	withCommit(t, ctx, repo, "assoc-target", "127.0.0.1", targetSD, "con1owner", func(tx record.RepositoryTx) error {
 		_, err := repo.CreateRecord(ctx, tx, "assoc-target", associationTargetKey, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, targetCreatedAt)
 		return err
 	})
@@ -62,7 +62,7 @@ func seedAssociations(t *testing.T, ctx context.Context, repo record.Repository,
 			CreatedAt: f.createdAt,
 			Associate: &target,
 		})
-		WithCommit(t, ctx, repo, f.id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+		withCommit(t, ctx, repo, f.id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
 			applied, err := repo.CreateAssociation(ctx, tx, f.id, target, "con1owner", f.author, f.schema, f.variant, f.id, f.createdAt)
 			if err != nil {
 				return err
@@ -98,9 +98,9 @@ func testAssociationListFilters(t *testing.T, be Backend) {
 	like, repost := "https://schema.example/like.json", "https://schema.example/repost.json"
 	t0 := time.Date(2026, 3, 1, 1, 0, 0, 0, time.UTC)
 	seedAssociations(t, ctx, repo, []associationFixture{
-		{"a-1", "con1alice", like, Ptr("👍"), t0},
-		{"a-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
-		{"a-3", "con1alice", like, Ptr("❤️"), t0.Add(2 * time.Minute)},
+		{"a-1", "con1alice", like, ptr("👍"), t0},
+		{"a-2", "con1bob", like, ptr("👍"), t0.Add(time.Minute)},
+		{"a-3", "con1alice", like, ptr("❤️"), t0.Add(2 * time.Minute)},
 		{"a-4", "con1carol", repost, nil, t0.Add(3 * time.Minute)},
 	})
 
@@ -140,7 +140,7 @@ func testAssociationListFilters(t *testing.T, be Backend) {
 	})
 
 	t.Run("since and until are inclusive", func(t *testing.T) {
-		rows, err := repo.GetAssociatedRecords(ctx, associationTargetKey, "", "", "", Ptr(t0.Add(time.Minute)), Ptr(t0.Add(2*time.Minute)), 0, "asc")
+		rows, err := repo.GetAssociatedRecords(ctx, associationTargetKey, "", "", "", ptr(t0.Add(time.Minute)), ptr(t0.Add(2*time.Minute)), 0, "asc")
 		require.NoError(t, err)
 		require.Equal(t, []string{"a-2", "a-3"}, associationIDs(t, rows))
 	})
@@ -165,10 +165,10 @@ func testAssociationCounts(t *testing.T, be Backend) {
 	// inserted out of createdAt order so the variant order has to come from
 	// the data, not from insertion order
 	seedAssociations(t, ctx, repo, []associationFixture{
-		{"c-3", "con1alice", like, Ptr("❤️"), t0.Add(2 * time.Minute)},
-		{"c-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
-		{"c-1", "con1alice", like, Ptr("👍"), t0},
-		{"c-6", "con1erin", like, Ptr("🎉"), t0.Add(5 * time.Minute)},
+		{"c-3", "con1alice", like, ptr("❤️"), t0.Add(2 * time.Minute)},
+		{"c-2", "con1bob", like, ptr("👍"), t0.Add(time.Minute)},
+		{"c-1", "con1alice", like, ptr("👍"), t0},
+		{"c-6", "con1erin", like, ptr("🎉"), t0.Add(5 * time.Minute)},
 		{"c-4", "con1carol", repost, nil, t0.Add(3 * time.Minute)},
 		{"c-5", "con1dave", repost, nil, t0.Add(4 * time.Minute)},
 	})
@@ -220,14 +220,14 @@ func testAssociationDelete(t *testing.T, be Backend) {
 	like := "https://schema.example/like.json"
 	t0 := time.Date(2026, 3, 1, 1, 0, 0, 0, time.UTC)
 	seedAssociations(t, ctx, repo, []associationFixture{
-		{"d-1", "con1alice", like, Ptr("👍"), t0},
-		{"d-2", "con1bob", like, Ptr("👍"), t0.Add(time.Minute)},
+		{"d-1", "con1alice", like, ptr("👍"), t0},
+		{"d-2", "con1bob", like, ptr("👍"), t0.Add(time.Minute)},
 	})
 
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		require.NoError(t, repo.DeleteAssociation(ctx, tx, "d-1"))
 	})
-	InTx(t, ctx, repo, func(tx record.RepositoryTx) {
+	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
 		require.NoError(t, repo.DeleteAssociation(ctx, tx, "d-1"))
 		require.NoError(t, repo.DeleteAssociation(ctx, tx, "never-existed"))
 	})

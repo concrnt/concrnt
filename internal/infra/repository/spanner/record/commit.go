@@ -25,21 +25,6 @@ type commitLogRow struct {
 
 const commitLogSelect = "SELECT id, ip, document, proof, owner, gc_candidate, c_date FROM commit_logs"
 
-func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
-	defer span.End()
-
-	_, err := r.client.Single().ReadRow(ctx, "commit_logs", spanner.Key{id}, []string{"id"})
-	if isNotFound(err) {
-		return false, nil
-	}
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	return true, nil
-}
-
 // CreateCommitLog stamps c_date with the commit timestamp, so the receive
 // order is the database's commit order; the column cannot be read again in
 // the same transaction.

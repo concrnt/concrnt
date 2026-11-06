@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
 	"github.com/concrnt/concrnt/internal/testutil"
@@ -21,11 +20,11 @@ func TestMain(m *testing.M) {
 func openBackend(t *testing.T) repotest.Backend {
 	t.Helper()
 	client, _ := testutil.CreateSpanner(t)
-	cl, _ := repotest.PeerClient(t)
+	cl := repotest.PeerClient(t)
 	return repotest.Backend{
-		Record:       New(client, nil, domain.Config{}),
+		Record:       New(client),
 		EntityMeta:   spannerdb.NewEntityMetaRepository(client),
-		Server:       spannerdb.NewServerRepository(&domain.Config{FQDN: "local.example"}, client, cl),
+		Server:       spannerdb.NewServerRepository(client, cl),
 		Notification: spannerdb.NewNotificationRepository(client),
 		Abuse:        spannerdb.NewAbuseRepository(client),
 		Inspect:      newInspector(client),

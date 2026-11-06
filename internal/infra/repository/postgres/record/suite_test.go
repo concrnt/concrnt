@@ -3,7 +3,6 @@ package record
 import (
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
@@ -15,11 +14,11 @@ func openBackend(t *testing.T) repotest.Backend {
 	t.Helper()
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
-	cl, _ := repotest.PeerClient(t)
+	cl := repotest.PeerClient(t)
 	return repotest.Backend{
-		Record:       New(db, nil, domain.Config{}, 8),
+		Record:       New(db, 8),
 		EntityMeta:   postgres.NewEntityMetaRepository(db),
-		Server:       postgres.NewServerRepository(&domain.Config{FQDN: "local.example"}, db, cl),
+		Server:       postgres.NewServerRepository(db, cl),
 		Notification: postgres.NewNotificationRepository(db),
 		Abuse:        postgres.NewAbuseRepository(db),
 		Inspect:      newInspector(db),

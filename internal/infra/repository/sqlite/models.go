@@ -13,7 +13,7 @@ import "gorm.io/gorm"
 // Indexes:
 //   - PRIMARY KEY (id): canonical commit/document lookup; used by record,
 //     entity, ack, association foreign keys and direct ccfs lookups in
-//     record.Repository.GetSignedDocument/HasCommitLog/DeleteCommitLogs, and
+//     record.Repository.GetSignedDocument/DeleteCommitLogs, and
 //     as the cursor of ListCommitLogs/ListGcCandidates (id < cutoff, id > after).
 //   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump and
 //     replication scans; used by record.Repository.GetAllCommitLogs,
@@ -49,7 +49,7 @@ func (m *CommitLog) BeforeCreate(*gorm.DB) error {
 //     associations.target_id joins in record.Repository.GetAssociatedRecords and
 //     ComputeAssociationCounts*.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
-//     record.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
+//     record.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
 //     GetChunklineManifest/LookupLocalItrs/LoadLocalBody, and association target
 //     lookups. Prefix scans (QueryByPrefix, QueryRecordSubtree, the parent_id IS
@@ -226,14 +226,13 @@ func (m *Association) BeforeCreate(*gorm.DB) error {
 //   - idx_servers_cs_id (cs_id): CSID cache lookup; used by
 //     ServerRepository.GetAndCacheByCSID.
 type Server struct {
-	ID          string `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
-	CSID        string `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
-	Tag         string `json:"tag" gorm:"type:text"`
-	Layer       string `json:"layer" gorm:"type:text"`
-	WellKnown   string `json:"wellKnown" gorm:"type:text"`
-	CDate       int64  `json:"cdate" gorm:"->;<-:create;type:integer;not null"`
-	MDate       int64  `json:"mdate" gorm:"type:integer;not null"`
-	LastScraped *int64 `json:"lastScraped" gorm:"type:integer"`
+	ID        string `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
+	CSID      string `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
+	Tag       string `json:"tag" gorm:"type:text"`
+	Layer     string `json:"layer" gorm:"type:text"`
+	WellKnown string `json:"wellKnown" gorm:"type:text"`
+	CDate     int64  `json:"cdate" gorm:"->;<-:create;type:integer;not null"`
+	MDate     int64  `json:"mdate" gorm:"type:integer;not null"`
 }
 
 func (m *Server) BeforeCreate(*gorm.DB) error {

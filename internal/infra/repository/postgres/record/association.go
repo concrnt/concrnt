@@ -23,7 +23,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 		return false, err
 	}
 
-	targetRK, err := GetRecordKeyByURI(ctx, db, targetURI)
+	targetRK, err := getRecordKeyByURI(ctx, db, targetURI)
 	if err != nil {
 		span.RecordError(err)
 		return false, err

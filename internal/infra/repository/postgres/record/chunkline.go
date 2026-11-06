@@ -20,7 +20,7 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	recordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
+	recordKey, err := getRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -54,7 +54,6 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
 		},
 		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
-		// Metadata: recordKey.Record.Value,
 	}, nil
 }
 
@@ -107,7 +106,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	chunkDate := time.Unix((chunkID+1)*600, 0)
 	prevChunkDate := time.Unix((chunkID-1)*600, 0)
 
-	parentRecordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
+	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err

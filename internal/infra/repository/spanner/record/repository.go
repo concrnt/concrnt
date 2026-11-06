@@ -16,19 +16,15 @@ import (
 	"google.golang.org/api/iterator"
 	"google.golang.org/grpc/codes"
 
-	"github.com/concrnt/concrnt/client"
-	"github.com/concrnt/concrnt/internal/domain"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 type Repository struct {
 	client *spanner.Client
-	cl     *client.Client
-	config domain.Config
 }
 
-func New(client *spanner.Client, cl *client.Client, config domain.Config) ucrecord.Repository {
-	return &Repository{client: client, cl: cl, config: config}
+func New(client *spanner.Client) ucrecord.Repository {
+	return &Repository{client: client}
 }
 
 var tracer = otel.Tracer("repository")

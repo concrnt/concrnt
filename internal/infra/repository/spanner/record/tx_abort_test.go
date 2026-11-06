@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -24,7 +23,7 @@ import (
 func TestRunInTxRetriesOnAbort(t *testing.T) {
 	ctx := context.Background()
 	client, _ := testutil.CreateSpanner(t)
-	repo := New(client, nil, domain.Config{})
+	repo := New(client)
 	key := "cckv://con1owner/items/contended"
 
 	var runs atomic.Int32
@@ -52,12 +51,13 @@ func TestRunInTxRetriesOnAbort(t *testing.T) {
 	wg.Wait()
 
 	require.GreaterOrEqual(t, runs.Load(), int32(3), "one of the two closures must have been re-run after an abort")
+	in := newInspector(client)
 	for _, id := range []string{"abort-older", "abort-newer"} {
-		has, err := repo.HasCommitLog(ctx, id)
+		commit, err := in.Commit(ctx, id)
 		require.NoError(t, err)
-		require.True(t, has, "%s must be committed", id)
+		require.NotNil(t, commit, "%s must be committed", id)
 	}
-	state, err := newInspector(client).RecordKey(ctx, key)
+	state, err := in.RecordKey(ctx, key)
 	require.NoError(t, err)
 	require.NotNil(t, state)
 	require.Equal(t, "abort-newer", *state.RecordID, "the newer document wins whichever order the transactions commit in")

@@ -16,18 +16,18 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
-// PeerDomain is the remote server PeerClient answers for.
-const PeerDomain = "peer.example"
+// peerDomain is the remote server PeerClient answers for.
+const peerDomain = "peer.example"
 
-// PeerClient returns a client whose requests to PeerDomain land on an
+// PeerClient returns a client whose requests to peerDomain land on an
 // httptest server that serves the returned well-known document, so a
 // server.Repository under test can resolve and cache it without network.
-func PeerClient(t *testing.T) (*client.Client, concrnt.WellKnownConcrnt) {
+func PeerClient(t *testing.T) *client.Client {
 	t.Helper()
 
 	wkc := concrnt.WellKnownConcrnt{
 		Version: "2.0",
-		Domain:  PeerDomain,
+		Domain:  peerDomain,
 		CSID:    "ccs1peerpeerpeerpeerpeerpeerpeerpeerpeerpe",
 		Endpoints: map[string]string{
 			"net.concrnt.core.resolve": "/api/v2/resolve?uri={uri}",
@@ -43,9 +43,9 @@ func PeerClient(t *testing.T) (*client.Client, concrnt.WellKnownConcrnt) {
 	}))
 	t.Cleanup(srv.Close)
 
-	cl := client.New(PeerDomain)
-	cl.AddHostRemapping(PeerDomain, srv.URL)
-	return cl, wkc
+	cl := client.New(peerDomain)
+	cl.AddHostRemapping(peerDomain, srv.URL)
+	return cl
 }
 
 // RunWorldSuite runs the contract tests of the stores beside the record
@@ -72,20 +72,20 @@ func testServerResolveCachesWellKnown(t *testing.T, be Backend) {
 	require.NoError(t, err)
 	require.Empty(t, servers)
 
-	sv, err := repo.Resolve(ctx, PeerDomain, nil)
+	sv, err := repo.Resolve(ctx, peerDomain, nil)
 	require.NoError(t, err)
-	require.Equal(t, PeerDomain, sv.Domain())
+	require.Equal(t, peerDomain, sv.Domain())
 	require.Equal(t, "ccs1peerpeerpeerpeerpeerpeerpeerpeerpeerpe", sv.CSID())
 	require.Equal(t, "/api/v2/resolve?uri={uri}", sv.WellKnown.Endpoints["net.concrnt.core.resolve"])
 
 	sv, err = repo.Resolve(ctx, "ccs1peerpeerpeerpeerpeerpeerpeerpeerpeerpe", nil)
 	require.NoError(t, err, "the cached row answers the csid lookup")
-	require.Equal(t, PeerDomain, sv.Domain())
+	require.Equal(t, peerDomain, sv.Domain())
 
 	servers, err = repo.List(ctx)
 	require.NoError(t, err)
 	require.Len(t, servers, 1)
-	require.Equal(t, PeerDomain, servers[0].Domain)
+	require.Equal(t, peerDomain, servers[0].Domain)
 }
 
 // A subscription is keyed by (vendorID, owner): Subscribe upserts, Get

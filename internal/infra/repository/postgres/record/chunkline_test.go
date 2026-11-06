@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repotest"
 	"github.com/concrnt/concrnt/internal/testutil"
@@ -25,7 +24,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db, nil, domain.Config{}, 8)
+	recordRepo := New(db, 8)
 	chunklineRepo := recordRepo
 
 	parentURI := "cckv://con2owner/timeline"
