@@ -25,6 +25,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -127,10 +128,7 @@ func upsert(ctx context.Context, ref *firestore.DocumentRef, fields map[string]a
 	if !IsNotFound(err) {
 		return err
 	}
-	created := make(map[string]any, len(fields)+1)
-	for k, v := range fields {
-		created[k] = v
-	}
+	created := maps.Clone(fields)
 	if _, ok := created["cDate"]; !ok {
 		created["cDate"] = firestore.ServerTimestamp
 	}
