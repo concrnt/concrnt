@@ -12,6 +12,7 @@ package rest
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -157,4 +158,42 @@ func TestRealtimeKeepsQuietSessions(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	require.NoError(t, conn.WriteJSON(map[string]any{"type": "listen", "prefixes": []string{"cckv://a/x"}}))
 	require.Equal(t, []string{"cckv://a/x"}, readSubscribed(t, conn))
+}
+
+func TestRealtimeTruncatesPrefixList(t *testing.T) {
+	srv, ps := newRealtimeTestServer(t)
+	conn := dialRealtime(t, srv)
+
+	prefixes := make([]string, realtimeMaxPrefixes+1)
+	for i := range prefixes {
+		prefixes[i] = fmt.Sprintf("cckv://a/%d", i)
+	}
+
+	// only the first realtimeMaxPrefixes are kept; the ack shows the list in effect
+	require.NoError(t, conn.WriteJSON(concrnt.RealtimeRequest{Type: "listen", Prefixes: prefixes}))
+	require.Equal(t, prefixes[:realtimeMaxPrefixes], readSubscribed(t, conn))
+	require.Eventually(t, func() bool { return subscribeCount(ps) == 1 }, 2*time.Second, 10*time.Millisecond)
+	ps.mu.Lock()
+	require.Equal(t, prefixes[:realtimeMaxPrefixes], ps.prefixes)
+	ps.mu.Unlock()
+}
+
+func TestRealtimeClosesOversizedMessage(t *testing.T) {
+	srv, ps := newRealtimeTestServer(t)
+	conn := dialRealtime(t, srv)
+
+	// an oversized message closes the session with 1009 instead of being read
+	big := concrnt.RealtimeRequest{Type: "listen", Prefixes: []string{"cckv://a/" + strings.Repeat("x", realtimeMaxMessageBytes)}}
+	require.NoError(t, conn.WriteJSON(big))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, _, err := conn.ReadMessage()
+	var closeErr *websocket.CloseError
+	require.ErrorAs(t, err, &closeErr)
+	require.Equal(t, websocket.CloseMessageTooBig, closeErr.Code)
+	require.Equal(t, 0, subscribeCount(ps), "the oversized subscribe must not reach the usecase")
+
+	// the server is still serving: a new session works
+	conn2 := dialRealtime(t, srv)
+	require.NoError(t, conn2.WriteJSON(concrnt.RealtimeRequest{Type: "listen", Prefixes: []string{"cckv://b/y"}}))
+	require.Equal(t, []string{"cckv://b/y"}, readSubscribed(t, conn2))
 }

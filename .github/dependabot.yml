@@ -1,0 +1,28 @@
+# version updates は minor/patch をまとめて週 1 回。major は個別 PR(auto-merge 側でラベル止まり)。
+# security updates はここにグループを書いていないので従来通り個別 PR。
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    open-pull-requests-limit: 10
+    groups:
+      gomod-minor-patch:
+        applies-to: version-updates
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Tokyo
+    groups:
+      actions:
+        applies-to: version-updates
+        patterns: ["*"]
