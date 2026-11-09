@@ -13,10 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	gfirestore "cloud.google.com/go/firestore"
 	gspanner "cloud.google.com/go/spanner"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/aggregate/stores"
+	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
+	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
 	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
@@ -27,7 +30,6 @@ import (
 	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/prometheus/client_golang/prometheus/collectors"
-	"gorm.io/gorm"
 
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
@@ -231,9 +233,10 @@ func main() {
 		notificationRepo notification.Repository
 		abuseRepo        abuse.Repository
 		databaseReady    func(ctx context.Context) error
-		db               *gorm.DB           // postgres only; the aggregate store's default home
-		spannerClient    *gspanner.Client   // spanner only; same role
-		firestoreClient  *gfirestore.Client // firestore only; same role
+		// the count cache table in the record database, under its
+		// backends.aggregate.store name; nil on sqlite, which has none
+		databaseAggregate     aggregate.Store
+		databaseAggregateName string
 		// logged as one line once the job queue is sized
 		concurrencySettings []any
 	)
@@ -264,13 +267,13 @@ func main() {
 		// and wait time are the first thing to check when everything gets slow
 		prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-		db = pg
 		databaseReady = sqlDB.PingContext
 		recordRepo = pgrecord.New(pg, pool.MaxConcurrentTx)
 		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
 		serverRepo = postgres.NewServerRepository(pg, cl)
 		notificationRepo = postgres.NewNotificationRepository(pg)
 		abuseRepo = postgres.NewAbuseRepository(pg)
+		databaseAggregate, databaseAggregateName = aggpostgres.New(pg), "postgres"
 	case "sqlite":
 		lite, err := sqlite.Open(conf.Backends.SQLitePath())
 		if err != nil {
@@ -282,7 +285,6 @@ func main() {
 		}
 		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.SQL(), "concrnt"))
 
-		// db stays nil: the aggregate store takes a gorm handle as Postgres
 		databaseReady = lite.Ready
 		recordRepo = sqliterecord.New(lite.DB)
 		entityMetaRepo = sqlite.NewEntityMetaRepository(lite.DB)
@@ -300,7 +302,6 @@ func main() {
 			panic("failed to migrate database: " + err.Error())
 		}
 
-		spannerClient = sp
 		databaseReady = func(ctx context.Context) error {
 			_, err := sp.Single().Query(ctx, gspanner.Statement{SQL: "SELECT 1"}).Next()
 			return err
@@ -310,6 +311,7 @@ func main() {
 		serverRepo = spannerrepo.NewServerRepository(sp, cl)
 		notificationRepo = spannerrepo.NewNotificationRepository(sp)
 		abuseRepo = spannerrepo.NewAbuseRepository(sp)
+		databaseAggregate, databaseAggregateName = aggspanner.New(sp), "spanner"
 	case "firestore":
 		fsc, err := database.NewFirestore(ctx, conf.Backends)
 		if err != nil {
@@ -322,13 +324,13 @@ func main() {
 		go fsrepo.VerifyIndexes(context.WithoutCancel(ctx), fsc)
 		prometheus.MustRegister(fsrepo.Collectors()...)
 
-		firestoreClient = fsc
 		databaseReady = fsrepo.NewReadiness(fsc, firestoreReadinessTTL).Check
 		recordRepo = fsrecord.New(fsc)
 		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
 		serverRepo = fsrepo.NewServerRepository(fsc, cl)
 		notificationRepo = fsrepo.NewNotificationRepository(fsc)
 		abuseRepo = fsrepo.NewAbuseRepository(fsc)
+		databaseAggregate, databaseAggregateName = aggfirestore.New(fsc), "firestore"
 	default:
 		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner, firestore)")
 	}
@@ -338,9 +340,27 @@ func main() {
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
-	aggregateStore, err := stores.Open(conf.Backends.Aggregate.Store, db, spannerClient, firestoreClient, redis, mc)
-	if err != nil {
-		panic(err.Error())
+	// the count cache store, built here like the repositories: "" keeps
+	// the counts in the record database (redis on sqlite), and a database
+	// store must be the record database itself
+	var aggregateStore aggregate.Store
+	switch name := conf.Backends.Aggregate.Store; name {
+	case "":
+		aggregateStore = databaseAggregate
+		if aggregateStore == nil {
+			aggregateStore = aggredis.New(redis)
+		}
+	case "postgres", "spanner", "firestore":
+		if name != databaseAggregateName {
+			panic("backends.aggregate.store " + name + " needs backends.database " + name)
+		}
+		aggregateStore = databaseAggregate
+	case "redis":
+		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
+	default:
+		panic("unknown backends.aggregate.store " + name + " (postgres, spanner, firestore, redis, memcached)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
