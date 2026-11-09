@@ -1,14 +1,16 @@
 // Package redis keeps aggregate entries as volatile Redis strings; Apply is
-// an optimistic WATCH / MULTI loop, InvalidateDefinition / InvalidateAll a
-// SCAN over the key pattern.
+// an optimistic WATCH / MULTI loop (serialised per key inside one process),
+// InvalidateDefinition / InvalidateAll a SCAN over the key pattern.
 package redis
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"hash/maphash"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,15 +21,23 @@ import (
 const (
 	keyPrefix      = "aggregate:"
 	applyAttempts  = 32
+	applyStripes   = 64
 	scanBatchCount = 1000
 )
 
 type Store struct {
 	rdb *redis.Client
+	// applyLocks serialise the Apply calls of this process on one key: WATCH
+	// lets only one of the concurrent writers of a key win each round, so a
+	// burst of same-key Applies from one process would otherwise burn the
+	// retries of all but one of them. Writers in other processes still meet
+	// at the WATCH.
+	applyLocks [applyStripes]sync.Mutex
+	applySeed  maphash.Seed
 }
 
 func New(rdb *redis.Client) *Store {
-	return &Store{rdb: rdb}
+	return &Store{rdb: rdb, applySeed: maphash.MakeSeed()}
 }
 
 type envelope struct {
@@ -71,6 +81,9 @@ func (s *Store) PutIfAbsent(ctx context.Context, key string, entry aggregate.Ent
 
 func (s *Store) Apply(ctx context.Context, key string, fn func(old []byte) ([]byte, error)) (*aggregate.Entry, bool, error) {
 	k := keyPrefix + key
+	mu := &s.applyLocks[maphash.String(s.applySeed, key)%applyStripes]
+	mu.Lock()
+	defer mu.Unlock()
 	for attempt := range applyAttempts {
 		if attempt > 0 {
 			// WATCH loses to every concurrent writer of the key; a jittered
