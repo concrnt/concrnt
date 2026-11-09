@@ -1,4 +1,4 @@
-package postgres
+package record
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
-	"github.com/concrnt/concrnt/internal/usecase/record"
+	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,7 +18,7 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := NewRecordRepository(db)
+	recordRepo := New(db)
 	chunklineRepo := NewChunklineRepository(db)
 
 	parentURI := "cckv://con1owner/timeline"
@@ -60,7 +60,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := NewRecordRepository(db)
+	recordRepo := New(db)
 	chunklineRepo := NewChunklineRepository(db)
 
 	parentURI := "cckv://con2owner/timeline"
@@ -99,7 +99,7 @@ func TestChunklineChunkBoundaryIsHalfOpen(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := NewRecordRepository(db)
+	recordRepo := New(db)
 	chunklineRepo := NewChunklineRepository(db)
 
 	parentURI := "cckv://con3owner/timeline"
@@ -127,7 +127,7 @@ func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := NewRecordRepository(db)
+	recordRepo := New(db)
 	chunklineRepo := NewChunklineRepository(db)
 
 	feedURI := "cckv://con4owner/timeline"
@@ -138,7 +138,7 @@ func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 	require.Nil(t, manifest.FirstChunk)
 }
 
-func createChunklineRecord(t *testing.T, ctx context.Context, repo record.Repository, id string, key string, createdAt time.Time) {
+func createChunklineRecord(t *testing.T, ctx context.Context, repo ucrecord.Repository, id string, key string, createdAt time.Time) {
 	t.Helper()
 
 	sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
@@ -150,7 +150,7 @@ func createChunklineRecord(t *testing.T, ctx context.Context, repo record.Reposi
 		CreatedAt: createdAt,
 	})
 
-	withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
+	withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx ucrecord.RepositoryTx) error {
 		_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
 		return err
 	})

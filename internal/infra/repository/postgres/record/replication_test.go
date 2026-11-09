@@ -1,4 +1,4 @@
-package postgres
+package record
 
 import (
 	"context"
@@ -11,7 +11,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
-	"github.com/concrnt/concrnt/internal/usecase/record"
+	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // The replication feed (/replication) pages the commit log by server receipt
@@ -23,7 +23,7 @@ func TestQueryCommitLogs(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := NewRecordRepository(db)
+	repo := New(db)
 
 	userA, userB := "con1aaaa", "con1bbbb"
 	seed := func(id, owner string) {
@@ -54,7 +54,7 @@ func TestQueryCommitLogs(t *testing.T) {
 	}
 	// ids reads each row's id back out of its ccfs URI; the ownerless row has
 	// no ccfs, so it is identified by the value the seed stored instead.
-	ids := func(rows []record.QueryRow) []string {
+	ids := func(rows []ucrecord.QueryRow) []string {
 		out := make([]string, 0, len(rows))
 		for _, row := range rows {
 			if row.Row.CCFS == nil {

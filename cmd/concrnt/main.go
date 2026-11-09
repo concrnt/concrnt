@@ -35,6 +35,7 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -259,11 +260,11 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
-	recordRepo := postgres.NewRecordRepository(db)
+	recordRepo := pgrecord.New(db)
 	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
 
-	chunklineRepo := postgres.NewChunklineRepository(db)
+	chunklineRepo := pgrecord.NewChunklineRepository(db)
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist

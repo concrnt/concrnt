@@ -1,4 +1,4 @@
-package postgres
+package record
 
 import (
 	"context"
@@ -28,7 +28,7 @@ func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri stri
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	recordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
+	recordKey, err := getRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -115,7 +115,7 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 	chunkDate := time.Unix((chunkID+1)*600, 0)
 	prevChunkDate := time.Unix((chunkID-1)*600, 0)
 
-	parentRecordKey, err := GetRecordKeyByURI(ctx, r.db, uri)
+	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err

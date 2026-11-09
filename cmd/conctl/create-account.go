@@ -11,6 +11,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/usecase/residence"
@@ -82,7 +83,7 @@ var createAccountCmd = &cobra.Command{
 		op.GlobalConfig.Registration = "open"
 
 		residenceRepo := postgres.NewResidenceRepository(op.DB, op.Client, op.GlobalConfig)
-		recordRepo := postgres.NewRecordRepository(op.DB)
+		recordRepo := pgrecord.New(op.DB)
 		serverRepo := postgres.NewServerRepository(&op.GlobalConfig, op.DB, op.Client)
 		serverUC := server.New(serverRepo, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
 		recordUC := record.New(recordRepo, residenceRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
