@@ -2,13 +2,12 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"time"
 
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/utils"
 )
@@ -29,7 +28,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 		return false, err
 	}
 
-	association := models.Association{
+	association := postgres.Association{
 		TargetID:   targetRK.ID,
 		DocumentID: documentID,
 		Unique:     unique,
@@ -66,7 +65,7 @@ func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.Reposito
 		return err
 	}
 
-	return db.Delete(&models.Association{}, "document_id = ?", documentID).Error
+	return db.Delete(&postgres.Association{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -79,12 +78,10 @@ func (r *Repository) GetAssociatedRecords(
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecords")
 	defer span.End()
 
-	var associations []models.Association
-
 	query := r.db.WithContext(ctx).
-		Model(&models.Association{}).
-		Preload("Document").
+		Model(&postgres.Association{}).
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
+		Joins("JOIN commit_logs c ON c.id = associations.document_id").
 		Where("rk.uri = ?", targetURI)
 
 	if schema != "" {
@@ -113,95 +110,100 @@ func (r *Repository) GetAssociatedRecords(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&associations).Error; err != nil {
+	var associations []commitRow
+	if err := query.Select("associations.document_id AS document_id, associations.owner AS owner, associations.created_at AS created_at, c.document AS document, c.proof AS proof").Scan(&associations).Error; err != nil {
 		return nil, err
 	}
 
-	rows := make([]ucrecord.QueryRow, len(associations))
-	for i, assoc := range associations {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(assoc.Document.Proof), &proof)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		ccfs := concrnt.ComposeCCFSURI(assoc.Owner, concrnt.CCFSTypeConcrnt, assoc.DocumentID)
-
-		rows[i] = ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCFS:     &ccfs,
-				Document: assoc.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: assoc.CreatedAt,
-		}
-	}
-
-	return rows, nil
+	return commitRows(associations)
 }
 
-func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsBySchema")
+// commitRow is a state row (association, ack, acked) joined with its commit
+// log; Owner is the namespace its ccfs URI is composed in.
+type commitRow struct {
+	DocumentID string
+	Owner      string
+	CreatedAt  time.Time
+	Document   string
+	Proof      string
+}
+
+func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
+	out := make([]ucrecord.QueryRow, len(rows))
+	for i, row := range rows {
+		sd, err := repoutil.CommitDocument(row.Owner, row.DocumentID, row.Document, row.Proof)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = ucrecord.QueryRow{
+			Row:       sd,
+			CreatedAt: row.CreatedAt,
+		}
+	}
+	return out, nil
+}
+
+func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
 	defer span.End()
 
+	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
+	// to min_created_at); the earliest association of each variant decides
+	// the variant order
 	var counts []struct {
-		Schema string
-		Count  int64
+		Schema       string
+		Variant      *string
+		Count        int64
+		MinCreatedAt time.Time
 	}
 
 	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
-		Select("schema, COUNT(*) AS count").
+		Model(&postgres.Association{}).
+		Select("associations.schema, associations.variant, COUNT(*) AS count, MIN(associations.created_at) AS min_created_at").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).
-		Group("schema").
+		Group("associations.schema, associations.variant").
 		Scan(&counts).Error
-
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	result := make(map[string]int64)
+	result := make(map[string]utils.OrderedKVMap[int64])
 	for _, c := range counts {
-		result[c.Schema] = c.Count
+		variants, ok := result[c.Schema]
+		if !ok {
+			variants = make(utils.OrderedKVMap[int64])
+			result[c.Schema] = variants
+		}
+		variant := ""
+		if c.Variant != nil {
+			variant = *c.Variant
+		}
+		variants[variant] = utils.OrderedKV[int64]{
+			Value: c.Count,
+			Order: c.MinCreatedAt.UnixNano(),
+		}
 	}
 
 	return result, nil
 }
 
-func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsByVariant")
+func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
 	defer span.End()
 
-	var counts []struct {
-		Variant  string
-		Count    int64
-		MinCDate time.Time
-	}
-
+	var authors []string
 	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
-		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
+		Model(&postgres.Association{}).
+		Distinct("associations.author").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).
-		Where("associations.schema = ?", schema).
-		Group("variant").
-		Order("min_created_at ASC").
-		Scan(&counts).Error
+		Limit(limit).
+		Pluck("associations.author", &authors).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	result := make(utils.OrderedKVMap[int64])
-	for _, c := range counts {
-		result[c.Variant] = utils.OrderedKV[int64]{
-			Value: c.Count,
-			Order: c.MinCDate.UnixNano(),
-		}
-	}
-
-	return &result, nil
+	return authors, nil
 }

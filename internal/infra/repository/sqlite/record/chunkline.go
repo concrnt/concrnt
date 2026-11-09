@@ -1,0 +1,148 @@
+package record
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/concrnt/concrnt/chunkline"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
+	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+)
+
+const (
+	defaultChunkSize = 32
+)
+
+func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
+	defer span.End()
+
+	recordKey, err := getRecordKeyByURI(ctx, r.db, uri)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	var firstChunk *int64
+	firstCollectionMember := sqlitedb.RecordKey{}
+	err = r.db.WithContext(ctx).
+		Model(&sqlitedb.RecordKey{}).
+		Where("record_keys.parent_id = ?", recordKey.ID).
+		Where("record_keys.record_created_at IS NOT NULL").
+		Order("record_keys.record_created_at ASC").
+		Limit(1).
+		Take(&firstCollectionMember).Error
+	if err == nil {
+		chunk := sqlitedb.Time(*firstCollectionMember.RecordCreatedAt).Unix() / repoutil.ChunkSize
+		firstChunk = &chunk
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return repoutil.ChunklineManifest(uri, firstChunk), nil
+}
+
+func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
+	defer span.End()
+
+	type TimelineRow struct {
+		URI          string `gorm:"column:uri"`
+		MaxCreatedAt *int64 `gorm:"column:max_created_at"`
+	}
+
+	var res []TimelineRow
+
+	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
+
+	latestSubQuery := r.db.
+		Table("record_keys AS child").
+		Select("child.record_created_at").
+		Where("child.parent_id = parent.id").
+		Where("child.record_created_at < ?", sqlitedb.Micros(cutoff)).
+		Order("child.record_created_at DESC").
+		Limit(1)
+
+	err := r.db.WithContext(ctx).
+		Table("record_keys AS parent").
+		Select("parent.uri AS uri, (?) AS max_created_at", latestSubQuery).
+		Where("parent.uri IN ?", uris).
+		Scan(&res).Error
+
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	lookup := make(map[string]int64)
+	for _, row := range res {
+		if row.MaxCreatedAt == nil {
+			continue
+		}
+		lookup[row.URI] = sqlitedb.Time(*row.MaxCreatedAt).Unix() / repoutil.ChunkSize
+	}
+	return lookup, nil
+}
+
+func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
+	defer span.End()
+
+	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
+	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
+
+	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	var members []sqlitedb.RecordKey
+	err = r.db.WithContext(ctx).
+		Where("parent_id = ?", parentRecordKey.ID).
+		Where("record_created_at < ?", sqlitedb.Micros(chunkDate)).
+		Order("record_created_at DESC").
+		Limit(defaultChunkSize).
+		Find(&members).Error
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// Judge window coverage by record_created_at — the same column the queries
+	// filter and order by — not the joined Record.CreatedAt, which can diverge
+	// (e.g. backdated records) and would skip the window scan.
+	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || *members[len(members)-1].RecordCreatedAt >= sqlitedb.Micros(prevChunkDate) {
+		err = r.db.WithContext(ctx).
+			Where("parent_id = ?", parentRecordKey.ID).
+			Where("record_created_at < ?", sqlitedb.Micros(chunkDate)).
+			Where("record_created_at >= ?", sqlitedb.Micros(prevChunkDate)).
+			Order("record_created_at DESC").
+			Find(&members).Error
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+	}
+
+	// every field a body item needs is on the key row (redirect and
+	// record_created_at are denormalised there), so no record is read
+	bodyItems := make([]chunkline.BodyItem, 0, len(members))
+	for _, member := range members {
+		href := member.URI
+		if member.Redirect != nil {
+			href = *member.Redirect
+		}
+		bodyItems = append(bodyItems, chunkline.BodyItem{
+			Timestamp:   sqlitedb.Time(*member.RecordCreatedAt),
+			Href:        href,
+			ContentType: "application/concrnt.document+json",
+		})
+	}
+
+	return bodyItems, nil
+}

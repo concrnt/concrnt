@@ -3,6 +3,7 @@ package record
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -65,7 +66,7 @@ func (s *remoteCommitServer) committed() []concrnt.SignedDocument {
 // newDeliverUsecase wires a usecase with a real client (no fakes possible:
 // the usecase holds *client.Client) whose remote.example is remapped to the
 // given httptest server, if any.
-func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, residence EntityRepository, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
+func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, residence entityLookups, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
 	t.Helper()
 	cl := client.New(cfg.FQDN)
 	if remote != nil {
@@ -73,8 +74,8 @@ func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, reside
 	}
 	queue := &recordingDeliveryQueue{}
 	uc := New(
-		repo,
-		residence,
+		withEntities{repo, residence},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		cl,
@@ -290,5 +291,58 @@ func TestDeliverLocalPublishMissingEvent(t *testing.T) {
 	}
 	if len(signal.channels) != 0 {
 		t.Fatal("did not expect Publish to be called without an Event")
+	}
+}
+
+type failingSignalService struct{}
+
+func (failingSignalService) Publish(ctx context.Context, channel string, event concrnt.Event) error {
+	return errors.New("redis unavailable")
+}
+
+// A realtime event for a channel owned on this server is published from the
+// post-commit action itself: queued, it waited behind every federation job.
+// Anything not known to be local still goes through the queue.
+func TestEnqueueEventDeliveryPublishesLocalChannels(t *testing.T) {
+	cfg := &domain.Config{FQDN: "example.com"}
+	local := newAckParty(t, cfg.FQDN)
+	remote := newAckParty(t, deliverRemoteHost)
+	unknown, _ := newIdentity(t)
+	event := &concrnt.Event{Type: "associated", URI: "cckv://example.com/posts/1", Timestamp: time.Now()}
+
+	for _, tc := range []struct {
+		name    string
+		channel string
+		signal  SignalService
+		publish bool
+	}{
+		{"local ccid owner", concrnt.CCURI{Scheme: "cckv", Owner: local.ccid, Key: "notify"}.String(), &recordingSignalService{}, true},
+		{"local domain owner", "cckv://example.com/timelines/home", &recordingSignalService{}, true},
+		{"remote ccid owner", concrnt.CCURI{Scheme: "cckv", Owner: remote.ccid, Key: "notify"}.String(), &recordingSignalService{}, false},
+		{"unknown owner", concrnt.CCURI{Scheme: "cckv", Owner: unknown, Key: "notify"}.String(), &recordingSignalService{}, false},
+		{"local, publish failed", concrnt.CCURI{Scheme: "cckv", Owner: local.ccid, Key: "notify"}.String(), failingSignalService{}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, queue := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(local, remote), tc.signal, nil)
+			job := DeliveryJob{ResolveURI: tc.channel, Local: DeliveryLocalPublish, Remote: DeliveryRemoteCommit, Event: event}
+
+			if err := uc.enqueueEventDelivery(context.Background(), job); err != nil {
+				t.Fatalf("enqueueEventDelivery: %v", err)
+			}
+
+			published := 0
+			if recorder, ok := tc.signal.(*recordingSignalService); ok {
+				published = len(recorder.channels)
+				if published == 1 && recorder.channels[0] != tc.channel {
+					t.Fatalf("published on %s, want %s", recorder.channels[0], tc.channel)
+				}
+			}
+			if tc.publish && (published != 1 || len(queue.jobs) != 0) {
+				t.Fatalf("want a direct publish and no job, got %d published, %d queued", published, len(queue.jobs))
+			}
+			if !tc.publish && (published != 0 || len(queue.jobs) != 1) {
+				t.Fatalf("want one queued job, got %d published, %d queued", published, len(queue.jobs))
+			}
+		})
 	}
 }

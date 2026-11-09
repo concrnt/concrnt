@@ -9,6 +9,9 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/aggregate/storetest"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
+	"github.com/concrnt/concrnt/internal/utils"
 )
 
 // queryRepo serves a fixed page for the parent listings and records which
@@ -37,8 +40,8 @@ func (r *queryRepo) QueryByParentOrderByKey(ctx context.Context, parent, schema,
 	return r.rows, nil
 }
 
-func (r *queryRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
-	return []concrnt.Policy{}, nil
+func (r *queryRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
 }
 
 func keyOnlyRow(key string) QueryRow {
@@ -72,7 +75,7 @@ func TestQueryOrderByKey(t *testing.T) {
 	}
 
 	newUsecase := func(repo *queryRepo, pol PolicyService) *Usecase {
-		return New(repo, stubResidenceRepo{}, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
+		return New(withEntities{repo, stubResidenceRepo{}}, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
 	}
 
 	t.Run("key-only entries are evaluated as record:read on the key", func(t *testing.T) {
@@ -150,4 +153,60 @@ func urisOf(items []concrnt.SignedDocument) []string {
 		uris = append(uris, *sd.CCKV)
 	}
 	return uris
+}
+
+// associationListRepo counts list reads and serves fixed counts.
+type associationListRepo struct {
+	Repository
+	counts  map[string]utils.OrderedKVMap[int64]
+	authors []string
+	lists   int
+}
+
+func (r *associationListRepo) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
+	return r.counts, nil
+}
+
+func (r *associationListRepo) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
+	return r.authors, nil
+}
+
+func (r *associationListRepo) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error) {
+	r.lists++
+	return nil, nil
+}
+
+// An association listing consults the count cache first: a target the cache
+// knows to have nothing matching is answered without the primary data, and
+// without a cache every listing reads it.
+func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
+	ctx := context.Background()
+	repo := &associationListRepo{counts: map[string]utils.OrderedKVMap[int64]{
+		"like": {"": {Value: 1, Order: 1}},
+	}, authors: []string{"con1liker"}}
+	uc := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
+	uc.SetAggregates(aggregate.New(storetest.NewInMemory(), 0, 0))
+
+	res, err := uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "reply", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Empty(t, res.Items)
+	require.Equal(t, 0, repo.lists, "a schema the counts lack must not reach the repository")
+
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "someone", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 0, repo.lists, "an author without associations on the target must not reach the repository")
+
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "con1liker", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.lists, "an author with associations is listed from the repository")
+
+	repo.counts = map[string]utils.OrderedKVMap[int64]{}
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.lists, "a target without associations must not reach the repository")
+
+	plain := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
+	_, err = plain.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 2, repo.lists, "without a count cache every listing reads the repository")
 }

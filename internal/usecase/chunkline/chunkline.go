@@ -7,29 +7,14 @@ import (
 
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// RemovedItemsTTL bounds how long a timeline advertises a removed item;
-// mirrors v1's 2-day retracted window. Readers only use the list to filter
-// already-cached chunks, so entries outliving their usefulness are harmless.
-const RemovedItemsTTL = 48 * time.Hour
-
-// RemovedItemsKey namespaces the KVS set of item IDs recently removed from a
-// timeline, written by record on delete and served via /chunkline/removed.
-func RemovedItemsKey(timeline string) string { return "removed:" + timeline }
-
 type Usecase struct {
-	repo     Repository
+	repo     record.Repository
 	gateway  Gateway
 	kvs      usecase.KVS
 	resolver URIResolver
-}
-
-// Repository defines storage operations for chunkline timelines.
-type Repository interface {
-	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
-	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
-	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 
 // Gateway encapsulates external timeline resolution.
@@ -44,7 +29,7 @@ type URIResolver interface {
 	CanonicalizeURI(ctx context.Context, uri string) (string, error)
 }
 
-func New(repo Repository, gateway Gateway, kvs usecase.KVS, resolver URIResolver) *Usecase {
+func New(repo record.Repository, gateway Gateway, kvs usecase.KVS, resolver URIResolver) *Usecase {
 	return &Usecase{
 		repo:     repo,
 		gateway:  gateway,
@@ -79,7 +64,7 @@ func (uc *Usecase) GetLocalRemovedItems(ctx context.Context, uri string) ([]stri
 	if uc.kvs == nil {
 		return []string{}, nil
 	}
-	items, err := uc.kvs.SetMembers(ctx, RemovedItemsKey(uri))
+	items, err := uc.kvs.SetMembers(ctx, usecase.RemovedItemsKey(uri))
 	if err != nil {
 		return nil, err
 	}

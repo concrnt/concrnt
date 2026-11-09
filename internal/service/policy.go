@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/patrickmn/go-cache"
@@ -28,6 +30,9 @@ type PolicyService struct {
 	globalParameters GlobalParameters
 	client           *client.Client
 	cache            *cache.Cache
+
+	refreshMu  sync.Mutex
+	refreshing map[string]bool
 }
 
 func NewPolicyService(
@@ -39,7 +44,8 @@ func NewPolicyService(
 		globalPolicy:     globalPolicy,
 		globalParameters: globalParameters,
 		client:           client,
-		cache:            cache.New(10*time.Minute, 15*time.Minute),
+		cache:            cache.New(policyStaleFor, time.Hour),
+		refreshing:       map[string]bool{},
 	}
 }
 
@@ -78,58 +84,104 @@ func (s *PolicyService) ConcrntCall(ctx context.Context, resolver string, api st
 	return result, nil
 }
 
+// A policy URL is fetched over HTTP and kept for policyStaleFor; past
+// policyFreshFor it is served as is while one refresh runs in the
+// background, so a commit, delivery or query never waits on the policy
+// host once a replica has the document. Only the very first use of a URL
+// on a replica fetches synchronously.
+const (
+	policyFreshFor = 10 * time.Minute
+	policyStaleFor = 24 * time.Hour
+)
+
+var policyHTTP = &http.Client{Timeout: 10 * time.Second}
+
+type cachedPolicy struct {
+	policy    []byte
+	fetchedAt time.Time
+}
+
 func (s *PolicyService) ResolvePolicyURL(ctx context.Context, policyURL string) (policy.Policy, error) {
 	ctx, span := tracer.Start(ctx, "Policy.Service.ResolvePolicyURL")
 	defer span.End()
 
-	cached, found := s.cache.Get(policyURL)
-	if found {
+	if x, found := s.cache.Get(policyURL); found {
+		cached := x.(cachedPolicy)
 		var policy20251223 policy.Policy
-		err := json.Unmarshal(cached.([]byte), &policy20251223)
-		if err != nil {
+		if err := json.Unmarshal(cached.policy, &policy20251223); err != nil {
 			span.RecordError(err)
 			s.cache.Delete(policyURL) // remove corrupted cache
 			return policy.Policy{}, err
 		}
+		if time.Since(cached.fetchedAt) > policyFreshFor {
+			// refetch in the background, once at a time per URL; a failed
+			// fetch keeps the stale copy and the next stale read retries
+			s.refreshMu.Lock()
+			refreshing := s.refreshing[policyURL]
+			s.refreshing[policyURL] = true
+			s.refreshMu.Unlock()
+			if !refreshing {
+				go s.refreshPolicyURL(policyURL)
+			}
+		}
 		return policy20251223, nil
 	}
 
-	resp, err := http.Get(policyURL)
+	policyBytes, err := s.fetchPolicyURL(ctx, policyURL)
 	if err != nil {
 		span.RecordError(err)
 		return policy.Policy{}, err
+	}
+	var policy20251223 policy.Policy
+	if err := json.Unmarshal(policyBytes, &policy20251223); err != nil {
+		span.RecordError(err)
+		return policy.Policy{}, err
+	}
+	s.cache.Set(policyURL, cachedPolicy{policy: policyBytes, fetchedAt: time.Now()}, policyStaleFor)
+	return policy20251223, nil
+}
+
+func (s *PolicyService) refreshPolicyURL(policyURL string) {
+	defer func() {
+		s.refreshMu.Lock()
+		delete(s.refreshing, policyURL)
+		s.refreshMu.Unlock()
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), policyHTTP.Timeout)
+	defer cancel()
+	policyBytes, err := s.fetchPolicyURL(ctx, policyURL)
+	if err != nil {
+		slog.Warn("policy: refresh failed, keeping the stale copy", slog.String("url", policyURL), slog.String("error", err.Error()))
+		return
+	}
+	s.cache.Set(policyURL, cachedPolicy{policy: policyBytes, fetchedAt: time.Now()}, policyStaleFor)
+}
+
+// fetchPolicyURL downloads the policy document and returns the JSON of the
+// version this server evaluates.
+func (s *PolicyService) fetchPolicyURL(ctx context.Context, policyURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, policyURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := policyHTTP.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("policy %s: status %d", policyURL, resp.StatusCode)
+	}
 
 	var policyDoc policy.PolicyDocument
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&policyDoc)
-	if err != nil {
-		span.RecordError(err)
-		return policy.Policy{}, err
+	if err := json.NewDecoder(resp.Body).Decode(&policyDoc); err != nil {
+		return nil, err
 	}
-
 	policyAny, ok := policyDoc.Versions["2025-12-23"]
 	if !ok {
-		return policy.Policy{}, fmt.Errorf("unsupported policy version in %s", policyURL)
+		return nil, fmt.Errorf("unsupported policy version in %s", policyURL)
 	}
-
-	policyBytes, err := json.Marshal(policyAny)
-	if err != nil {
-		span.RecordError(err)
-		return policy.Policy{}, err
-	}
-
-	var policy20251223 policy.Policy
-	err = json.Unmarshal(policyBytes, &policy20251223)
-	if err != nil {
-		span.RecordError(err)
-		return policy.Policy{}, err
-	}
-
-	s.cache.Set(policyURL, policyBytes, cache.DefaultExpiration)
-
-	return policy20251223, nil
+	return json.Marshal(policyAny)
 }
 
 func (s *PolicyService) resolvePolicyStack(ctx context.Context, stack []concrnt.Policy) (policy.PolicyStack, error) {

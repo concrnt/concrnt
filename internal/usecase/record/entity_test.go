@@ -48,10 +48,10 @@ func remoteParty(t *testing.T, storedAt time.Time) ackParty {
 	return party
 }
 
-func newReferenceCommitUsecase(cfg *domain.Config, repo Repository, residence EntityRepository) *Usecase {
+func newReferenceCommitUsecase(cfg *domain.Config, repo Repository, residence entityLookups) *Usecase {
 	return New(
-		repo,
-		residence,
+		withEntities{repo, residence},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -279,7 +279,7 @@ func TestCommitEntityInvalidatesResourceCache(t *testing.T) {
 	cl.AddHostRemapping(remoteEntityHost, srv.URL)
 
 	repo := &recordingRecordRepo{}
-	uc := New(repo, stubResidenceRepo{}, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, nil)
+	uc := New(withEntities{repo, stubResidenceRepo{}}, nil, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, nil)
 
 	fetch := func() {
 		t.Helper()
@@ -368,7 +368,7 @@ func newHintRecheckFixture(t *testing.T, serve func(w http.ResponseWriter, ccid 
 
 	repo := &recordingRecordRepo{storedCreatedAt: time.Now().Add(-2 * time.Hour)}
 	kvs := &stubKVS{}
-	uc := New(repo, fixedResidenceRepo{entity: stored}, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, kvs)
+	uc := New(withEntities{repo, fixedResidenceRepo{entity: stored}}, nil, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, kvs)
 	return hintRecheckFixture{uc: uc, repo: repo, kvs: kvs, resolves: resolves, ccid: ccid, priv: priv}
 }
 

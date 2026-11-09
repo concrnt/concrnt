@@ -28,10 +28,58 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
+  # database is the record store: postgres (the default), sqlite, spanner or
+  # firestore.
+  # sqlite keeps everything in one file (sqlite.path, default ./concrnt.db)
+  # and needs no database server; redis and memcached are still required.
+  database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # postgres sizes the connection pool of each replica. replicas x
+  # maxOpenConns must stay under the server's max_connections. a
+  # transaction's reads take a second connection, so maxConcurrentTx is
+  # capped at maxOpenConns/2 (a larger value is lowered with a warning).
+  # postgres:
+  #   maxOpenConns: 64      # default 64
+  #   maxConcurrentTx: 32   # default maxOpenConns/2
+  # sqlite:
+  #   path: /var/lib/concrnt/concrnt.db
+  # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),
+  # Spanner Omni (mode omni, plain text at endpoint; `docker compose
+  # --profile spanner up` runs one) or the emulator (mode emulator). the
+  # database must exist; the server creates and migrates its schema.
+  # spanner:
+  #   mode: omni
+  #   endpoint: spanner-omni:15000
+  #   project: default      # omni fixes project and instance to "default"
+  #   instance: default
+  #   database: concrnt
+  # firestore reaches Cloud Firestore (Native mode) with the ambient
+  # credentials, or the emulator at emulatorHost (`docker compose --profile
+  # firestore up` runs one). deploy the composite indexes of
+  # deploy/firestore/firestore.indexes.json before switching traffic.
+  # firestore:
+  #   projectID: my-project    # optional on GCP (detected from the metadata server)
+  #   databaseID: concrnt      # optional, "(default)" when omitted
+  #   emulatorHost: firestore-emulator:8080
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
+  # aggregate is the cache of counts (association counts, ack counts).
+  # store: postgres, spanner or firestore (a table / collection in the
+  # record database), redis or memcached; the default is the record
+  # database when it is postgres, spanner or firestore, redis otherwise.
+  # memcached shares memcachedAddr with the timeline chunk cache, and
+  # `aggregate-invalidate` there reaches the other replicas within 5s.
+  # the cache is never the source of truth: `conctl op aggregate-invalidate
+  # --all` drops it and every count is recomputed on its next read.
+  # aggregate:
+  #   store: postgres
+  #   ttl: 24h
+  #   maxDeltas: 10000
+  # jobqueue runs the background jobs (federation delivery, realtime
+  # events); concurrency is the consumer goroutines per replica.
+  # jobqueue:
+  #   concurrency: 16       # default 16
 
 observability:
   enableTrace: true

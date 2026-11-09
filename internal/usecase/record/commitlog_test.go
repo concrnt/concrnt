@@ -13,15 +13,9 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
-// committedRecordRepo answers HasCommitLog true for every id, so Commit
-// returns before any verification or write: the import loop can be exercised
-// with unsigned documents and no other dependencies.
-type committedRecordRepo struct{ Repository }
-
-func (committedRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return true, nil
-}
-
+// importLine is a well-formed SignedDocument whose none proof Commit rejects
+// before it reaches any dependency, so the import loop can be exercised
+// with a nil repository: every parsed line ends as one commit failure.
 func importLine(t *testing.T) string {
 	t.Helper()
 	doc := concrnt.Document[any]{Kind: "record", CreatedAt: time.Now()}
@@ -38,7 +32,7 @@ func importLine(t *testing.T) string {
 
 func TestImportCommitLogsStreamsLines(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
-	uc := New(committedRecordRepo{}, nil, nil, cfg, nil, nil, nil, nil, nil)
+	uc := New(nil, nil, nil, cfg, nil, nil, nil, nil, nil)
 
 	t.Run("valid and blank lines", func(t *testing.T) {
 		body := importLine(t) + "\n\n" + importLine(t) + "\n   \n" + importLine(t)
@@ -46,8 +40,13 @@ func TestImportCommitLogsStreamsLines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(results) != 0 {
-			t.Fatalf("expected no failures, got %+v", results)
+		if len(results) != 3 {
+			t.Fatalf("expected one result per non-blank line, got %+v", results)
+		}
+		for _, r := range results {
+			if !strings.HasPrefix(r.Error, "failed to commit document") {
+				t.Fatalf("unexpected error text: %s", r.Error)
+			}
 		}
 	})
 
@@ -58,14 +57,17 @@ func TestImportCommitLogsStreamsLines(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if len(results) != 1 {
-			t.Fatalf("expected one failure, got %d", len(results))
+		if len(results) != 2 {
+			t.Fatalf("expected two results, got %d", len(results))
 		}
 		if !strings.HasPrefix(results[0].Error, "failed to parse line as SignedDocument") {
 			t.Fatalf("unexpected error text: %s", results[0].Error)
 		}
 		if len(results[0].Document) != maxImportEchoBytes || !strings.HasPrefix(bad, results[0].Document) {
 			t.Fatalf("echoed document must be the first %d bytes of the line, got %d bytes", maxImportEchoBytes, len(results[0].Document))
+		}
+		if !strings.HasPrefix(results[1].Error, "failed to commit document") {
+			t.Fatalf("the line after a bad one must still be processed, got: %s", results[1].Error)
 		}
 	})
 
@@ -75,8 +77,8 @@ func TestImportCommitLogsStreamsLines(t *testing.T) {
 		if !errors.Is(err, bufio.ErrTooLong) {
 			t.Fatalf("expected bufio.ErrTooLong, got %v", err)
 		}
-		if len(results) != 0 {
-			t.Fatalf("lines before the failure must have been committed, got %+v", results)
+		if len(results) != 1 {
+			t.Fatalf("only the line before the failure must have been processed, got %+v", results)
 		}
 	})
 }

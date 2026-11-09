@@ -12,14 +12,13 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
-
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
-
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections. Transactions hold
+// one connection while their reads take another (CONTRACT.md C4), so the
+// record repository must run at most maxOpenConns/2 of them at once
+// (config.Postgres.WithDefaults).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -52,13 +51,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// A transaction holds one connection while the reads issued inside it
-	// (through the repository's plain db handle) take another one from this
-	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (postgres.MaxConcurrentTx); otherwise that many
-	// concurrent commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 
@@ -80,31 +74,4 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	}
 
 	return db, nil
-}
-
-// migrationLockID serializes AutoMigrate across replicas starting simultaneously.
-const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
-
-func MigratePostgres(db *gorm.DB) error {
-	// session-level advisory lock must be taken and released on the same connection
-	return db.Connection(func(conn *gorm.DB) error {
-		if err := conn.Exec("SELECT pg_advisory_lock(?)", migrationLockID).Error; err != nil {
-			return err
-		}
-		defer conn.Exec("SELECT pg_advisory_unlock(?)", migrationLockID)
-
-		return conn.AutoMigrate(
-			&models.CommitLog{},
-			&models.Record{},
-			&models.RecordKey{},
-			&models.Association{},
-			&models.Ack{},
-			&models.Acked{},
-			&models.Server{},
-			&models.Entity{},
-			&models.EntityMeta{},
-			&models.Subscription{},
-			&models.AbuseReport{},
-		)
-	})
 }

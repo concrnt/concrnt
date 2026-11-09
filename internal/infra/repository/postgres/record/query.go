@@ -2,13 +2,13 @@ package record
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"time"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
+	"gorm.io/gorm"
 )
 
 func (r *Repository) QueryByPrefix(
@@ -21,91 +21,74 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
-	var rks []models.RecordKey
+	// the prefix is a literal (CONTRACT.md): its LIKE metacharacters are
+	// escaped so "it_em" cannot match "items"
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false).
+		Where(uriPrefixMatch, likeEscaper.Replace(prefix)+"%")
 
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id").
-		Where("uri LIKE ?", prefix+"%")
+	query = orderLimit(recordFilters(query, schema, author, since, until), order, limit)
 
-	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
-	}
-	if author != "" {
-		query = query.Where("r.author = ?", author)
-	}
-	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
-	}
-	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
-	}
-
-	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
-	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
-	}
-
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
-
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
+	return queryRows(rows)
 }
 
 // likeEscaper escapes LIKE metacharacters so a key containing '%' or '_'
 // can't over-match when embedded in a pattern.
 var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 
+// uriPrefixMatch is a prefix LIKE on record_keys.uri. A btree serves LIKE
+// 'x%' only under the "C" collation, so the match is forced to it and the
+// (uri COLLATE "C") indexes apply; under the database's default collation
+// it scans the whole table.
+const uriPrefixMatch = `record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`
+
 // QueryRecordSubtree returns every live record whose key is base itself
 // (includeSelf) or lies under base's path subtree (base + "/..."), ordered by
-// URI so base leads. Unlike QueryByPrefix's raw prefix match this never picks
+// URI (byte order) so base leads. Unlike QueryByPrefix's raw prefix match this never picks
 // up sibling keys ("item2" for base "item"), and metacharacters in base are
 // escaped — the result is exactly the set a range delete may remove.
-func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
+func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false)
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		// the OR hides the LIKE prefix from the planner, so the scan is bounded
+		// explicitly: base and base/... both sort in [base, base+"0") ('/' < '0')
+		query = query.Where(`record_keys.uri COLLATE "C" >= ? AND record_keys.uri COLLATE "C" < ? AND (record_keys.uri = ? OR `+uriPrefixMatch+`)`,
+			base, base+"0", base, subtreePattern)
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where(uriPrefixMatch, subtreePattern)
 	}
 
-	var rks []models.RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	if afterURI != "" {
+		query = query.Where(`uri COLLATE "C" > ?`, afterURI)
+	}
+	query = query.Order(`uri COLLATE "C" ASC`)
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	sds := make([]concrnt.SignedDocument, 0, len(rks))
-	for _, rk := range rks {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
+	sds := make([]concrnt.SignedDocument, 0, len(rows))
+	for _, row := range rows {
+		sd, err := row.signedDocument()
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
-
-		sds = append(sds, concrnt.SignedDocument{
-			CCKV:     &rk.URI,
-			CCFS:     &ccfs,
-			Document: rk.Record.Document.Document,
-			Proof:    proof,
-		})
+		sds = append(sds, sd)
 	}
 
 	return sds, nil
@@ -121,55 +104,22 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	var rks []models.RecordKey
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), false)
 
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
-
-	// The owner root (cckv://<owner>) has no record_keys row and its top-level
-	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
-	// matched by URI prefix instead (CIP-5 §3.1).
-	parsedParent, err := concrnt.ParseCCURI(parent)
+	query, err := parentPredicate(query, parent)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
-	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
-	}
 
-	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
-	}
-	if author != "" {
-		query = query.Where("r.author = ?", author)
-	}
-	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
-	}
-	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
-	}
+	query = orderLimit(recordFilters(query, schema, author, since, until), order, limit)
 
-	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
-	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
-	}
-
-	if limit > 0 {
-		query = query.Limit(limit)
-	}
-
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	rows, err := scanRecordRows(query)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
+	return queryRows(rows)
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
@@ -187,23 +137,46 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	var rks []models.RecordKey
+	query := joinRecords(r.db.WithContext(ctx).Model(&postgres.RecordKey{}), true)
 
-	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
-
-	parsedParent, err := concrnt.ParseCCURI(parent)
+	query, err := parentPredicate(query, parent)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
-	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+
+	query = recordFilters(query, schema, author, nil, nil)
+	// byte order (CONTRACT.md "Key order"): the collation is forced on the
+	// bounds and the ordering alike so the (parent_id, uri COLLATE "C") index
+	// serves both
+	if since != nil {
+		query = query.Where(`record_keys.uri COLLATE "C" >= ?`, *since)
+	}
+	if until != nil {
+		query = query.Where(`record_keys.uri COLLATE "C" <= ?`, *until)
 	}
 
+	if order == "desc" {
+		query = query.Order(`record_keys.uri COLLATE "C" DESC`)
+	} else {
+		query = query.Order(`record_keys.uri COLLATE "C" ASC`)
+	}
+
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+
+	rows, err := scanRecordRows(query)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	return queryRows(rows)
+}
+
+// recordFilters adds the schema, author and createdAt window of a listing
+// over joined records (r).
+func recordFilters(query *gorm.DB, schema, author string, since, until *time.Time) *gorm.DB {
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
 	}
@@ -211,26 +184,38 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Where("r.author = ?", author)
 	}
 	if since != nil {
-		query = query.Where("record_keys.uri >= ?", *since)
+		query = query.Where("r.created_at >= ?", *since)
 	}
 	if until != nil {
-		query = query.Where("record_keys.uri <= ?", *until)
+		query = query.Where("r.created_at <= ?", *until)
 	}
+	return query
+}
 
+// orderLimit orders a listing by (created_at, id) and bounds the page.
+func orderLimit(query *gorm.DB, order string, limit int) *gorm.DB {
 	if order == "desc" {
-		query = query.Order("record_keys.uri DESC")
+		query = query.Order("r.created_at DESC, r.document_id DESC")
 	} else {
-		query = query.Order("record_keys.uri ASC")
+		query = query.Order("r.created_at ASC, r.document_id ASC")
 	}
-
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
+	return query
+}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
-		span.RecordError(err)
+// parentPredicate restricts a listing to parent's direct children. The
+// owner root (cckv://<owner>) has no record_keys row and its top-level keys
+// carry parent_id NULL (getOrCreateParentRecordKey), so the root is matched
+// by URI prefix instead (CIP-5 §3.1).
+func parentPredicate(query *gorm.DB, parent string) (*gorm.DB, error) {
+	parsedParent, err := concrnt.ParseCCURI(parent)
+	if err != nil {
 		return nil, err
 	}
-
-	return recordKeysToQueryRows(rks, span)
+	if parsedParent.Key == "" {
+		return query.Where(`parent_id IS NULL AND `+uriPrefixMatch, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%"), nil
+	}
+	return query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent), nil
 }

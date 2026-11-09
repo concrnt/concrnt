@@ -16,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // commitlogBackupMeta is the "meta" of each commit-log backup line: what the
@@ -78,19 +78,13 @@ func (b *backupFile) writeJSON(v any) error {
 	return nil
 }
 
-// writeCommitLog appends a commit_logs row as one concrnt.SignedDocumentWithMeta
+// writeCommitLog appends a commit log as one concrnt.SignedDocumentWithMeta
 // line: the replayable document/proof plus meta {id, owner, ip, cdate}.
-func (b *backupFile) writeCommitLog(cl models.CommitLog) error {
-	var proof concrnt.Proof
-	if cl.Proof != "" {
-		if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
-			return fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
-		}
-	}
+func (b *backupFile) writeCommitLog(cl record.CommitLogEntry) error {
 	err := b.writeJSON(concrnt.SignedDocumentWithMeta{
 		SignedDocument: concrnt.SignedDocument{
 			Document: cl.Document,
-			Proof:    proof,
+			Proof:    cl.Proof,
 		},
 		Meta: commitlogBackupMeta{
 			ID:    cl.ID,

@@ -3,24 +3,38 @@ package record
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/policy"
 )
 
+// ErrAlreadyCommitted is returned by CreateCommitLog for an id the commit
+// log already holds: the document was committed before, and the commit
+// that found out ends as a no-op.
+var ErrAlreadyCommitted = errors.New("document already committed")
+
 type Repository interface {
-	// Utilities
-	BeginTx(ctx context.Context) (RepositoryTx, error)
+	// RunInTx runs fn atomically. fn may be invoked more than once (a backend
+	// may retry on contention), so it must reach the store only through tx and
+	// must not have side effects of its own. A non-nil error from fn rolls the
+	// transaction back and is returned unchanged.
+	RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error
 
 	// Create / Update
+
+	// CreateCommitLog inserts the commit log by id; an id already held is
+	// left as first written and reported as ErrAlreadyCommitted.
 	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
 
 	CreateEntity(ctx context.Context, tx RepositoryTx, ccid string, alias *string, domain string, documentID string, createdAt time.Time) (bool, error)
@@ -32,14 +46,27 @@ type Repository interface {
 	UnAcknowledged(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error)
 
 	// Read
-	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
+	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
+	// that resolves to nothing is absent from the map, not an error.
+	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
-	GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
+
+	// Compute* recount from the primary data (C2). They are the aggregate
+	// layer's cache miss path and the verification tool's reference; request
+	// handlers go through the aggregate layer instead (aggregates.go).
+	ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
+	// ComputeAssociationCounts counts a target's associations by schema and,
+	// within a schema, by variant (an association without a variant counts
+	// under ""); a variant's Order is the createdAt (unix nanoseconds) of
+	// its earliest association.
+	ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error)
+	// ListAssociationAuthors lists up to limit distinct authors of a target's
+	// associations, in no particular order; a result of exactly limit may be
+	// incomplete.
+	ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -50,16 +77,21 @@ type Repository interface {
 	// is unused.
 	QueryByParentOrderByKey(ctx context.Context, parent, schema, author string, since, until *string, limit int, order string) ([]QueryRow, error)
 
-	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
+	// QueryRecordSubtree lists the live records under base (base itself too
+	// when includeSelf) in key order, those after afterURI only when it is
+	// set, at most limit when it is positive.
+	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
+	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
+	// for several cckv URIs at once (one fetch of the union of their
+	// ancestor chains); every input URI has an entry.
+	GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error)
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
 	// QueryCommitLogs pages the commit log by server receipt time (c_date,
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
 	// that c_date. owner "" means no owner filter.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-
-	GetDistributions(ctx context.Context, uri string) ([]string, error)
 
 	// Delete
 	// MarkCommitLogGcCandidate flags a commit log for `conctl op gc-commitlog`
@@ -68,6 +100,56 @@ type Repository interface {
 	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
+
+	// Offline tooling (conctl gc-commitlog / dump-commitlog)
+
+	// CountGcCandidates counts gc-flagged commit logs whose id sorts below
+	// cutoffID (i.e. whose document is older than the cutoff).
+	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
+	// ListGcCandidates returns up to limit gc-flagged commit logs below
+	// cutoffID in id order, starting after afterID ("" starts from the first).
+	ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]CommitLogEntry, error)
+	// DeleteCommitLogs removes the given commit logs together with every row
+	// that hangs off them (record, record key, ack, acked, association,
+	// entity). Missing ids are ignored; the count of commit logs actually
+	// removed is returned.
+	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
+	// ListCommitLogs returns one page of commit logs ordered by id ascending.
+	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
+
+	// Entities
+	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
+
+	// Chunkline views over record keys
+	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
+	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
+	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
+}
+
+// CommitLogEntry is one commit log row as offline tooling sees it.
+type CommitLogEntry struct {
+	ID       string
+	IP       string
+	Document string
+	Proof    concrnt.Proof
+	Owner    string
+	CDate    time.Time
+}
+
+// CommitLogPage selects a page of commit logs ordered by id ascending. Commit
+// log ids are time-prefixed CDIDs, so id bounds are time bounds.
+type CommitLogPage struct {
+	// FromID is an inclusive lower bound; "" means none. Ignored when AfterID is set.
+	FromID string
+	// AfterID is an exclusive lower bound (the last id of the previous page).
+	AfterID string
+	// UntilID is an inclusive upper bound; "" means none.
+	UntilID string
+	// Owner restricts to commits owned by this ccid; "" means all.
+	Owner string
+	Limit int
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
@@ -96,9 +178,11 @@ type QueryParams struct {
 	Order    string
 }
 
+// RepositoryTx is the opaque per-backend transaction handle passed back into
+// the repository's transactional methods; the usecase never commits or rolls
+// back itself.
 type RepositoryTx interface {
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
+	IsRepositoryTx()
 }
 
 type PostProcessAction func(ctx context.Context) error
@@ -111,15 +195,6 @@ type PolicyService interface {
 	Eval(ctx context.Context, req policy.RequestContext, stack []concrnt.Policy, action string, key string) error
 }
 
-// EntityRepository is the slice of the residence repository this usecase
-// needs: residency checks on entity commits and entity lookups. The full
-// residence.Repository embeds it.
-type EntityRepository interface {
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
-	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
-	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
-}
-
 type commitApplyResult struct {
 	result        *concrnt.SignedDocument
 	postProcesses []PostProcessAction
@@ -128,7 +203,7 @@ type commitApplyResult struct {
 
 type Usecase struct {
 	repo   Repository
-	entity EntityRepository
+	meta   usecase.EntityMetaRepository
 	server *server.Usecase
 	config *domain.Config
 	client *client.Client
@@ -137,11 +212,17 @@ type Usecase struct {
 	jobs   usecase.JobQueue
 	kvs    usecase.KVS
 	cache  *cache.Cache
+	// agg is the count cache; nil (offline tooling, tests) reads counts
+	// straight from repo.Compute*
+	agg  *aggregate.Usecase
+	aggs aggregates
+	// sharedCache is nil in offline tooling and tests
+	sharedCache SharedCache
 }
 
 func New(
 	repo Repository,
-	entity EntityRepository,
+	meta usecase.EntityMetaRepository,
 	server *server.Usecase,
 	config *domain.Config,
 	client *client.Client,
@@ -152,7 +233,7 @@ func New(
 ) *Usecase {
 	uc := &Usecase{
 		repo:   repo,
-		entity: entity,
+		meta:   meta,
 		server: server,
 		config: config,
 		client: client,
@@ -162,6 +243,7 @@ func New(
 		kvs:    kvs,
 		cache:  cache.New(10*time.Minute, 15*time.Minute),
 	}
+	uc.aggs = newAggregates(repo)
 
 	// this usecase owns the delivery job type: it both enqueues DeliveryJobs
 	// and interprets them, so the queue itself stays agnostic
@@ -173,9 +255,22 @@ func New(
 			}
 			return uc.Deliver(ctx, job)
 		})
+		jobs.RegisterHandler(JobTypeRecordRangeDelete, func(ctx context.Context, payload json.RawMessage) error {
+			job, err := usecase.ParseJobPayload[RangeDeleteJob](payload)
+			if err != nil {
+				return err
+			}
+			return uc.ContinueRangeDelete(ctx, job)
+		})
 	}
 
 	return uc
+}
+
+// SetAggregates routes the count reads and writes through the aggregate
+// cache agg.
+func (uc *Usecase) SetAggregates(agg *aggregate.Usecase) {
+	uc.agg = agg
 }
 
 // resolver returns uc.client as a DocumentResolver, or a nil interface when

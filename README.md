@@ -75,13 +75,17 @@ go build ./cmd/conctl       # admin CLI (account creation, key generation, v1->v
 go build ./cmd/k8s-elector  # optional Kubernetes sidecar for leader election / peer discovery
 
 go vet ./...
-go test ./...                                    # repository-layer tests spin up Postgres via dockertest (needs a Docker daemon)
+go test ./...                                    # repository-layer tests spin up Postgres, Spanner Omni and the Firestore emulator via dockertest (needs a Docker daemon)
 go test ./policy/... ./chunkline/... ./client/... # pure-logic packages, no Docker required
+CONCRNT_TEST_SPANNER=0 CONCRNT_TEST_FIRESTORE=0 go test ./...  # skip the Spanner / Firestore suites (they pull 1GB+ images and take minutes)
 go test ./... -run TestName -v                   # a single test
 ```
 
 `go build` / `go vet` / `go test` are the tools of record; there is no Makefile or lint
-config. `cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
+config. `.github/workflows/test.yml` runs `go vet ./...` and `go test ./... -count=1`
+(dockertest included) on every pull request and on pushes to `develop`; the
+Spanner and Firestore suites run in their own jobs.
+`cmd/concrnt/Dockerfile` is the canonical build recipe used by CI
 (`.github/workflows/docker-publish.yml`), which publishes multi-arch images on `v*.*.*`
 tags and pushes to `main`.
 
@@ -111,16 +115,21 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `server`, `notification`, `subscription`, `chunkline`, `abuse`), each exposing
   `Usecase`/`New` plus the repository/gateway interfaces only it needs; infra packages
   satisfy these interfaces structurally. The parent package holds only the ports shared
-  across concerns (`JobQueue`, `KVS`). `record` is the hub: `residence` builds on it (its
-  `Repository` embeds `record.EntityRepository`), and `record` depends on `server` (remote
-  server resolution) and `chunkline` (removed-item advertisements). Inside `record`,
+  across concerns (`JobQueue`, `KVS`, the removed-item kvs keys). `record` is the hub:
+  `record.Repository` is the single store interface for commit log, records, entities and
+  the chunkline views (one set of tables, so one repository — `CONTRACT.md` C9), while
+  the registration state (`entity_metas`, keyed by ccid and never joined) is its own
+  `usecase.EntityMetaRepository`; `residence` and `chunkline` build on `record`, and
+  `record` depends on `server` (remote server resolution). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
   `delete.go`); `read.go`/`query.go` are the read paths, `replication.go` the paged
   commit-log feed for external followers, `deliver.go` the federation delivery job,
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  (GORM; `postgres/record` is the record store, the other repositories sit beside it),
+  with `repository/repotest` holding the contract suites every backend must pass (see
+  `internal/infra/repository/CONTRACT.md`); `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).
@@ -156,11 +165,104 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
 ### Config
 
 `internal/infra/config` loads YAML; see `config.example.yaml` for the full shape
-(`concrnt` domain identity and registration mode, `backends` for Postgres/Redis/Memcached,
-`observability` tracing, `integrations` for captcha/VAPID keys, `meta` for
-instance branding served via well-known, `additionalWellKnown` for extra static
-`/.well-known/<name>` documents, `services` for pluggable modules).
-`domain.Config` is the resulting in-process representation.
+(`concrnt` domain identity and registration mode, `backends` for the record
+store, Redis and Memcached, `observability` tracing, `integrations` for
+captcha/VAPID keys, `meta` for instance branding served via well-known,
+`additionalWellKnown` for extra static `/.well-known/<name>` documents,
+`services` for pluggable modules). `domain.Config` is the resulting in-process
+representation.
+
+### Backends
+
+`backends.database` selects the record store; every repository of the chosen
+backend is wired in `cmd/concrnt/main.go` (and `cmd/conctl`) from that
+backend's package, and every backend passes the same contract suites
+(`internal/infra/repository/repotest`, see `internal/infra/repository/CONTRACT.md`).
+
+- `postgres` (default): `internal/infra/repository/postgres`, GORM over
+  `backends.postgresDsn`. Schema changes are numbered steps in
+  `postgres/migrations.go`, applied at server start. Each replica opens up
+  to `backends.postgres.maxOpenConns` connections (default 64) and runs at
+  most `maxConcurrentTx` transactions at once (default and cap: half the
+  pool), so keep replicas × maxOpenConns (+ conctl and exporters) under the
+  server's `max_connections` (`SHOW max_connections`; Cloud SQL sizes it
+  from memory, e.g. 100 on db-custom-1-3840, so set the flag explicitly).
+- `sqlite`: `internal/infra/repository/sqlite`, GORM over the pure-Go (wasm,
+  no cgo) `github.com/ncruces/go-sqlite3`, one file at `backends.sqlite.path`
+  (default `./concrnt.db`). Its own models live in `sqlite/models.go` and are
+  AutoMigrated at start; numbered steps go in `sqlite/migrations.go`. No
+  database server to run, so a single-binary server is
+
+  ```sh
+  # redis and memcached are still required (delivery jobs, realtime events,
+  # timeline chunk cache); their abstraction is out of scope for now
+  docker run -d -p 6379:6379 redis:8
+  docker run -d -p 11211:11211 memcached:1.6-alpine
+  cat > config.yaml <<'EOF'
+  concrnt: { fqdn: localhost, registration: open, layer: concrnt-mainnet, privatekey: "<hex>" }
+  backends: { database: sqlite, sqlite: { path: ./concrnt.db }, redisAddr: "127.0.0.1:6379", memcachedAddr: "127.0.0.1:11211" }
+  EOF
+  CONCRNT_CONFIG=config.yaml go run ./cmd/concrnt
+  ```
+
+  The SQLite contract suites run without Docker:
+  `go test ./internal/infra/repository/sqlite/... -count=1`.
+- `spanner`: `internal/infra/repository/spanner`, the native
+  `cloud.google.com/go/spanner` client (GoogleSQL, DML in read-write
+  transactions, no GORM). `backends.spanner.mode` picks the target: `cloud`
+  (Cloud Spanner, ambient credentials), `omni` (Spanner Omni at
+  `backends.spanner.endpoint`, plain text) or `emulator`. The database
+  (`backends.spanner.database`, default `concrnt`) must exist; the server
+  applies the numbered DDL batches of `spanner/schema.go` at start. Spanner
+  Omni runs locally from compose:
+
+  ```sh
+  docker compose --profile spanner up -d spanner-omni redis memcached
+  docker compose exec spanner-omni /google/spanner/bin/spanner databases create concrnt
+  # backends: { database: spanner, spanner: { mode: omni, endpoint: spanner-omni:15000 }, ... }
+  ```
+
+  Omni fixes the instance path to `projects/default/instances/default` and
+  its evaluation license lasts 90 days from the first start of the volume
+  (`spanner deployment describe` shows the expiry). The Spanner suites start
+  an Omni container through dockertest; `CONCRNT_TEST_SPANNER_ENDPOINT=localhost:15000`
+  points them at a running one instead and `CONCRNT_TEST_SPANNER=0` skips them.
+- `firestore`: `internal/infra/repository/firestore`, the native
+  `cloud.google.com/go/firestore` client (Native mode). A transaction's
+  writes are buffered until the usecase closure returns and laid over its
+  reads, so a method sees what the earlier methods of the same transaction
+  wrote. There is no schema to migrate, but the composite indexes in
+  `deploy/firestore/firestore.indexes.json` (generated from the query shapes
+  in `firestore/indexes.go`, pinned by a test) must be deployed before
+  traffic; `deploy/firestore/README.md` has the setup, the IAM binding and
+  the TTL policy of the count cache. The emulator runs from compose:
+
+  ```sh
+  docker compose --profile firestore up -d firestore-emulator redis memcached
+  # backends: { database: firestore, firestore: { projectID: local, emulatorHost: firestore-emulator:8080 }, ... }
+  ```
+
+  The Firestore suites start an emulator container through dockertest;
+  `CONCRNT_TEST_FIRESTORE_HOST=localhost:8080` points them at a running one
+  instead and `CONCRNT_TEST_FIRESTORE=0` skips them. The emulator does not
+  enforce composite indexes, so a query a new index is missing for only
+  fails in production (the startup probe logs it).
+
+`backends.aggregate` selects where the count caches live (`postgres` or
+`spanner` table, `firestore` collection, `redis` or `memcached`); see
+`MIGRATION.md` for the operational notes.
+
+`conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
+`migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,
+`import-commitlog`, `gc-commitlog`, `dump-/import-subscriptions`,
+`aggregate-*`) work on every backend.
+
+Entities (`entity:<ccid>`, 60 s plus a 5 s in-process copy), resolved
+documents (`doc:<hash>`, 1 h) and policy stacks (`policy-stack:<gen>:<hash>`,
+1 h under a per-owner generation) are cached in memcached for every backend.
+Commits invalidate their entries, but `conctl` edits of the tables (a
+changed `tag`, `delete-user`, `gc-commitlog`) do not reach the cache and
+take effect within those TTLs.
 
 ### Migration
 

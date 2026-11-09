@@ -1,0 +1,129 @@
+package postgres
+
+import (
+	"context"
+	"fmt"
+
+	"gorm.io/gorm"
+
+	aggpg "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+)
+
+// migration is one numbered, idempotent schema step. Steps are applied in
+// order and recorded in schema_migrations, so a step runs once per database;
+// a schema change is a new step, never an edit of an applied one.
+type migration struct {
+	Version int
+	Name    string
+	Up      func(tx *gorm.DB) error
+}
+
+var migrations = []migration{
+	{1, "baseline_tables", AutoMigrateTables},
+	// the key-ordered child listing moved to byte order (CONTRACT.md "Key
+	// order"); the index under this name was built on the database collation
+	// and is rebuilt by AutoMigrate with COLLATE "C"
+	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
+		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
+	}},
+	{3, "aggregate_entries", func(tx *gorm.DB) error {
+		return tx.Exec(aggpg.Schema).Error
+	}},
+	// chunkline reads come off the key row alone (C1): redirect moves onto
+	// record_keys and record_created_at is filled where it was never set
+	{4, "record_keys_redirect", func(tx *gorm.DB) error {
+		for _, stmt := range []string{
+			`ALTER TABLE record_keys ADD COLUMN IF NOT EXISTS redirect text`,
+			`UPDATE record_keys rk SET redirect = r.redirect FROM records r WHERE rk.record_id = r.document_id AND r.redirect IS NOT NULL AND rk.redirect IS NULL`,
+			`UPDATE record_keys rk SET record_created_at = r.created_at FROM records r WHERE rk.record_id = r.document_id AND rk.record_created_at IS NULL`,
+		} {
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
+	// acks are read by from and ackeds by to (CONTRACT.md eq(from ∨ to)):
+	// the other side's indexes and the schema ones were never scanned, and
+	// the gc flag index is rebuilt by AutoMigrate as a partial index
+	{5, "drop_unused_ack_indexes_and_partial_gc_index", func(tx *gorm.DB) error {
+		for _, name := range []string{
+			"idx_acks_to_valid_created_at", "idx_acks_schema_valid_created_at",
+			"idx_acked_from_valid_created_at", "idx_acked_schema_valid_created_at",
+			"idx_commit_logs_gc_candidate",
+		} {
+			if err := tx.Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
+}
+
+// AutoMigrateTables creates or extends every table from its model: tables,
+// columns, primary keys, unique constraints, foreign keys and indexes. It is
+// additive, so Migrate runs it at every start after the numbered steps: a new
+// column or index only needs its tag. Changing an existing index needs a step
+// that drops it by name (see step 2); AutoMigrate then recreates it from the
+// tag. `conctl op repair-anchored-acks` runs it again after it has reshaped a
+// pre-baseline schema by hand.
+func AutoMigrateTables(db *gorm.DB) error {
+	return db.AutoMigrate(
+		&CommitLog{},
+		&Record{},
+		&RecordKey{},
+		&Association{},
+		&Ack{},
+		&Acked{},
+		&Server{},
+		&Entity{},
+		&EntityMeta{},
+		&Subscription{},
+		&AbuseReport{},
+	)
+}
+
+// migrationLockID serializes Migrate across replicas starting simultaneously.
+const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
+
+// Migrate brings the schema up to date: the pending numbered steps, then
+// AutoMigrate for whatever the models declare and the database lacks.
+// Everything runs in one transaction under a transaction-scoped advisory
+// lock, so concurrent starters queue up and a failed step leaves the
+// database untouched.
+func Migrate(ctx context.Context, db *gorm.DB) error {
+	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLockID).Error; err != nil {
+			return err
+		}
+		if err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version integer PRIMARY KEY,
+			name text NOT NULL,
+			applied_at timestamp with time zone NOT NULL DEFAULT now()
+		)`).Error; err != nil {
+			return err
+		}
+
+		var versions []int
+		if err := tx.Raw("SELECT version FROM schema_migrations").Scan(&versions).Error; err != nil {
+			return err
+		}
+		applied := make(map[int]bool, len(versions))
+		for _, v := range versions {
+			applied[v] = true
+		}
+
+		for _, m := range migrations {
+			if applied[m.Version] {
+				continue
+			}
+			if err := m.Up(tx); err != nil {
+				return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
+			}
+			if err := tx.Exec("INSERT INTO schema_migrations (version, name) VALUES (?, ?)", m.Version, m.Name).Error; err != nil {
+				return err
+			}
+		}
+		return AutoMigrateTables(tx)
+	})
+}

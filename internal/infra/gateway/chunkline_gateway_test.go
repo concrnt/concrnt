@@ -6,18 +6,23 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/testutil"
+	ucchunkline "github.com/concrnt/concrnt/internal/usecase/chunkline"
+	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
 )
 
@@ -35,7 +40,7 @@ func newTestResolver(t *testing.T) (*resolver, chunkline.Manifest) {
 	}
 	seedManifest(t, mc, testTimeline, manifest)
 
-	return &resolver{mc: mc}, manifest
+	return newResolver(nil, mc, nil, nil), manifest
 }
 
 func seedManifest(t *testing.T, mc *memcache.Client, timeline string, manifest chunkline.Manifest) {
@@ -500,7 +505,7 @@ func TestQueryDescendingStaticManifestHost(t *testing.T) {
 	cl := client.New(domain)
 	cl.AddHostRemapping(domain, server.URL)
 
-	r := &resolver{mc: mc, client: cl, demand: noDemand{}}
+	r := newResolver(cl, mc, noDemand{}, nil)
 	timeline := "https://" + domain + "/backrooms/manifest.json"
 
 	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, newest.Add(time.Minute), 16)
@@ -515,5 +520,178 @@ func TestQueryDescendingStaticManifestHost(t *testing.T) {
 	}
 	if !cl.IsOnline(domain) {
 		t.Fatal("static host must stay online")
+	}
+}
+
+// localChunklineRepo serves the chunkline views of one timeline the way the
+// record stores do.
+type localChunklineRepo struct {
+	ucrecord.Repository
+	timeline string
+	items    []chunkline.BodyItem
+	calls    atomic.Int32
+}
+
+func (l *localChunklineRepo) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+	l.calls.Add(1)
+	safeURI := url.QueryEscape(uri)
+	return &chunkline.Manifest{
+		Version:   "1.0",
+		ChunkSize: 600,
+		Descending: &chunkline.Endpoint{
+			Iterator: "/api/v2/chunkline/itr/{chunk}?uri=" + safeURI,
+			Body:     "/api/v2/chunkline/body/{chunk}?uri=" + safeURI,
+		},
+		Removed: "/api/v2/chunkline/removed?uri=" + safeURI,
+	}, nil
+}
+
+func (l *localChunklineRepo) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
+	l.calls.Add(1)
+	result := map[string]int64{}
+	for _, uri := range uris {
+		if uri == l.timeline {
+			result[uri] = chunkID
+		}
+	}
+	return result, nil
+}
+
+func (l *localChunklineRepo) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
+	l.calls.Add(1)
+	if uri != l.timeline {
+		return nil, nil
+	}
+	return l.items, nil
+}
+
+// This server's own timelines are read from the store: every request the
+// client sends to this server's own domain would be the loopback through
+// /api/v2/batch the 3000 DAU load test choked on.
+func TestQueryDescendingLocalTimelineSkipsHTTP(t *testing.T) {
+	const self = "self.example.test"
+	timeline := "cckv://" + self + "/home"
+	mc, cleanup := testutil.CreateMC()
+	t.Cleanup(cleanup)
+
+	var httpRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		httpRequests.Add(1)
+		http.Error(w, "unexpected request "+r.URL.String(), http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	cl := client.New(self)
+	cl.AddHostRemapping(self, server.URL)
+
+	now := time.Now()
+	repo := &localChunklineRepo{timeline: timeline, items: []chunkline.BodyItem{
+		{Timestamp: now.Add(-time.Second), Href: timeline + "/newest"},
+		{Timestamp: now.Add(-2 * time.Second), Href: timeline + "/older"},
+	}}
+	r := newResolver(cl, mc, noDemand{}, nil)
+	r.fqdn, r.local = self, ucchunkline.New(repo, nil, nil, nil)
+
+	items, err := chunkline.NewClient(r).QueryDescending(context.Background(), []string{timeline}, now, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].Href != timeline+"/newest" || items[1].Href != timeline+"/older" {
+		t.Fatalf("unexpected items: %+v", items)
+	}
+	if repo.calls.Load() < 3 {
+		t.Fatalf("manifest, iterator and body must come from the store, got %d calls", repo.calls.Load())
+	}
+
+	// the removed-items refresh runs in the background
+	time.Sleep(200 * time.Millisecond)
+	if n := httpRequests.Load(); n != 0 {
+		t.Fatalf("%d HTTP requests reached this server's own API", n)
+	}
+}
+
+// A manifest read once is answered from the in-process copy afterwards,
+// so timeline queries do not pay a memcached round trip per request.
+func TestResolveTimelinesLocalCopySkipsMemcached(t *testing.T) {
+	r, manifest := newTestResolver(t)
+	r.manifests = cache.New(manifestLocalTTL, time.Minute)
+	ctx := context.Background()
+
+	got, err := r.ResolveTimelines(ctx, []string{testTimeline})
+	if err != nil || got[testTimeline].ChunkSize != manifest.ChunkSize {
+		t.Fatalf("ResolveTimelines = %+v, %v", got, err)
+	}
+	if err := r.mc.Delete(manifestCacheKey(testTimeline)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.ResolveTimelines(ctx, []string{testTimeline})
+	if err != nil || got[testTimeline].ChunkSize != manifest.ChunkSize {
+		t.Fatalf("second ResolveTimelines = %+v, %v (memcached entry deleted)", got, err)
+	}
+	single, err := r.resolveTimeline(ctx, testTimeline)
+	if err != nil || single.ChunkSize != manifest.ChunkSize {
+		t.Fatalf("resolveTimeline = %+v, %v", single, err)
+	}
+}
+
+// gapPubsub is a worker.PubSub that hands the cache updater its event
+// channel and gap hook.
+type gapPubsub struct {
+	events chan<- concrnt.Event
+	gap    func()
+}
+
+func (p *gapPubsub) Publish(ctx context.Context, channel string, event concrnt.Event) error {
+	return nil
+}
+func (p *gapPubsub) Subscribe(ctx context.Context, prefixes []string, response chan<- concrnt.Event) error {
+	return nil
+}
+func (p *gapPubsub) SubscribeAll(ctx context.Context, response chan<- concrnt.Event) error {
+	p.events = response
+	return nil
+}
+func (p *gapPubsub) OnGap(fn func()) { p.gap = fn }
+
+type fixedDemand []string
+
+func (d fixedDemand) CurrentSubscriptions() []string { return d }
+
+// The cache updater applies created events from its subscription and, after
+// a gap in the stream, purges the latest chunk of the timelines it maintains
+// so readers rebuild it from the origin.
+func TestCacheUpdaterAppliesEventsAndPurgesOnGap(t *testing.T) {
+	r, manifest := newTestResolver(t)
+	ps := &gapPubsub{}
+	r.pubsub = ps
+	r.demand = fixedDemand{testTimeline}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.cacheUpdater(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for ps.events == nil || ps.gap == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("cache updater did not subscribe")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	now := time.Now()
+	epoch := manifest.Time2Chunk(now)
+	seedChunk(t, r.mc, testTimeline, epoch, []chunkline.BodyItem{{Timestamp: now.Add(-time.Minute), Href: "cckv://alice/home/existing"}})
+
+	ps.events <- testEvent(testTimeline+"/rec-new", now)
+	ps.events <- concrnt.Event{Type: "deleted", URI: testTimeline + "/rec-old"}
+	deadline = time.Now().Add(5 * time.Second)
+	for !strings.Contains(cachedBody(t, r.mc, testTimeline, epoch), "rec-new") {
+		if time.Now().After(deadline) {
+			t.Fatal("created event not applied by the cache updater")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ps.gap()
+	if _, err := r.mc.Get(bodyCacheKey(testTimeline, strconv.FormatInt(epoch, 10))); err != memcache.ErrCacheMiss {
+		t.Fatalf("latest chunk not purged after a gap: %v", err)
 	}
 }

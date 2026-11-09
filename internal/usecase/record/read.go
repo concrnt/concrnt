@@ -37,7 +37,7 @@ func (uc *Usecase) GetSigned(ctx context.Context, uri string) (*concrnt.SignedDo
 			return nil, err
 		}
 
-		sd, err := uc.repo.GetSignedDocument(ctx, uri)
+		sd, err := uc.signedDocumentCached(ctx, uri)
 		if err != nil {
 			return nil, err
 		}
@@ -96,10 +96,30 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CheckReadAccess")
 	defer span.End()
 
-	if uri == "" {
-		err := errors.New("uri is required for read access evaluation")
+	doc, policyRoot, err := readAccessSubject(uri, sd)
+	if err != nil {
 		span.RecordError(err)
 		return err
+	}
+
+	stack, err := uc.policyStack(ctx, policyRoot)
+	if err != nil {
+		span.RecordError(err)
+		stack = []concrnt.Policy{}
+	}
+
+	if err := uc.evalReadAccess(ctx, uri, doc, stack, requester); err != nil {
+		span.RecordError(err)
+		return err
+	}
+	return nil
+}
+
+// readAccessSubject parses the document a read-access check is about and
+// names the resource whose policy stack applies to it.
+func readAccessSubject(uri string, sd concrnt.SignedDocument) (concrnt.Document[any], string, error) {
+	if uri == "" {
+		return concrnt.Document[any]{}, "", errors.New("uri is required for read access evaluation")
 	}
 
 	// A key-only query row (CIP-5 §3.2.1 intermediate key) has no document;
@@ -108,12 +128,8 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 	var doc concrnt.Document[any]
 	if sd.Document == "" {
 		doc = concrnt.Document[any]{Kind: "record", Key: uri}
-	} else {
-		err := json.Unmarshal([]byte(sd.Document), &doc)
-		if err != nil {
-			span.RecordError(err)
-			return err
-		}
+	} else if err := json.Unmarshal([]byte(sd.Document), &doc); err != nil {
+		return concrnt.Document[any]{}, "", err
 	}
 
 	// Associations have no record_keys row of their own; their policy stack is
@@ -122,14 +138,11 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 	if doc.Associate != nil {
 		policyRoot = *doc.Associate
 	}
+	return doc, policyRoot, nil
+}
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
-	if err != nil {
-		span.RecordError(err)
-		stack = []concrnt.Policy{}
-	}
-
-	err = uc.policy.Eval(
+func (uc *Usecase) evalReadAccess(ctx context.Context, uri string, doc concrnt.Document[any], stack []concrnt.Policy, requester domain.Entity) error {
+	return uc.policy.Eval(
 		ctx,
 		policy.RequestContext{
 			Requester: requester,
@@ -139,12 +152,6 @@ func (uc *Usecase) checkReadAccessAs(ctx context.Context, uri string, sd concrnt
 		policyReadAction(doc),
 		uri,
 	)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return nil
 }
 
 func (uc *Usecase) markEventForAnonymous(ctx context.Context, event concrnt.Event) concrnt.Event {
