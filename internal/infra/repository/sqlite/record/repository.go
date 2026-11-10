@@ -20,7 +20,7 @@ import (
 )
 
 // Repository implements record.Repository. Every Apply* method is one
-// IMMEDIATE transaction. Dependents (CONTRACT.md P4) are removed by ON
+// IMMEDIATE transaction. Dependents (CONTRACT.md C11) are removed by ON
 // DELETE CASCADE inside the transaction that removes what they hang off,
 // as on Postgres, so nothing is left for Cleanup.
 type Repository struct {

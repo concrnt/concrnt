@@ -212,7 +212,7 @@ func testDeleteContinuationPage(t *testing.T, be Backend) {
 }
 
 // Associations belong to the incarnation of the key they were created on
-// (P4). Overwriting the record keeps the incarnation; removing the key
+// (C11). Overwriting the record keeps the incarnation; removing the key
 // ends it: from that operation on its associations are gone from every
 // read and from uniqueness, and a record written to the key later starts
 // with none.

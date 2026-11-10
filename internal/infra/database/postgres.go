@@ -14,9 +14,9 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-// NewPostgres opens a pool of maxOpenConns connections. Transactions hold
-// one connection while their reads take another (CONTRACT.md C4), so the
-// record repository must run at most maxOpenConns/2 of them at once
+// NewPostgres opens a pool of maxOpenConns connections. A commit is one
+// transaction on one connection and its reads run before it (CONTRACT.md
+// C4), so the pool needs no headroom beyond the concurrency wanted
 // (config.Postgres.WithDefaults).
 func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 

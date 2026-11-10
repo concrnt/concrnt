@@ -318,7 +318,7 @@ func testAssociationListingSurvivesSiblingDelete(w *world) {
 	w.requireAssociationCounts(target, map[string][]variantCount{likeSchema: {{"+1", 1}}, replySchema: {{"", 1}}})
 }
 
-// P4: a key that is deleted and written again is a new incarnation. What
+// C11: a key that is deleted and written again is a new incarnation. What
 // was attached to the old one never comes back, in listings or in counts,
 // and does not block the same association from being made again. The
 // backend's deferred removal of the old incarnation runs after the new one

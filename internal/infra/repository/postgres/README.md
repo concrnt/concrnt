@@ -1,5 +1,41 @@
 # Postgres backend notes
 
+## Writes and connections (repository contract v2)
+
+Every `Apply*` method of the record repository is one transaction on one
+pooled connection (`record/repository.go`, `apply`): it is re-run from
+scratch on `serialization_failure` (40001), `deadlock_detected` (40P01) and
+when a concurrent writer overtook a row before it could be locked, up to 8
+attempts with a 10 ms to 500 ms backoff, and it is rolled back when the
+outcome is `Stale` or `Duplicate`, which is how those leave no trace. The
+usecase issues its reads before the call, never inside the transaction.
+
+What that removed: the rule that a transaction needs a second connection
+for its reads, the transaction slots that enforced it, the setting
+`backends.postgres.maxConcurrentTx` (a config that still has it loads; the
+key is ignored) and the `concrnt_record_tx_slot*` metrics. Size the pool
+with `backends.postgres.maxOpenConns` alone.
+
+Dependents go by `ON DELETE CASCADE` inside the same transaction
+(`record_keys.record_id` → `records`, `associations.target_id` →
+`record_keys`, everything anchored to a commit → `commit_logs`), so
+`ApplyDelete` issues no cleanup tokens and `Cleanup` is a no-op.
+
+Two things this schema does that the contract does not ask for
+(`CONTRACT.md`, backend notes):
+
+- `associations."unique"` is unique table-wide, not per target. The usecase
+  derives the value from the target, so the difference is not reachable
+  through it.
+- `record_keys.parent_id` is the parent row's serial id, without a foreign
+  key. Removing a key that has children deletes the parent row; the
+  children keep the dangling id and are missing from `QueryByParent*` and
+  the chunkline views of that parent until they are written again (an
+  overwrite sets `parent_id` anew).
+
+Migration step 6 (`aggregate_entries_counters`) drops and recreates the
+count cache table in its counter shape (`internal/infra/aggregate/postgres`).
+
 ## Prefix scans on record_keys.uri
 
 `record_keys.uri` has the database's default collation (en_US.utf8 on the

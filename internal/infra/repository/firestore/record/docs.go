@@ -163,7 +163,7 @@ type recordKeyDoc struct {
 	URI       string
 	ParentURI string
 	Ancestors []string
-	// Gen is the key's incarnation (CONTRACT.md P4).
+	// Gen is the key's incarnation (CONTRACT.md C11).
 	Gen string
 
 	// absent on placeholder keys

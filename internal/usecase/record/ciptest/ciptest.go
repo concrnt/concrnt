@@ -1,5 +1,5 @@
 // Package ciptest is the protocol-level conformance suite of a record
-// store (CONTRACT.md P5): it drives the real record and chunkline usecases
+// store (CONTRACT.md C7): it drives the real record and chunkline usecases
 // over the backend under test and asserts what a client or a peer server
 // can observe (commits, reads, listings, counts, events, the replication
 // feed). Passing it is what "implements concrnt" means for a backend; how

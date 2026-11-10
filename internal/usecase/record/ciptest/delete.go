@@ -278,7 +278,7 @@ func testRangeDeleteOffline(w *world) {
 	require.Len(w.t, w.signal.channels("deleted", ""), largeSubtreeSize+1)
 }
 
-// P4: whatever a backend leaves for later when a key is removed (cleanup
+// C11: whatever a backend leaves for later when a key is removed (cleanup
 // tokens, run by RecordCleanup jobs) is invisible. Every read answers the
 // same before and after the jobs ran, and the jobs run to their end.
 func testCleanupChangesNothing(w *world) {

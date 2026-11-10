@@ -13,18 +13,75 @@ dropping it is always safe and never needs a log replay.
   recomputed on their next read or write. `gc-commitlog` does this itself.
 - **To check the cache against the data**: `conctl op aggregate-verify
   --sample 1000` (add `--scan` for a uniform sample over the whole commit
-  log). Drifted entries are dropped and rebuild on demand. A redis store
-  may show transient drift from concurrent writers; it converges within
-  `backends.aggregate.ttl`.
+  log). Drifted entries are dropped and rebuild on demand. Writes reach
+  an entry as blind deltas, so a little drift is expected on a busy server
+  (a decrement landing on an entry computed after the removal, for
+  instance); an entry is recomputed after `backends.aggregate.maxDeltas`
+  deltas and at the latest after `backends.aggregate.ttl`.
 - **Switching the store** (`backends.aggregate.store: postgres | spanner | firestore | redis | memcached`)
-  needs no migration: the new store starts cold and fills on demand. The
-  old table (`aggregate_entries`, Postgres, Spanner or Firestore) can be
-  truncated. On Firestore expired entries are only removed by the TTL
+  needs no migration: the new store starts cold and fills on demand. What
+  the old store holds can be dropped: the table `aggregate_entries` on
+  Postgres, `aggregate_entries` with `aggregate_deltas` on Spanner, the
+  collection `aggregate_entries` on Firestore, the keys `aggregate:v2:*`
+  in Redis; memcached items (`agg2:`) expire on their own. On Firestore
+  expired entries are only removed by the TTL
   policy on `expiresAt` (`deploy/firestore/README.md`); until it is
   enabled they stay on disk, ignored.
 - Existing databases get no pre-computed counts; the first read of each
-  target computes it (one `GROUP BY` over that target's associations, plus
-  one author listing when the target has at most 1000 of them).
+  target computes it (one scan of that target's associations, which also
+  lists their authors when there are at most 1000).
+
+## Upgrading to the repository contract v2
+
+The release that carries the repository contract v2
+(`internal/infra/repository/CONTRACT.md`) changes how every backend writes
+and what Firestore and the count caches store. Per backend:
+
+- **Postgres**: start the new version; migration step 6 drops and
+  recreates `aggregate_entries` (a cache, it refills on demand). The record
+  tables are unchanged. `backends.postgres.maxConcurrentTx` no longer
+  exists: a config that still sets it loads and the key is ignored, and the
+  `concrnt_record_tx_slot*` metrics are gone with it (remove them from
+  dashboards and alerts). A commit takes one connection, so
+  `backends.postgres.maxOpenConns` is simply the concurrency wanted.
+- **SQLite**: nothing to do.
+- **Spanner**: start the new version; it applies schema batches 3
+  (`aggregate_entries` recreated, `aggregate_deltas` added), 4
+  (`record_keys.gen`, `associations.target_gen`, the association indexes
+  rebuilt on `(target_uri, target_gen, ...)`) and 5 (the foreign key from
+  associations to their target key dropped). All in place, no backfill;
+  the index builds of batch 4 take time proportional to the number of
+  associations and the server waits for them at start. Removing a key no
+  longer deletes its associations in the same commit: `RecordCleanup` jobs
+  remove them afterwards, so the job queue must be running.
+- **Firestore**: the stored model changed (documents embedded in
+  `record_keys`, `associations`, `acks`, `ackeds` and `entities`, key
+  generations, `anchor` on commits, no `records` collection) and there is
+  no in-place converter. Data written by the previous version is not
+  readable by this one. The only path is the log replay below: dump with
+  the old version, deploy the new composite indexes
+  (`deploy/firestore/README.md`), replay into an **empty** database with
+  the new version. The old database, its `records` collection included,
+  can then be deleted. If the replay target is not a new database but the
+  old one emptied by hand, empty `aggregate_entries` too, or run `conctl op
+  aggregate-invalidate --all` before serving: an entry in the old format
+  reads as an entry without counts until it expires.
+- **Redis / memcached count caches**: the keys moved (`aggregate:v2:` in
+  Redis, `agg2:` in memcached), so the cache starts cold; the old keys
+  expire on their own.
+
+Behaviour an operator may notice:
+
+- A redelivered commit that used to be acknowledged silently can now be
+  rejected when what it refers to has gone in the meantime (an association
+  whose target was removed and is not inlined in the commit, a delete of an
+  association by ccfs whose record is gone): the reads of a commit now all
+  come before its write.
+- Deleting a retained, superseded version of a record by its ccfs URI
+  works.
+- On Postgres an unack arriving as the first state of a relationship used
+  to be stored as valid; it is stored invalid now. Rows written before the
+  upgrade are not corrected.
 
 ## Moving between backends (log replay)
 
@@ -71,6 +128,15 @@ Notes:
   this corner.
 - Counts are not part of the log: the target's aggregate cache starts empty
   and fills on demand.
+- The job queue lives in Redis, not in the record store, and
+  `RecordCleanup` jobs carry tokens only the backend that issued them
+  understands (Spanner and Firestore issue them, Postgres and SQLite
+  never do). Let the source server's queue drain before pointing a server
+  with the same Redis at another backend (`concrnt_jobqueue_backlog` at
+  zero for ready, pending and retry). A leftover job is an error on
+  Spanner and Firestore (it retries and ends in the dead-letter queue) and
+  is dropped as done on Postgres and SQLite; either way the target is
+  unharmed and the source's cleanup stays unfinished.
 - The target server needs the same outbound reach as the source: policy
   documents are fetched by URL during replay, so a container without CA
   certificates denies every write into a policy-governed timeline.
@@ -78,7 +144,9 @@ Notes:
   commit: the first 500 go in the commit, the rest in `RecordRangeDelete`
   jobs on the target server, so the target's job queue must be running
   (it is, when the server is) and the dump comparison of step 3 is only
-  final once that queue is idle.
+  final once that queue is idle. The same queue runs the `RecordCleanup`
+  jobs of a Spanner or Firestore target (the physical removal of a deleted
+  key's associations); they change nothing a read or a dump shows.
 - On Spanner the database itself must exist before the server starts
   (`spanner databases create concrnt` on Omni, the console or `gcloud` on
   Cloud Spanner); the server creates and migrates the tables.

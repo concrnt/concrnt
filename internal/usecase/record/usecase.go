@@ -30,8 +30,12 @@ import (
 // is already in the log changes nothing and reports Duplicate.
 //
 // Reads: every read returns committed state and complete rows (the signed
-// document included). The budget of each is noted as "round trips": a list
-// read is one query, a point read one get.
+// document included). The budget of each is noted as "round trips": the
+// sequential steps it may take against the store, whatever the page size.
+// A list read is one query, a point read one get; requests a backend
+// issues in parallel count as one step (a backend without joins reads the
+// key that qualifies a query beside the query). Where a backend cannot
+// hold the budget in every case, the method says so.
 type Repository interface {
 	// ApplyEntity stores an entity document: the commit log entry and the
 	// entity (ccid, alias, domain) it registers. Accept-if-newer on
@@ -120,7 +124,11 @@ type Repository interface {
 	// GetAssociatedRecords lists the associations on the current
 	// incarnation of targetURI. Optional schema, variant and author
 	// filters, inclusive createdAt window, ordered by (createdAt, id). Each
-	// row's CCFS is composed in the target owner's namespace. Round trips: 1.
+	// row's CCFS is composed in the target owner's namespace. Round trips: 1
+	// (a backend without joins reads the target key, which names the
+	// current incarnation, in parallel; while associations of an ended
+	// incarnation of the key still await Cleanup it may have to read
+	// further pages to fill one).
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 
 	// Compute* recount from the primary data (C2). They are the aggregate
@@ -135,14 +143,17 @@ type Repository interface {
 	// earliest createdAt of every (schema, variant), and the distinct
 	// authors, or AuthorsOverflow instead when there are more than
 	// maxAuthors. A target without associations (or without a key) yields
-	// the zero summary. Round trips: 1.
+	// the zero summary. Round trips: 1 (a backend without joins reads the
+	// target key in parallel).
 	ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (AssociationSummary, error)
 
 	// QueryByPrefix lists the records whose key starts with the literal
 	// prefix (no wildcard in it means anything). Optional schema and author
 	// filters, inclusive createdAt window, ordered by (createdAt, id).
 	// QueryRow.CreatedAt is the createdAt the record was stored with (a
-	// reference record carries its target's). Round trips: 1.
+	// reference record carries its target's). Round trips: 1; a backend that
+	// cannot index a prefix ending inside a path segment filters such a
+	// prefix from an overfetched page and may read further pages.
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	// QueryByParent is QueryByPrefix for the direct children of parent that
 	// hold a record; the owner root (cckv://<owner>) is a valid parent.
@@ -158,7 +169,8 @@ type Repository interface {
 	// QueryRecordSubtree lists the live records under base (base itself too
 	// when includeSelf) in key order (byte order), those after afterURI
 	// only when it is set, at most limit when it is positive. Matching is
-	// by path hierarchy, never by string prefix. Round trips: 1.
+	// by path hierarchy, never by string prefix. Round trips: 1 (a backend
+	// without a disjunction reads base itself in parallel with its subtree).
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error)
 	// GetTimelineRemoval tells which chunkline item a key occupies: its
 	// parent key and the item id LoadLocalBody serves for it (the redirect
@@ -223,17 +235,20 @@ type Repository interface {
 
 	// GetChunklineManifest returns the manifest of the timeline at uri,
 	// FirstChunk being the chunk of its earliest item (nil without items);
-	// domain.NotFoundError when the key does not exist. Round trips: 1.
+	// domain.NotFoundError when the key does not exist. Round trips: 1 (a
+	// backend without joins reads the key in parallel with the item query).
 	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
 	// LookupLocalItrs maps each timeline that has an item at or before
-	// chunkID to the chunk of its latest such item. Round trips: 1 on SQL
-	// backends, one bounded query per timeline in parallel elsewhere.
+	// chunkID to the chunk of its latest such item. Round trips: 1; a backend
+	// without joins issues one bounded query per timeline and one batch get
+	// of the timeline keys, in parallel.
 	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
 	// LoadLocalBody returns the items of chunkID and the chunk before it,
 	// newest first, and at least a page of items when the timeline has
 	// older ones; domain.NotFoundError when the key does not exist. Round
-	// trips: 1 (a backend without joins may spend a parallel get on the
-	// existence of the key).
+	// trips: 1 (a backend without joins reads the key in parallel), and a
+	// second one on such a backend when the two chunks hold more than a
+	// page of items.
 	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 

@@ -10,7 +10,7 @@
 // Reads are plain strong reads outside any transaction, and whatever one
 // returns is on the documents its query or get lands on.
 //
-// Dependents (P4): an association carries the gen of the key incarnation
+// Dependents (C11): an association carries the gen of the key incarnation
 // it was created on and is live only while the key document carries that
 // gen. Removing a key deletes its document alone, which ends the
 // incarnation for every read at once; the associations and uniqueness

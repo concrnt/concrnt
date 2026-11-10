@@ -35,7 +35,9 @@ backends:
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # postgres sizes the connection pool of each replica. replicas x
-  # maxOpenConns must stay under the server's max_connections.
+  # maxOpenConns must stay under the server's max_connections. a commit
+  # takes one connection for one transaction. (maxConcurrentTx of older
+  # configs is ignored.)
   # postgres:
   #   maxOpenConns: 64      # default 64
   # sqlite:
@@ -69,12 +71,16 @@ backends:
   # `aggregate-invalidate` there reaches the other replicas within 5s.
   # the cache is never the source of truth: `conctl op aggregate-invalidate
   # --all` drops it and every count is recomputed on its next read.
+  # ttl is how long a computed entry is served; maxDeltas how many writes
+  # it absorbs as deltas before a read recomputes it.
   # aggregate:
   #   store: postgres
   #   ttl: 24h
   #   maxDeltas: 10000
   # jobqueue runs the background jobs (federation delivery, realtime
-  # events); concurrency is the consumer goroutines per replica.
+  # events, the later pages of a range delete, the cleanup after a deleted
+  # key on spanner / firestore); concurrency is the consumer goroutines
+  # per replica.
   # jobqueue:
   #   concurrency: 16       # default 16
 

@@ -20,7 +20,7 @@ import (
 // reads the usecase issues happen before it, so a commit never holds a
 // connection while waiting for another.
 //
-// Dependents (CONTRACT.md P4) are removed by ON DELETE CASCADE inside the
+// Dependents (CONTRACT.md C11) are removed by ON DELETE CASCADE inside the
 // transaction that removes what they hang off: an association references
 // the row of its target key, and a key recreated later is a new row, so it
 // starts without any. Nothing is left for Cleanup.

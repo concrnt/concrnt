@@ -123,13 +123,19 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `record` depends on `server` (remote server resolution). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
-  `delete.go`); `read.go`/`query.go` are the read paths, `replication.go` the paged
+  `delete.go`): a commit is planned from committed reads (validation, policy) and then
+  written by exactly one `Repository.Apply*` call, with no transaction handle in the
+  interface; `range_delete.go` and `cleanup.go` are the jobs that continue a large
+  delete. `read.go`/`query.go` are the read paths, `replication.go` the paged
   commit-log feed for external followers, `deliver.go` the federation delivery job,
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM; `postgres/record` is the record store, the other repositories sit beside it),
-  with `repository/repotest` holding the contract suites every backend must pass (see
-  `internal/infra/repository/CONTRACT.md`); `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  (GORM; `postgres/record` is the record store, the other repositories sit beside it)
+  and its siblings `sqlite`, `spanner` and `firestore`, with `repository/repotest`
+  (per-method, black-box) and `usecase/record/ciptest` (protocol-level, through the real
+  usecases) holding the conformance suites every backend must pass (see
+  `internal/infra/repository/CONTRACT.md`); `aggregate` (the count cache stores);
+  `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).
@@ -176,12 +182,14 @@ representation.
 
 `backends.database` selects the record store; every repository of the chosen
 backend is wired in `cmd/concrnt/main.go` (and `cmd/conctl`) from that
-backend's package, and every backend passes the same contract suites
-(`internal/infra/repository/repotest`, see `internal/infra/repository/CONTRACT.md`).
+backend's package, and every backend passes the same conformance suites
+(`internal/usecase/record/ciptest` and `internal/infra/repository/repotest`,
+see `internal/infra/repository/CONTRACT.md`).
 
 - `postgres` (default): `internal/infra/repository/postgres`, GORM over
   `backends.postgresDsn`. Schema changes are numbered steps in
-  `postgres/migrations.go`, applied at server start. Each replica opens up
+  `postgres/migrations.go`, applied at server start. A commit is one
+  transaction on one connection. Each replica opens up
   to `backends.postgres.maxOpenConns` connections (default 64), so keep
   replicas × maxOpenConns (+ conctl and exporters) under the
   server's `max_connections` (`SHOW max_connections`; Cloud SQL sizes it
@@ -207,8 +215,8 @@ backend's package, and every backend passes the same contract suites
   The SQLite contract suites run without Docker:
   `go test ./internal/infra/repository/sqlite/... -count=1`.
 - `spanner`: `internal/infra/repository/spanner`, the native
-  `cloud.google.com/go/spanner` client (GoogleSQL, DML in read-write
-  transactions, no GORM). `backends.spanner.mode` picks the target: `cloud`
+  `cloud.google.com/go/spanner` client (GoogleSQL, one read-write
+  transaction per commit, no GORM). `backends.spanner.mode` picks the target: `cloud`
   (Cloud Spanner, ambient credentials), `omni` (Spanner Omni at
   `backends.spanner.endpoint`, plain text) or `emulator`. The database
   (`backends.spanner.database`, default `concrnt`) must exist; the server
@@ -227,10 +235,12 @@ backend's package, and every backend passes the same contract suites
   an Omni container through dockertest; `CONCRNT_TEST_SPANNER_ENDPOINT=localhost:15000`
   points them at a running one instead and `CONCRNT_TEST_SPANNER=0` skips them.
 - `firestore`: `internal/infra/repository/firestore`, the native
-  `cloud.google.com/go/firestore` client (Native mode). A transaction's
-  writes are buffered until the usecase closure returns and laid over its
-  reads, so a method sees what the earlier methods of the same transaction
-  wrote. There is no schema to migrate, but the composite indexes in
+  `cloud.google.com/go/firestore` client (Native mode). A commit is one
+  transaction that reads a few documents by id and never queries, and a
+  listing returns the signed documents embedded in the documents it lands
+  on. There is no schema to migrate (a database written before the
+  repository contract v2 is replayed into an empty one, see `MIGRATION.md`),
+  but the composite indexes in
   `deploy/firestore/firestore.indexes.json` (generated from the query shapes
   in `firestore/indexes.go`, pinned by a test) must be deployed before
   traffic; `deploy/firestore/README.md` has the setup, the IAM binding and
@@ -248,8 +258,10 @@ backend's package, and every backend passes the same contract suites
   fails in production (the startup probe logs it).
 
 `backends.aggregate` selects where the count caches live (`postgres` or
-`spanner` table, `firestore` collection, `redis` or `memcached`); see
-`MIGRATION.md` for the operational notes.
+`spanner` table, `firestore` collection, `redis` or `memcached`). An entry
+is a set of counters that writes adjust with blind deltas and that is
+recomputed from the records when missing; see `MIGRATION.md` for the
+operational notes.
 
 `conctl op` commands that speak SQL directly (`delete-user`, `repair-*`,
 `migrate-*`) run on the Postgres backend only; the rest (`dump-commitlog`,

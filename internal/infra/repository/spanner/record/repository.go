@@ -11,7 +11,7 @@
 // so a Stale or Duplicate transaction has nothing to leave behind. Reads
 // outside a transaction are single-use strong reads.
 //
-// Dependents (CONTRACT.md P4): a key row carries the generation (gen) of
+// Dependents (CONTRACT.md C11): a key row carries the generation (gen) of
 // its incarnation and an association the target_gen it was created on.
 // Removing a key deletes the key row only, which makes its associations
 // unreadable at once (no key row with their generation is left); their
