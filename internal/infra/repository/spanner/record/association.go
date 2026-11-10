@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -13,78 +11,59 @@ import (
 
 	"github.com/concrnt/concrnt/internal/domain"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
-	"github.com/concrnt/concrnt/internal/utils"
 )
 
-func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
+// currentIncarnation joins associations (a) to the key row (rk) their
+// target has now. An association whose target_gen is not that row's gen
+// belongs to an incarnation that has ended: no read may return it, and it
+// stays only until Cleanup has removed it.
+const currentIncarnation = "record_keys rk JOIN associations a ON a.target_uri = rk.uri AND a.target_gen = rk.gen "
+
+// ApplyAssociation binds the association to the incarnation of the target
+// key it finds: it stores the key row's gen. The read locks the key row
+// and the uniqueness key within that incarnation, so neither a concurrent
+// removal of the key nor a concurrent association with the same Unique can
+// commit beside this one.
+func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAssociation")
 	defer span.End()
 
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+	status, err := r.apply(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) (ucrecord.ApplyStatus, error) {
+		read, err := readSet[struct {
+			Duplicate bool    `spanner:"duplicate"`
+			Gen       *string `spanner:"gen"`
+			Taken     bool    `spanner:"taken"`
+		}](ctx, tx, spanner.Statement{
+			SQL: "SELECT " + duplicateCommit + `,
+				(SELECT gen FROM record_keys WHERE uri = @target) AS gen,
+				EXISTS(SELECT 1 FROM ` + currentIncarnation + `WHERE rk.uri = @target AND a.unique_key = @unique) AS taken`,
+			Params: map[string]any{"id": commit.ID, "target": commit.Target, "unique": commit.Unique},
+		})
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if read.Duplicate {
+			return ucrecord.Duplicate, nil
+		}
+		if read.Gen == nil {
+			return ucrecord.Applied, domain.NotFoundError{Resource: "record key"}
+		}
+		if read.Taken {
+			return ucrecord.Stale, nil
+		}
 
-	targetRK, err := readRecordKey(ctx, stx, targetURI)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	if targetRK == nil {
-		err := domain.NotFoundError{Resource: "record key"}
-		span.RecordError(err)
-		return false, err
-	}
-
-	// Duplicates are a silent success like record/ack: the same document
-	// re-delivered is caught by INSERT OR IGNORE on the id, the same logical
-	// association under a new document id by the unique_key lookup (a unique
-	// index violation would otherwise fail the statement).
-	_, found, err := spannerdb.QueryOne[struct {
-		ID string `spanner:"id"`
-	}](ctx, stx, spanner.Statement{
-		SQL:    "SELECT id FROM associations WHERE unique_key = @unique",
-		Params: map[string]any{"unique": unique},
+		insert, err := insertCommit(commit.Commit, false)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		return ucrecord.Applied, tx.BufferWrite([]*spanner.Mutation{insert, spanner.Insert("associations",
+			[]string{"id", "target_uri", "target_gen", "owner", "author", "schema", "variant", "unique_key", "created_at", "c_date"},
+			[]any{commit.ID, commit.Target, *read.Gen, commit.Owner, commit.Author, commit.Schema, commit.Variant, commit.Unique, commit.CreatedAt, time.Now().UTC()})})
 	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
 	}
-	if found {
-		return false, nil
-	}
-
-	affected, err := stx.Update(ctx, spanner.Statement{
-		SQL: `INSERT OR IGNORE INTO associations (id, target_uri, owner, author, schema, variant, unique_key, created_at, c_date)
-			VALUES (@id, @target_uri, @owner, @author, @schema, @variant, @unique, @created_at, CURRENT_TIMESTAMP())`,
-		Params: map[string]any{
-			"id": documentID, "target_uri": targetURI, "owner": owner, "author": author, "schema": schema,
-			"variant": variant, "unique": unique, "created_at": createdAt,
-		},
-	})
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	return affected > 0, nil
-}
-
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
-	defer span.End()
-
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	_, err = stx.Update(ctx, spanner.Statement{
-		SQL:    "DELETE FROM associations WHERE id = @id",
-		Params: map[string]any{"id": documentID},
-	})
-	return err
+	return status, err
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -98,7 +77,7 @@ func (r *Repository) GetAssociatedRecords(
 	defer span.End()
 
 	params := map[string]any{"target": targetURI}
-	where := []string{"a.target_uri = @target"}
+	where := []string{"rk.uri = @target"}
 	if schema != "" {
 		where = append(where, "a.schema = @schema")
 		params["schema"] = schema
@@ -114,7 +93,7 @@ func (r *Repository) GetAssociatedRecords(
 	where = timeRange(where, params, "a.created_at", since, until)
 
 	sql := `SELECT a.id AS document_id, a.owner AS owner, a.created_at AS created_at, c.document AS document, c.proof AS proof
-		FROM associations a JOIN commit_logs c ON c.id = a.id WHERE ` + strings.Join(where, " AND ") +
+		FROM ` + currentIncarnation + `JOIN commit_logs c ON c.id = a.id WHERE ` + strings.Join(where, " AND ") +
 		orderLimit("a.created_at", "a.id", order, limit, params)
 	rows, err := spannerdb.QueryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
@@ -124,62 +103,49 @@ func (r *Repository) GetAssociatedRecords(
 	return commitRows(rows)
 }
 
-func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
-	defer span.End()
-
-	// the earliest association of each variant decides the variant order
-	counts, err := spannerdb.QueryAll[struct {
-		Schema       string    `spanner:"schema"`
-		Variant      *string   `spanner:"variant"`
-		Count        int64     `spanner:"count"`
-		MinCreatedAt time.Time `spanner:"min_created_at"`
-	}](ctx, r.client.Single(), spanner.Statement{
-		SQL: `SELECT schema, variant, COUNT(*) AS count, MIN(created_at) AS min_created_at FROM associations
-			WHERE target_uri = @target GROUP BY schema, variant`,
-		Params: map[string]any{"target": targetURI},
-	})
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	result := make(map[string]utils.OrderedKVMap[int64])
-	for _, c := range counts {
-		variants, ok := result[c.Schema]
-		if !ok {
-			variants = make(utils.OrderedKVMap[int64])
-			result[c.Schema] = variants
-		}
-		variant := ""
-		if c.Variant != nil {
-			variant = *c.Variant
-		}
-		variants[variant] = utils.OrderedKV[int64]{
-			Value: c.Count,
-			Order: c.MinCreatedAt.UnixNano(),
-		}
-	}
-	return result, nil
-}
-
-func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
+// ComputeAssociationSummary reads a target's associations in one statement
+// (one snapshot): the counts per (schema, variant), and the distinct
+// authors, which stop one past maxAuthors (that one row is what tells an
+// overflow). Both halves are served by the (target_uri, target_gen, schema,
+// variant, author) index.
+func (r *Repository) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (ucrecord.AssociationSummary, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationSummary")
 	defer span.End()
 
 	rows, err := spannerdb.QueryAll[struct {
-		Author string `spanner:"author"`
+		Kind     int64      `spanner:"kind"`
+		Schema   *string    `spanner:"schema"`
+		Variant  *string    `spanner:"variant"`
+		Author   *string    `spanner:"author"`
+		Count    int64      `spanner:"count"`
+		Earliest *time.Time `spanner:"earliest"`
 	}](ctx, r.client.Single(), spanner.Statement{
-		SQL:    `SELECT DISTINCT author FROM associations WHERE target_uri = @target LIMIT @limit`,
-		Params: map[string]any{"target": targetURI, "limit": int64(limit)},
+		SQL: `SELECT 0 AS kind, a.schema AS schema, a.variant AS variant, CAST(NULL AS STRING) AS author, COUNT(*) AS count, MIN(a.created_at) AS earliest
+				FROM ` + currentIncarnation + `WHERE rk.uri = @target GROUP BY a.schema, a.variant
+			UNION ALL
+			SELECT 1, NULL, NULL, d.author, 0, NULL
+				FROM (SELECT DISTINCT a.author FROM ` + currentIncarnation + `WHERE rk.uri = @target LIMIT @authors) d`,
+		Params: map[string]any{"target": targetURI, "authors": int64(maxAuthors) + 1},
 	})
 	if err != nil {
 		span.RecordError(err)
-		return nil, err
+		return ucrecord.AssociationSummary{}, err
 	}
-	authors := make([]string, 0, len(rows))
+
+	var summary ucrecord.AssociationSummary
 	for _, row := range rows {
-		authors = append(authors, row.Author)
+		if row.Kind == 1 {
+			summary.Authors = append(summary.Authors, deref(row.Author))
+			continue
+		}
+		variant := ucrecord.AssociationVariant{Schema: deref(row.Schema), Variant: deref(row.Variant), Count: row.Count}
+		if row.Earliest != nil {
+			variant.Earliest = row.Earliest.UTC()
+		}
+		summary.Variants = append(summary.Variants, variant)
 	}
-	return authors, nil
+	if len(summary.Authors) > maxAuthors {
+		summary.Authors, summary.AuthorsOverflow = nil, true
+	}
+	return summary, nil
 }

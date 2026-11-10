@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -27,90 +25,76 @@ var (
 	ackedSide = ackTable{name: "ackeds", owner: "to_ccid"}
 )
 
-// upsertAck is the CIP-10 §4 state move: only a document with a strictly
+func tableOf(side ucrecord.AckSide) ackTable {
+	if side == ucrecord.TargetSide {
+		return ackedSide
+	}
+	return ackSide
+}
+
+// ApplyAck is the CIP-10 §4 state move: only a document with a strictly
 // newer createdAt may move the (from, to, schema) state; an equal or older
-// one is a no-op (false). The key is createdAt alone — never the document
-// id — so the acker's and the associate owner's servers, which hold
-// different documents with the same createdAt, reach the same decision.
-// The state row is keyed by the document id (its commit), so a move is a
-// delete of the old row and an insert of the new one.
-func upsertAck(ctx context.Context, stx *spanner.ReadWriteTransaction, table ackTable, documentID, from, to, schema string, createdAt time.Time, valid bool) (bool, error) {
-	old, found, err := spannerdb.QueryOne[struct {
-		ID        string    `spanner:"id"`
-		CreatedAt time.Time `spanner:"created_at"`
-	}](ctx, stx, spanner.Statement{
-		SQL:    "SELECT id, created_at FROM " + table.name + " WHERE from_ccid = @from AND to_ccid = @to AND schema = @schema",
-		Params: map[string]any{"from": from, "to": to, "schema": schema},
-	})
-	if err != nil {
-		return false, err
-	}
-	if found {
-		if !createdAt.After(old.CreatedAt) {
-			return false, nil
-		}
-		if _, err := stx.Update(ctx, spanner.Statement{
-			SQL:    "DELETE FROM " + table.name + " WHERE id = @id",
-			Params: map[string]any{"id": old.ID},
-		}); err != nil {
-			return false, err
-		}
-	}
-	affected, err := stx.Update(ctx, spanner.Statement{
-		SQL: "INSERT OR IGNORE INTO " + table.name + ` (id, from_ccid, to_ccid, schema, valid, created_at, c_date)
-			VALUES (@id, @from, @to, @schema, @valid, @created_at, CURRENT_TIMESTAMP())`,
-		Params: map[string]any{"id": documentID, "from": from, "to": to, "schema": schema, "valid": valid, "created_at": createdAt},
-	})
-	if err != nil {
-		return false, err
-	}
-	return affected > 0, nil
-}
-
-func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
+// one is Stale. The key is createdAt alone — never the document id — so
+// the acker's and the associate owner's servers, which hold different
+// documents with the same createdAt, reach the same decision. The state row
+// is keyed by the document id (its commit), so a move is a delete of the
+// old row and an insert of the new one. The read locks the state (or its
+// absence), so the validity reported as the previous one is the one this
+// write replaced.
+func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAck")
 	defer span.End()
 
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		return false, err
-	}
-	moved, err := upsertAck(ctx, stx, ackSide, documentID, from, to, schema, createdAt, valid)
+	table := tableOf(commit.Side)
+	var outcome ucrecord.AckOutcome
+	status, err := r.apply(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.AckOutcome{}
+
+		read, err := readSet[struct {
+			Duplicate bool `spanner:"duplicate"`
+			States    []*struct {
+				ID        string    `spanner:"id"`
+				Valid     bool      `spanner:"valid"`
+				CreatedAt time.Time `spanner:"created_at"`
+			} `spanner:"states"`
+		}](ctx, tx, spanner.Statement{
+			SQL: "SELECT " + duplicateCommit + `, ARRAY(SELECT AS STRUCT id, valid, created_at FROM ` + table.name + `
+				WHERE from_ccid = @from AND to_ccid = @to AND schema = @schema) AS states`,
+			Params: map[string]any{"id": commit.ID, "from": commit.From, "to": commit.To, "schema": commit.Schema},
+		})
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if read.Duplicate {
+			return ucrecord.Duplicate, nil
+		}
+
+		insert, err := insertCommit(commit.Commit, false)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		mutations := []*spanner.Mutation{insert}
+		if len(read.States) > 0 {
+			state := read.States[0]
+			outcome.WasValid = state.Valid
+			if !commit.CreatedAt.After(state.CreatedAt) {
+				outcome.IsValid = state.Valid
+				return ucrecord.Stale, nil
+			}
+			mutations = append(mutations, spanner.Delete(table.name, spanner.Key{state.ID}))
+		}
+		outcome.IsValid = commit.Valid
+		mutations = append(mutations, spanner.Insert(table.name,
+			[]string{"id", "from_ccid", "to_ccid", "schema", "valid", "created_at", "c_date"},
+			[]any{commit.ID, commit.From, commit.To, commit.Schema, commit.Valid, commit.CreatedAt, time.Now().UTC()}))
+		return ucrecord.Applied, tx.BufferWrite(mutations)
+	})
 	if err != nil {
 		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
 	}
-	return moved, err
-}
-
-func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, true)
-}
-
-func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, false)
-}
-
-func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
-	defer span.End()
-
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		return false, err
-	}
-	moved, err := upsertAck(ctx, stx, ackedSide, documentID, from, to, schema, createdAt, valid)
-	if err != nil {
-		span.RecordError(err)
-	}
-	return moved, err
-}
-
-func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, true)
-}
-
-func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, false)
+	outcome.Status = status
+	return outcome, nil
 }
 
 // ackRecords lists the valid states of one side filtered by its owning

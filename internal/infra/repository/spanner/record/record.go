@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -11,6 +9,7 @@ import (
 	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
 
 	"cloud.google.com/go/spanner"
+	"github.com/google/uuid"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
@@ -18,142 +17,185 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-type recordKeyRow struct {
+// keyState is what ApplyRecord reads of a key row before deciding.
+type keyState struct {
 	URI             string     `spanner:"uri"`
-	ParentURI       *string    `spanner:"parent_uri"`
 	RecordID        *string    `spanner:"record_id"`
 	RecordCreatedAt *time.Time `spanner:"record_created_at"`
-	Redirect        *string    `spanner:"redirect"`
 	CleanOnUpdate   bool       `spanner:"clean_on_update"`
 }
 
-var recordKeyColumns = []string{"uri", "parent_uri", "record_id", "record_created_at", "redirect", "clean_on_update"}
-
-// readRecordKey reads the key row of uri; nil when there is none.
-func readRecordKey(ctx context.Context, q spannerdb.Reader, uri string) (*recordKeyRow, error) {
-	row, err := q.ReadRow(ctx, "record_keys", spanner.Key{uri}, recordKeyColumns)
-	if isNotFound(err) {
-		return nil, nil
+// distributionsOf is the value of the NOT NULL distributions column.
+func distributionsOf(commit ucrecord.RecordCommit) []string {
+	if commit.Distributions == nil {
+		return []string{}
 	}
-	if err != nil {
-		return nil, err
-	}
-	var rk recordKeyRow
-	if err := row.ToStruct(&rk); err != nil {
-		return nil, err
-	}
-	return &rk, nil
+	return commit.Distributions
 }
 
-func (r *Repository) CreateRecord(
-	ctx context.Context,
-	tx ucrecord.RepositoryTx,
-	documentID string,
-	key string,
-	owner string,
-	author string,
-	schema string,
-	onUpdate *string,
-	policies *string,
-	distributions []string,
-	redirect *string,
-	createdAt time.Time,
-) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateRecord")
+// replaceForgetting are the statements of an ApplyRecord that replaces the
+// version oldID and forgets it, in the order they must run: the commit, the
+// record interleaved in it, the key row moving on to that record, and only
+// then the old record and its gc flag.
+func replaceForgetting(commit ucrecord.RecordCommit, parent *string, cleanOnUpdate bool, oldID string) ([]spanner.Statement, error) {
+	proof, err := json.Marshal(commit.Proof)
+	if err != nil {
+		return nil, err
+	}
+	return []spanner.Statement{{
+		SQL: `INSERT INTO commit_logs (id, ip, document, proof, owner, gc_candidate, c_date)
+			VALUES (@id, @ip, @document, @proof, @owner, false, PENDING_COMMIT_TIMESTAMP())`,
+		Params: map[string]any{"id": commit.ID, "ip": commit.IP, "document": commit.Document, "proof": string(proof), "owner": commit.Owner},
+	}, {
+		SQL: `INSERT INTO records (id, owner, author, redirect, schema, policies, distributions, created_at, c_date)
+			VALUES (@id, @owner, @author, @redirect, @schema, @policies, @distributions, @created_at, @c_date)`,
+		Params: map[string]any{
+			"id": commit.ID, "owner": commit.Owner, "author": commit.Author, "redirect": commit.Redirect, "schema": commit.Schema,
+			"policies": commit.Policies, "distributions": distributionsOf(commit), "created_at": commit.CreatedAt, "c_date": time.Now().UTC(),
+		},
+	}, {
+		SQL: `UPDATE record_keys SET parent_uri = @parent_uri, record_id = @record_id, record_created_at = @record_created_at,
+			redirect = @redirect, clean_on_update = @clean_on_update WHERE uri = @uri`,
+		Params: map[string]any{
+			"uri": commit.Key, "parent_uri": parent, "record_id": commit.ID, "record_created_at": commit.CreatedAt,
+			"redirect": commit.Redirect, "clean_on_update": cleanOnUpdate,
+		},
+	}, {
+		SQL:    "UPDATE commit_logs SET gc_candidate = true WHERE id = @id",
+		Params: map[string]any{"id": oldID},
+	}, {
+		SQL:    "DELETE FROM records WHERE id = @id",
+		Params: map[string]any{"id": oldID},
+	}}, nil
+}
+
+// ApplyRecord reads the key row and those of all its ancestors in one
+// statement. The read locks them (a missing row included), so of two
+// commits to the same key, fresh or not, one is aborted and re-run on what
+// the other stored: CIP-3 §3.4 accept-if-newer is decided on a row no one
+// else can change before this transaction commits.
+func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordCommit) (ucrecord.RecordOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyRecord")
 	defer span.End()
 
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
+	// nearest ancestor first
+	var ancestors []string
+	for uri := commit.Key; ; {
+		parent, ok, err := repoutil.ParentURI(uri)
+		if err != nil {
+			span.RecordError(err)
+			return ucrecord.RecordOutcome{}, err
+		}
+		if !ok {
+			break
+		}
+		ancestors = append(ancestors, parent)
+		uri = parent
 	}
 
-	// CIP-3 §3.4 accept-if-newer on the document's createdAt: only a
-	// strictly newer document takes the key, an equal or older one is a
-	// no-op. The read takes a shared lock on the key row; a concurrent
-	// writer of the same key aborts one of the two transactions, which the
-	// client re-runs from the top.
-	oldRecordKey, err := readRecordKey(ctx, stx, key)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	if oldRecordKey != nil && oldRecordKey.RecordID != nil && oldRecordKey.RecordCreatedAt != nil && !createdAt.After(*oldRecordKey.RecordCreatedAt) {
-		return false, nil
-	}
+	var outcome ucrecord.RecordOutcome
+	status, err := r.apply(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.RecordOutcome{}
 
-	if distributions == nil {
-		distributions = []string{}
-	}
-	_, err = stx.Update(ctx, spanner.Statement{
-		SQL: `INSERT OR IGNORE INTO records (id, owner, author, redirect, schema, policies, distributions, created_at, c_date)
-			VALUES (@id, @owner, @author, @redirect, @schema, @policies, @distributions, @created_at, CURRENT_TIMESTAMP())`,
-		Params: map[string]any{
-			"id": documentID, "owner": owner, "author": author, "redirect": redirect, "schema": schema,
-			"policies": policies, "distributions": distributions, "created_at": createdAt,
-		},
+		read, err := readSet[struct {
+			Duplicate bool        `spanner:"duplicate"`
+			Keys      []*keyState `spanner:"keys"`
+		}](ctx, tx, spanner.Statement{
+			SQL: "SELECT " + duplicateCommit + `, ARRAY(SELECT AS STRUCT uri, record_id, record_created_at, clean_on_update
+				FROM record_keys WHERE uri IN UNNEST(@uris)) AS keys`,
+			Params: map[string]any{"id": commit.ID, "uris": append([]string{commit.Key}, ancestors...)},
+		})
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if read.Duplicate {
+			return ucrecord.Duplicate, nil
+		}
+		keys := make(map[string]*keyState, len(read.Keys))
+		for _, key := range read.Keys {
+			keys[key.URI] = key
+		}
+
+		// only a strictly newer document takes the key; a placeholder
+		// (RecordID nil) is taken by any
+		old := keys[commit.Key]
+		if old != nil && old.RecordID != nil && old.RecordCreatedAt != nil && !commit.CreatedAt.After(*old.RecordCreatedAt) {
+			return ucrecord.Stale, nil
+		}
+
+		outcome.FreshKey = old == nil || old.RecordID == nil
+		if !outcome.FreshKey {
+			outcome.PreviousID = *old.RecordID
+		}
+
+		// a placeholder for every ancestor up to the nearest one that
+		// exists, each the start of that key's incarnation
+		var mutations []*spanner.Mutation
+		for i, uri := range ancestors {
+			if keys[uri] != nil {
+				break
+			}
+			var parent *string
+			if i+1 < len(ancestors) {
+				parent = &ancestors[i+1]
+			}
+			mutations = append(mutations, spanner.Insert("record_keys",
+				[]string{"uri", "parent_uri", "clean_on_update", "gen"},
+				[]any{uri, parent, false, uuid.NewString()}))
+		}
+
+		var parent *string
+		if len(ancestors) > 0 {
+			parent = &ancestors[0]
+		}
+		cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
+
+		if !outcome.FreshKey && old.CleanOnUpdate {
+			// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
+			// Deleting a record takes the key row pointing at it along, and
+			// for buffered mutations Spanner decides that on the rows as
+			// they were before the transaction, where the key still points
+			// at the old record. So this case is written as DML, which
+			// runs in order: the key row moves on first, then the old
+			// record goes. The rows the key row and the record refer to
+			// must then be DML too (the foreign key and the interleaving
+			// are checked per statement).
+			statements, err := replaceForgetting(commit, parent, cleanOnUpdate, *old.RecordID)
+			if err != nil {
+				return ucrecord.Applied, err
+			}
+			if _, err := tx.BatchUpdate(ctx, statements); err != nil {
+				return ucrecord.Applied, err
+			}
+			return ucrecord.Applied, tx.BufferWrite(mutations)
+		}
+
+		insert, err := insertCommit(commit.Commit, false)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		keyColumns := []string{"uri", "parent_uri", "record_id", "record_created_at", "redirect", "clean_on_update"}
+		keyValues := []any{commit.Key, parent, commit.ID, commit.CreatedAt, commit.Redirect, cleanOnUpdate}
+		// an update leaves the row its gen: a record arriving on a
+		// placeholder, and one replacing a retained version, continue the
+		// incarnation
+		key := spanner.Update("record_keys", keyColumns, keyValues)
+		if old == nil {
+			key = spanner.Insert("record_keys", append(keyColumns, "gen"), append(keyValues, uuid.NewString()))
+		}
+		mutations = append(mutations, insert,
+			spanner.Insert("records",
+				[]string{"id", "owner", "author", "redirect", "schema", "policies", "distributions", "created_at", "c_date"},
+				[]any{commit.ID, commit.Owner, commit.Author, commit.Redirect, commit.Schema, commit.Policies, distributionsOf(commit), commit.CreatedAt, time.Now().UTC()}),
+			key)
+		return ucrecord.Applied, tx.BufferWrite(mutations)
 	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.RecordOutcome{}, err
 	}
-
-	parentURI, err := ensureParentRecordKeys(ctx, stx, key)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
-
-	// The conditional write closes the window two concurrent commits to a
-	// fresh key have (same as Postgres): only a strictly newer document may
-	// take the key. IS NULL keeps normal writes to parent placeholder rows
-	// (RecordID nil) working.
-	params := map[string]any{
-		"uri": key, "parent_uri": parentURI, "record_id": documentID, "record_created_at": createdAt,
-		"redirect": redirect, "clean_on_update": cleanOnUpdate,
-	}
-	var affected int64
-	if oldRecordKey == nil {
-		affected, err = stx.Update(ctx, spanner.Statement{
-			SQL: `INSERT OR IGNORE INTO record_keys (uri, parent_uri, record_id, record_created_at, redirect, clean_on_update)
-				VALUES (@uri, @parent_uri, @record_id, @record_created_at, @redirect, @clean_on_update)`,
-			Params: params,
-		})
-	} else {
-		affected, err = stx.Update(ctx, spanner.Statement{
-			SQL: `UPDATE record_keys SET parent_uri = @parent_uri, record_id = @record_id, record_created_at = @record_created_at, redirect = @redirect, clean_on_update = @clean_on_update
-				WHERE uri = @uri AND (record_id IS NULL OR record_created_at IS NULL OR record_created_at < @record_created_at)`,
-			Params: params,
-		})
-	}
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	if affected == 0 {
-		return false, nil
-	}
-
-	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
-	if oldRecordKey != nil && oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if _, err := stx.Update(ctx, spanner.Statement{
-			SQL:    "UPDATE commit_logs SET gc_candidate = true WHERE id = @id",
-			Params: map[string]any{"id": *oldRecordKey.RecordID},
-		}); err != nil {
-			span.RecordError(err)
-			return false, err
-		}
-		if _, err := stx.Update(ctx, spanner.Statement{
-			SQL:    "DELETE FROM records WHERE id = @id",
-			Params: map[string]any{"id": *oldRecordKey.RecordID},
-		}); err != nil {
-			span.RecordError(err)
-			return false, err
-		}
-	}
-
-	return true, nil
+	outcome.Status = status
+	return outcome, nil
 }
 
 func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
@@ -326,54 +368,26 @@ func (r *Repository) signedDocumentsByID(ctx context.Context, ids []string) (map
 	return out, nil
 }
 
-// DeleteRecordByKey deletes the record the key points at; the key row and
-// the associations targeting it cascade through the foreign keys, which
-// counts every one of them against the commit's mutation limit.
-func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
-	defer span.End()
-
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	_, err = stx.Update(ctx, spanner.Statement{
-		SQL:    "DELETE FROM records WHERE id IN (SELECT record_id FROM record_keys WHERE uri = @uri AND record_id IS NOT NULL)",
-		Params: map[string]any{"uri": targetURI},
-	})
-	return err
-}
-
-func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByDocumentID")
-	defer span.End()
-
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	_, err = stx.Update(ctx, spanner.Statement{
-		SQL:    "DELETE FROM records WHERE id = @id",
-		Params: map[string]any{"id": documentID},
-	})
-	return err
-}
-
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
 
-	rk, err := readRecordKey(ctx, r.client.Single(), keyURI)
+	row, err := r.client.Single().ReadRow(ctx, "record_keys", spanner.Key{keyURI}, []string{"parent_uri", "record_created_at", "redirect"})
+	if isNotFound(err) {
+		return "", "", domain.NotFoundError{Resource: keyURI}
+	}
 	if err != nil {
 		span.RecordError(err)
 		return "", "", err
 	}
-	if rk == nil {
-		return "", "", domain.NotFoundError{Resource: keyURI}
+	var rk struct {
+		ParentURI       *string    `spanner:"parent_uri"`
+		RecordCreatedAt *time.Time `spanner:"record_created_at"`
+		Redirect        *string    `spanner:"redirect"`
+	}
+	if err := row.ToStruct(&rk); err != nil {
+		span.RecordError(err)
+		return "", "", err
 	}
 
 	// only rows with a parent and a record_created_at appear in chunkline bodies
@@ -390,44 +404,4 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	}
 
 	return *rk.ParentURI, itemID, nil
-}
-
-// ensureParentRecordKeys creates the placeholder keys of uri's ancestors
-// that do not exist yet (root first, so a parent always precedes its
-// child) and returns uri's parent key, nil for a top-level key.
-func ensureParentRecordKeys(ctx context.Context, stx *spanner.ReadWriteTransaction, uri string) (*string, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ensureParentRecordKeys")
-	defer span.End()
-
-	parentURI, ok, err := repoutil.ParentURI(uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if !ok {
-		return nil, nil
-	}
-
-	existing, err := readRecordKey(ctx, stx, parentURI)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if existing != nil {
-		return &parentURI, nil
-	}
-
-	grandParentURI, err := ensureParentRecordKeys(ctx, stx, parentURI)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if _, err := stx.Update(ctx, spanner.Statement{
-		SQL:    "INSERT OR IGNORE INTO record_keys (uri, parent_uri, clean_on_update) VALUES (@uri, @parent_uri, false)",
-		Params: map[string]any{"uri": parentURI, "parent_uri": grandParentURI},
-	}); err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return &parentURI, nil
 }

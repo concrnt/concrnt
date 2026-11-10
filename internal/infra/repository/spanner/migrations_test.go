@@ -75,12 +75,43 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	steps := countMigrations(t, client)
-	require.Equal(t, int64(3), steps, "baseline, the ack index drop and the count cache tables")
+	require.Equal(t, int64(5), steps, "baseline, the ack index drop, the count cache tables, the association incarnations and the dropped cascade")
 	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
 
 	require.NoError(t, spannerrepo.Migrate(ctx, admin, client))
 	require.Equal(t, steps, countMigrations(t, client))
 	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
+
+	// a start that finds batches applied but not recorded (the process died
+	// in between) runs them again: the IF NOT EXISTS statements of batch 4
+	// change nothing, and batch 5, whose DROP CONSTRAINT cannot be repeated,
+	// sees through its Pending query that the constraint is gone
+	_, err := client.Apply(ctx, []*spanner.Mutation{spanner.Delete("schema_migrations", spanner.KeySets(spanner.Key{4}, spanner.Key{5}))})
+	require.NoError(t, err)
+	require.NoError(t, spannerrepo.Migrate(ctx, admin, client))
+	require.Equal(t, steps, countMigrations(t, client))
+	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
+	require.Equal(t, []string{"fk_entities_commit", "fk_record_keys_record"}, listForeignKeys(t, client),
+		"a key's associations no longer cascade from it")
+}
+
+func listForeignKeys(t *testing.T, client *spanner.Client) []string {
+	t.Helper()
+	it := client.Single().Query(context.Background(), spanner.Statement{SQL: `
+		SELECT CONSTRAINT_NAME FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+		WHERE TABLE_SCHEMA = '' AND CONSTRAINT_TYPE = 'FOREIGN KEY' ORDER BY CONSTRAINT_NAME`})
+	defer it.Stop()
+	var names []string
+	for {
+		row, err := it.Next()
+		if err == iterator.Done {
+			return names
+		}
+		require.NoError(t, err)
+		var name string
+		require.NoError(t, row.Column(0, &name))
+		names = append(names, name)
+	}
 }
 
 var expectedIndexes = []indexRow{
@@ -94,10 +125,10 @@ var expectedIndexes = []indexRow{
 	{"aggregate_deltas", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC, id ASC"},
 	{"aggregate_entries", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC"},
 	{"associations", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
-	{"associations", "idx_associations_target_schema_variant_author", "INDEX", false, false, "target_uri ASC, schema ASC, variant ASC, author ASC"},
-	{"associations", "idx_associations_target_schema_variant_created_at", "INDEX", false, false, "target_uri ASC, schema ASC, variant ASC, created_at ASC"},
-	{"associations", "idx_associations_target_uri", "INDEX", false, false, "target_uri ASC"},
-	{"associations", "uni_associations_unique", "INDEX", true, false, "unique_key ASC"},
+	{"associations", "idx_associations_target_gen_created_at", "INDEX", false, false, "target_uri ASC, target_gen ASC, created_at ASC"},
+	{"associations", "idx_associations_target_gen_schema_variant_author", "INDEX", false, false, "target_uri ASC, target_gen ASC, schema ASC, variant ASC, author ASC"},
+	{"associations", "idx_associations_target_gen_schema_variant_created_at", "INDEX", false, false, "target_uri ASC, target_gen ASC, schema ASC, variant ASC, created_at ASC"},
+	{"associations", "uni_associations_target_gen_unique", "INDEX", true, false, "target_uri ASC, target_gen ASC, unique_key ASC"},
 	{"commit_logs", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
 	{"commit_logs", "idx_commit_logs_c_date_id", "INDEX", false, false, "c_date ASC, id ASC"},
 	{"commit_logs", "idx_commit_logs_gc_candidate", "INDEX", false, false, "gc_candidate ASC"},

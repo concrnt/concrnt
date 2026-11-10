@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (

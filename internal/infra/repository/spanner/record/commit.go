@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -29,59 +27,28 @@ type commitLogRow struct {
 
 const commitLogSelect = "SELECT id, ip, document, proof, owner, gc_candidate, c_date FROM commit_logs"
 
-// CreateCommitLog stamps c_date with the commit timestamp, so the receive
-// order is the database's commit order; the column cannot be read again in
-// the same transaction.
-func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
-	defer span.End()
+// duplicateCommit is the subquery every Apply* read starts with: whether
+// the commit id is already in the log.
+const duplicateCommit = "EXISTS(SELECT 1 FROM commit_logs WHERE id = @id) AS duplicate"
 
-	stx, err := getRecordTx(tx)
+// insertCommit is the mutation of the commit log entry. c_date is the
+// commit timestamp, so the receive order is the database's commit order.
+// The caller has read that the id is not in the log yet (duplicateCommit).
+func insertCommit(commit ucrecord.Commit, gcCandidate bool) (*spanner.Mutation, error) {
+	proofBytes, err := json.Marshal(commit.Proof)
 	if err != nil {
-		span.RecordError(err)
-		return err
+		return nil, err
 	}
-
-	proofBytes, err := json.Marshal(proof)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	rows, err := stx.Update(ctx, spanner.Statement{
-		SQL: `INSERT OR IGNORE INTO commit_logs (id, ip, document, proof, owner, gc_candidate, c_date)
-			VALUES (@id, @ip, @document, @proof, @owner, false, PENDING_COMMIT_TIMESTAMP())`,
-		Params: map[string]any{"id": id, "ip": ip, "document": document, "proof": string(proofBytes), "owner": owner},
-	})
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-	if rows == 0 {
-		return ucrecord.ErrAlreadyCommitted
-	}
-	return nil
+	return spanner.Insert("commit_logs",
+		[]string{"id", "ip", "document", "proof", "owner", "gc_candidate", "c_date"},
+		[]any{commit.ID, commit.IP, commit.Document, string(proofBytes), commit.Owner, gcCandidate, spanner.CommitTimestamp}), nil
 }
 
-func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
-	defer span.End()
-
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	_, err = stx.Update(ctx, spanner.Statement{
-		SQL:    "UPDATE commit_logs SET gc_candidate = true WHERE id = @id",
-		Params: map[string]any{"id": documentID},
-	})
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-	return nil
+// markGcCandidate is the mutation flagging commit log id for `conctl op
+// gc-commitlog`. The row must exist: an update of a missing row fails the
+// commit.
+func markGcCandidate(id string) *spanner.Mutation {
+	return spanner.Update("commit_logs", []string{"id", "gc_candidate"}, []any{id, true})
 }
 
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
@@ -159,23 +126,36 @@ func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afte
 	return commitLogEntries(logs)
 }
 
-// deleteBatch bounds the rows one DeleteCommitLogs transaction removes:
-// the cascaded state rows and their index entries all count against the
-// commit's mutation limit.
+// deleteBatch bounds the commits one DeleteCommitLogs transaction removes.
+// A commit takes at most its record with the key row and their index
+// entries along (about a dozen mutations), so a batch stays far below the
+// commit's mutation limit whatever hangs off the keys.
 const deleteBatch = 100
 
 // DeleteCommitLogs deletes the commit logs in batches of deleteBatch, one
 // transaction each (the caller is offline tooling, so the batches need not
 // be atomic together); records, acks, ackeds and associations go with them
-// as interleaved children, entities and record keys (and those keys'
-// associations) through the foreign keys.
+// as interleaved children, entities and record keys through the foreign
+// keys. A key row removed this way ends the key's incarnation; there is no
+// one to hand a cleanup token to, so the associations it leaves behind are
+// removed here, page by page, once the batch is committed. A run
+// interrupted between the two leaves those rows unreadable and in place
+// for good, which costs their storage and nothing else.
 func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, error) {
 	deleted := 0
 	for start := 0; start < len(ids); start += deleteBatch {
 		batch := ids[start:min(start+deleteBatch, len(ids))]
 		var n int64
-		_, err := r.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
+		var ended []incarnation
+		err := r.write(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 			var err error
+			ended, err = spannerdb.QueryAll[incarnation](ctx, tx, spanner.Statement{
+				SQL:    "SELECT uri, gen FROM record_keys WHERE record_id IN UNNEST(@ids)",
+				Params: map[string]any{"ids": batch},
+			})
+			if err != nil {
+				return err
+			}
 			n, err = tx.Update(ctx, spanner.Statement{
 				SQL:    "DELETE FROM commit_logs WHERE id IN UNNEST(@ids)",
 				Params: map[string]any{"ids": batch},
@@ -186,6 +166,13 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 			return deleted, err
 		}
 		deleted += int(n)
+		for _, inc := range ended {
+			for more := true; more; {
+				if more, err = r.cleanupStep(ctx, inc); err != nil {
+					return deleted, err
+				}
+			}
+		}
 	}
 	return deleted, nil
 }
