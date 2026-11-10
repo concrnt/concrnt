@@ -60,12 +60,16 @@ type migration struct {
 //     ccfs-to-cckv lookups; idx_record_keys_parent_uri_uri (parent_uri, uri)
 //     QueryByParentOrderByKey including placeholders.
 //   - associations: PK (id) interleaved; every index starts with the
-//     incarnation (target_uri, target_gen): (.., created_at)
-//     GetAssociatedRecords in its own order and the Cleanup pages;
-//     (.., schema, variant, author) ComputeAssociationSummary and the
-//     filtered listings, (.., schema, variant, created_at) the filtered
-//     listings in order; UNIQUE (.., unique_key) one logical association
-//     per incarnation.
+//     incarnation (target_uri, target_gen) and the listing ones end with
+//     (created_at DESC, id DESC), the order a listing asks for unless told
+//     otherwise (an index is only read forwards: the other order reads the
+//     whole range and sorts): (.., created_at DESC, id DESC)
+//     GetAssociatedRecords without a filter and the Cleanup pages;
+//     (.., schema, variant, created_at DESC, id DESC) the listings filtered
+//     by schema and the counts of ComputeAssociationSummary;
+//     (.., author, created_at DESC, id DESC) the listings filtered by
+//     author and the authors of ComputeAssociationSummary;
+//     UNIQUE (.., unique_key) one logical association per incarnation.
 //   - acks / ackeds: PK (id) interleaved; UNIQUE (from_ccid, to_ccid, schema)
 //     the accept-if-newer state key; acks (from_ccid, valid, created_at) and
 //     ackeds (to_ccid, valid, created_at) the list and count lookups (acks
@@ -272,4 +276,28 @@ var migrations = []migration{
 		`ALTER TABLE associations DROP CONSTRAINT fk_associations_target`,
 	}, `SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
 		WHERE TABLE_SCHEMA = '' AND TABLE_NAME = 'associations' AND CONSTRAINT_NAME = 'fk_associations_target'`},
+	// an entry row is written once and never updated: the delta rows are
+	// folded into one of their own instead of into the entry (a fold that
+	// rewrites the entry row reads it under a lock every other fold and
+	// every replacement of the entry waits on), so the count of folded
+	// deltas lives in that row. DROP COLUMN has no IF EXISTS
+	{6, "aggregate_entries_drop_deltas", []string{
+		`ALTER TABLE aggregate_entries DROP COLUMN deltas`,
+	}, `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = '' AND TABLE_NAME = 'aggregate_entries' AND COLUMN_NAME = 'deltas'`},
+	// the listings read newest first by default and a client asks for its
+	// own associations on every message it shows: on the ascending indexes
+	// the first read every association of the target to sort them, the
+	// second read them all to find one author's. The descending indexes
+	// serve both with a seek; (schema, variant, author) has no reader left
+	// (the authors come from the author index), so an association still has
+	// four index entries
+	{7, "association_listing_indexes", []string{
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_created_at_desc ON associations (target_uri, target_gen, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_schema_variant_created_at_desc ON associations (target_uri, target_gen, schema, variant, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_author_created_at_desc ON associations (target_uri, target_gen, author, created_at DESC, id DESC)`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_created_at`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_schema_variant_created_at`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_schema_variant_author`,
+	}, ""},
 }

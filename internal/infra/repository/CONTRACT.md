@@ -292,6 +292,15 @@ How the usecase uses it (`aggregate/usecase.go`, `record/aggregates.go`):
   became part of the primary data may have missed it and gets the delta
   too (`AsOf` against the write's receipt time).
 - A dump replay (`import-commitlog`) invalidates instead of adding deltas.
+- Readers of one entry share reads (`aggregate/coalesce.go`). Clients
+  re-read a target's counts and their own associations when an event about
+  it arrives, so every session subscribed to a popular target asks for the
+  same entry within milliseconds. At most one `Get` of a key is in flight
+  per process; callers that arrive meanwhile wait for the read that starts
+  when it ends and share its result (and its one computation when the entry
+  is missing). A caller is never given a read that began before it asked,
+  so a write folded in before a request is always visible to it. The shared
+  `Counters` must not be modified by a caller.
 
 ### `usecase.EntityMetaRepository` (`internal/usecase/entitymeta.go`)
 
@@ -380,11 +389,17 @@ have to think about. None of it changes the contract's meaning.
   `IMMEDIATE` transaction). The usecase's reads happen before it, so a
   commit never holds a connection while waiting for another. The v1 rule
   that a transaction needs a second connection for its reads is gone, and
-  with it `backends.postgres.maxConcurrentTx`, the transaction slots and
-  the `concrnt_record_tx_slot*` metrics; a config that still sets
-  `maxConcurrentTx` loads and the key is ignored. The pool
-  (`backends.postgres.maxOpenConns`) needs no headroom beyond the
-  concurrency wanted.
+  with it `backends.postgres.maxConcurrentTx`; a config that still sets
+  `maxConcurrentTx` loads and the key is ignored.
+- Transactions do not take the whole pool. A transaction keeps its
+  connection for several round trips, a read for one, and `database/sql`
+  gives a freed connection to any waiter, so a burst of commits would take
+  every connection and leave each read waiting among them. Postgres admits `maxOpenConns / 2` `Apply*`
+  transactions at a time (derived from the pool, no setting; the wait is
+  `concrnt_record_tx_slot_wait_seconds` and holds no connection). SQLite
+  has one writer, so its `Apply*` calls take turns in-process before they
+  begin: the 8 pooled connections stay with the readers WAL lets run beside
+  the writer instead of being parked in `BEGIN IMMEDIATE`.
 - A `Stale` or `Duplicate` outcome rolls the transaction back, which is how
   it leaves no trace.
 - C11 is `ON DELETE CASCADE`: an association references the row of its
@@ -408,7 +423,10 @@ have to think about. None of it changes the contract's meaning.
   children stay listed. Neither suite asserts either behaviour.
 - The aggregate store on Postgres is one row per entry with jsonb counters;
   `Add` is a single `UPDATE` (writers of one key queue on the row lock for
-  the length of that statement). Migration step 6 drops and recreates
+  the length of that statement and its commit: measured at 32 writers on
+  one key, 0.4 ms per `Add` with 50 members and 1 ms with 900, i.e. a
+  thousand or more per second and key).
+  Migration step 6 drops and recreates
   `aggregate_entries` in the new shape. SQLite has no aggregate store of
   its own and defaults to Redis.
 - `postgres/README.md` has the index notes (prefix scans, collation).
@@ -477,10 +495,39 @@ have to think about. None of it changes the contract's meaning.
 - The aggregate store is a delta log: `aggregate_entries` holds an entry as
   computed and `aggregate_deltas`, interleaved in it, one row per `Add` (an
   insert that reads nothing; the parent row it requires is the "live entry"
-  check). `Get` reads the entry with its delta rows and folds them, and
-  folds them into the entry row for good once there are more than 64.
-  Expired entries go with their deltas by the row deletion policy. Schema
-  batch 3 drops and recreates both tables.
+  check). `Get` reads the entry with its delta rows in one statement (a
+  seek of the entry row and of the rows interleaved under it) and folds
+  them; once there are more than 64 it replaces them by one delta row
+  holding their sum and the number of `Add`s it stands for. Expired entries
+  go with their deltas by the row deletion policy. Schema batch 3 drops and
+  recreates both tables, batch 6 drops `aggregate_entries.deltas` (the
+  count of folded deltas, now in the sum row).
+- No write of the aggregate store reads in a transaction. A transaction
+  that reads a row and then writes it has to turn its shared lock into an
+  exclusive one, and several doing so on one row abort each other: with
+  `PutIfAbsent` and the fold written that way, the readers of a popular
+  target (all finding the entry missing, or all finding it due for a fold)
+  made 16 % of all commits end `ABORTED` and waited on each other's locks
+  (load test of 2026-11-11). So the entry row is written once, by an insert
+  that fails `ALREADY_EXISTS` for every caller but one, and is never
+  updated; the fold is one commit of mutations that updates every row it
+  folds before deleting it, so it fails as a whole (`NOT_FOUND`, a no-op)
+  when another fold took one of its rows first, and a process folds a key
+  once at a time. Only the replacement of an entry that has expired and is
+  not collected yet is a read-write transaction. These refused commits are
+  the expected outcome of a race and show up as errors on the `Commit`
+  span; `ABORTED` there is what should stay at zero.
+- Every statement on `associations` names its index (`FORCE_INDEX`), so the
+  range it reads, and inside `ApplyAssociation` the range it locks (one
+  entry of the unique index), does not depend on the optimizer's
+  statistics. Spanner reads an index forwards only: the listing indexes end
+  with `(created_at DESC, id DESC)`, which makes the default order (`desc`)
+  a seek that reads the page; `asc`, and a schema filter without a variant,
+  read the whole range the filters leave and sort it. The index beginning
+  with `author` serves the listing a client issues for every message it
+  shows (its own associations on the target). Schema batch 7 builds the
+  three descending indexes and drops the ascending ones and `(schema,
+  variant, author)`; an association still has four index entries.
 - Time-ordered primary keys (CDIDs) are written to monotonically increasing
   key ranges; no sharding at this scale. Adding a shard column later is a
   DDL batch plus the key predicates, nothing in the contract.

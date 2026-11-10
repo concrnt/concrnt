@@ -75,7 +75,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	steps := countMigrations(t, client)
-	require.Equal(t, int64(5), steps, "baseline, the ack index drop, the count cache tables, the association incarnations and the dropped cascade")
+	require.Equal(t, int64(7), steps, "baseline, the ack index drop, the count cache tables, the association incarnations, the dropped cascade, the dropped count column and the listing indexes")
 	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
 
 	require.NoError(t, spannerrepo.Migrate(ctx, admin, client))
@@ -83,10 +83,11 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
 
 	// a start that finds batches applied but not recorded (the process died
-	// in between) runs them again: the IF NOT EXISTS statements of batch 4
-	// change nothing, and batch 5, whose DROP CONSTRAINT cannot be repeated,
-	// sees through its Pending query that the constraint is gone
-	_, err := client.Apply(ctx, []*spanner.Mutation{spanner.Delete("schema_migrations", spanner.KeySets(spanner.Key{4}, spanner.Key{5}))})
+	// in between) runs them again: the IF [NOT] EXISTS statements of
+	// batches 4 and 7 change nothing, and batches 5 and 6, whose DROP
+	// CONSTRAINT and DROP COLUMN cannot be repeated, see through their
+	// Pending queries that the constraint and the column are gone
+	_, err := client.Apply(ctx, []*spanner.Mutation{spanner.Delete("schema_migrations", spanner.KeySets(spanner.Key{4}, spanner.Key{5}, spanner.Key{6}, spanner.Key{7}))})
 	require.NoError(t, err)
 	require.NoError(t, spannerrepo.Migrate(ctx, admin, client))
 	require.Equal(t, steps, countMigrations(t, client))
@@ -125,9 +126,9 @@ var expectedIndexes = []indexRow{
 	{"aggregate_deltas", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC, id ASC"},
 	{"aggregate_entries", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC"},
 	{"associations", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
-	{"associations", "idx_associations_target_gen_created_at", "INDEX", false, false, "target_uri ASC, target_gen ASC, created_at ASC"},
-	{"associations", "idx_associations_target_gen_schema_variant_author", "INDEX", false, false, "target_uri ASC, target_gen ASC, schema ASC, variant ASC, author ASC"},
-	{"associations", "idx_associations_target_gen_schema_variant_created_at", "INDEX", false, false, "target_uri ASC, target_gen ASC, schema ASC, variant ASC, created_at ASC"},
+	{"associations", "idx_associations_target_gen_author_created_at_desc", "INDEX", false, false, "target_uri ASC, target_gen ASC, author ASC, created_at DESC, id DESC"},
+	{"associations", "idx_associations_target_gen_created_at_desc", "INDEX", false, false, "target_uri ASC, target_gen ASC, created_at DESC, id DESC"},
+	{"associations", "idx_associations_target_gen_schema_variant_created_at_desc", "INDEX", false, false, "target_uri ASC, target_gen ASC, schema ASC, variant ASC, created_at DESC, id DESC"},
 	{"associations", "uni_associations_target_gen_unique", "INDEX", true, false, "target_uri ASC, target_gen ASC, unique_key ASC"},
 	{"commit_logs", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
 	{"commit_logs", "idx_commit_logs_c_date_id", "INDEX", false, false, "c_date ASC, id ASC"},

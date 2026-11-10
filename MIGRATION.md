@@ -40,18 +40,27 @@ and what Firestore and the count caches store. Per backend:
 - **Postgres**: start the new version; migration step 6 drops and
   recreates `aggregate_entries` (a cache, it refills on demand). The record
   tables are unchanged. `backends.postgres.maxConcurrentTx` no longer
-  exists: a config that still sets it loads and the key is ignored, and the
-  `concrnt_record_tx_slot*` metrics are gone with it (remove them from
-  dashboards and alerts). A commit takes one connection, so
-  `backends.postgres.maxOpenConns` is simply the concurrency wanted.
+  exists: a config that still sets it loads and the key is ignored. A
+  commit takes one connection, and at most half of
+  `backends.postgres.maxOpenConns` are given to commits at once so that
+  reads keep the rest: size the pool with that one setting. Of the
+  `concrnt_record_tx_slot*` metrics only the histogram
+  `concrnt_record_tx_slot_wait_seconds` remains; `concrnt_record_tx_slots`
+  and `concrnt_record_tx_slots_in_use` are gone (remove them from
+  dashboards and alerts).
 - **SQLite**: nothing to do.
 - **Spanner**: start the new version; it applies schema batches 3
   (`aggregate_entries` recreated, `aggregate_deltas` added), 4
   (`record_keys.gen`, `associations.target_gen`, the association indexes
-  rebuilt on `(target_uri, target_gen, ...)`) and 5 (the foreign key from
-  associations to their target key dropped). All in place, no backfill;
-  the index builds of batch 4 take time proportional to the number of
-  associations and the server waits for them at start. Removing a key no
+  rebuilt on `(target_uri, target_gen, ...)`), 5 (the foreign key from
+  associations to their target key dropped), 6 (`aggregate_entries.deltas`
+  dropped) and 7 (the association listing indexes rebuilt in descending
+  `created_at` order, one beginning with `author` added, `(schema, variant,
+  author)` dropped). All in place, no backfill; the index builds of batches
+  4 and 7 take time proportional to the number of associations and the
+  server waits for them at start. Processes of a version from before batch
+  6 cannot read the count cache once the column is gone: stop them before
+  the new version starts instead of rolling. Removing a key no
   longer deletes its associations in the same commit: `RecordCleanup` jobs
   remove them afterwards, so the job queue must be running.
 - **Firestore**: the stored model changed (documents embedded in

@@ -3,6 +3,8 @@ package spanner_test
 import (
 	"context"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,8 +40,9 @@ func countDeltaRows(t *testing.T, client *gspanner.Client) int64 {
 }
 
 // An Add is a delta row; a Get that finds more of them than it tolerates
-// folds them into the entry row. The entry reads the same before and after,
-// and the rows are gone with the entry.
+// replaces them by one row holding their sum. The entry reads the same
+// before and after (the sum counts for the Adds it stands for), and the
+// rows are gone with the entry.
 func TestSpannerStoreCompactsDeltaRows(t *testing.T) {
 	ctx := context.Background()
 	client, _ := testutil.CreateSpanner(t)
@@ -77,13 +80,88 @@ func TestSpannerStoreCompactsDeltaRows(t *testing.T) {
 
 	add(few, many)
 	read(many)
-	require.Zero(t, countDeltaRows(t, client), "the read folded the delta rows into the entry")
+	require.EqualValues(t, 1, countDeltaRows(t, client), "the read folded the delta rows into one")
 	read(many)
 
 	add(many, many+few)
 	read(many + few)
-	require.EqualValues(t, few, countDeltaRows(t, client))
+	require.EqualValues(t, 1+few, countDeltaRows(t, client))
+
+	// the sum is a delta row like any other: the next fold takes it along
+	add(many+few, 2*many)
+	read(2 * many)
+	require.EqualValues(t, 1, countDeltaRows(t, client))
+	read(2 * many)
 
 	require.NoError(t, s.Invalidate(ctx, "counts:a"))
 	require.Zero(t, countDeltaRows(t, client), "the delta rows go with their entry")
+}
+
+// Two folds of the same delta rows, as two server processes reading one
+// entry at the same moment start them: the second finds the rows taken and
+// changes nothing, so no Add is counted twice.
+func TestSpannerStoreConcurrentFoldsCountOnce(t *testing.T) {
+	ctx := context.Background()
+	client, _ := testutil.CreateSpanner(t)
+	// one store per process: a store folds a key once at a time by itself
+	stores := []*spanner.Store{spanner.New(client), spanner.New(client), spanner.New(client), spanner.New(client)}
+
+	won, err := stores[0].PutIfAbsent(ctx, "counts:folded", aggregate.Counters{AsOf: time.Now()}, time.Hour)
+	require.NoError(t, err)
+	require.True(t, won)
+
+	const adds = 150
+	for i := range adds {
+		ok, err := stores[0].Add(ctx, "counts:folded", aggregate.Delta{Inc: map[string]int64{"x": 1}, AddMembers: []string{time.Duration(i).String()}})
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	for round := range 3 {
+		var wg sync.WaitGroup
+		for _, s := range stores {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got, ok, err := s.Get(ctx, "counts:folded")
+				if err != nil || !ok || got.Counts["x"] != adds || got.Deltas != adds || len(got.Members) != adds {
+					t.Errorf("round %d: %+v, %v, %v", round, got, ok, err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	require.EqualValues(t, 1, countDeltaRows(t, client))
+}
+
+// PutIfAbsent with several callers at once, as the readers that found the
+// entry missing offer what they computed: exactly one stores, the others
+// are told so, and none of them waits for another.
+func TestSpannerStoreConcurrentPutIfAbsentHasOneWinner(t *testing.T) {
+	ctx := context.Background()
+	client, _ := testutil.CreateSpanner(t)
+	s := spanner.New(client)
+
+	const callers = 16
+	var winners atomic.Int32
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			won, err := s.PutIfAbsent(ctx, "counts:raced", aggregate.Counters{Counts: map[string]int64{"x": int64(i)}, AsOf: time.Now()}, time.Hour)
+			if err != nil {
+				t.Errorf("caller %d: %v", i, err)
+			}
+			if won {
+				winners.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	require.EqualValues(t, 1, winners.Load())
+
+	_, ok, err := s.Get(ctx, "counts:raced")
+	require.NoError(t, err)
+	require.True(t, ok)
 }
