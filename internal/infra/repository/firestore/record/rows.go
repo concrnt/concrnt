@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -10,15 +8,9 @@ import (
 
 	"github.com/concrnt/concrnt"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
-
-// getAllBatch is the chunk size for BatchGetDocuments: commit documents are
-// up to 32 KiB, and a response must stay under Firestore's 10 MiB limit.
-const getAllBatch = 100
-
-// inBatch is Firestore's cap on the disjunctions of one "in" filter.
-const inBatch = 30
 
 // direction maps the repository's order string ("desc", anything else asc).
 func direction(order string) firestore.Direction {
@@ -46,64 +38,16 @@ func applyWindow(q firestore.Query, tsField string, idField string, since, until
 	return q
 }
 
-// getDoc reads one document outside a transaction; missing is (nil, false, nil).
-func (r *Repository) getDoc(ctx context.Context, ref *firestore.DocumentRef) (map[string]any, bool, error) {
-	snap, err := ref.Get(ctx)
+// getKey reads one key outside a transaction; nil when it does not exist.
+func (r *Repository) getKey(ctx context.Context, uri string) (*recordKeyDoc, error) {
+	snap, err := r.col(fs.ColRecordKeys).Doc(keyID(uri)).Get(ctx)
 	if err != nil {
 		if fs.IsNotFound(err) {
-			return nil, false, nil
+			return nil, nil
 		}
-		return nil, false, err
-	}
-	if !snap.Exists() {
-		return nil, false, nil
-	}
-	return snap.Data(), true, nil
-}
-
-// getAll reads documents by reference in batches outside a transaction;
-// missing ones are absent from the result.
-func (r *Repository) getAll(ctx context.Context, refs []*firestore.DocumentRef) (map[string]map[string]any, error) {
-	out := make(map[string]map[string]any, len(refs))
-	for start := 0; start < len(refs); start += getAllBatch {
-		snaps, err := r.client.GetAll(ctx, refs[start:min(start+getAllBatch, len(refs))])
-		if err != nil {
-			return nil, err
-		}
-		for _, snap := range snaps {
-			if snap.Exists() {
-				out[snap.Ref.ID] = snap.Data()
-			}
-		}
-	}
-	return out, nil
-}
-
-// getCommits batch-fetches commits/{id}; commits that no longer exist are
-// absent from the result (the SQL backends would have dropped their rows by
-// cascade).
-func (r *Repository) getCommits(ctx context.Context, ids []string) (map[string]commitDoc, error) {
-	refs := make([]*firestore.DocumentRef, 0, len(ids))
-	for _, id := range ids {
-		refs = append(refs, r.col(fs.ColCommits).Doc(id))
-	}
-	docs, err := r.getAll(ctx, refs)
-	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]commitDoc, len(docs))
-	for id, m := range docs {
-		out[id] = commitFromMap(m)
-	}
-	return out, nil
-}
-
-func (r *Repository) getKey(ctx context.Context, uri string) (*recordKeyDoc, error) {
-	m, exists, err := r.getDoc(ctx, r.col(fs.ColRecordKeys).Doc(keyID(uri)))
-	if err != nil || !exists {
-		return nil, err
-	}
-	key := recordKeyFromMap(m)
+	key := recordKeyFromMap(snap.Data())
 	return &key, nil
 }
 
@@ -121,42 +65,39 @@ func decodeKeys(snaps []*firestore.DocumentSnapshot, recordsOnly bool) []recordK
 	return keys
 }
 
-// keysToQueryRows resolves the commit of every listed key and builds the
-// rows in the keys' order, carrying recordCreatedAt as the sort key. A
-// placeholder key becomes a key-only row holding just its cckv (CIP-5
-// §3.2.1); a key whose commit is gone is skipped.
-func (r *Repository) keysToQueryRows(ctx context.Context, keys []recordKeyDoc) ([]ucrecord.QueryRow, error) {
-	ids := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if !k.isPlaceholder() {
-			ids = append(ids, k.RecordID)
-		}
-	}
-	commits, err := r.getCommits(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
+// signedDocument builds the signed document of a key holding a record from
+// the key alone.
+func (d recordKeyDoc) signedDocument() (concrnt.SignedDocument, error) {
+	return repoutil.RecordDocument(d.URI, d.Owner, d.RecordID, d.Document, d.Proof)
+}
 
+// keyRows builds the listing rows of keys in their order, carrying
+// recordCreatedAt as the sort key. A placeholder key becomes a key-only row
+// holding just its cckv (CIP-5 §3.2.1).
+func keyRows(keys []recordKeyDoc) ([]ucrecord.QueryRow, error) {
 	rows := make([]ucrecord.QueryRow, 0, len(keys))
 	for _, k := range keys {
-		uri := k.URI
 		if k.isPlaceholder() {
+			uri := k.URI
 			rows = append(rows, ucrecord.QueryRow{Row: concrnt.SignedDocument{CCKV: &uri}})
 			continue
 		}
-		commit, ok := commits[k.RecordID]
-		if !ok {
-			continue
-		}
-		proof, err := commit.proof()
+		sd, err := k.signedDocument()
 		if err != nil {
 			return nil, err
 		}
-		ccfs := concrnt.ComposeCCFSURI(k.Owner, concrnt.CCFSTypeConcrnt, k.RecordID)
-		rows = append(rows, ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{CCKV: &uri, CCFS: &ccfs, Document: commit.Document, Proof: proof},
-			CreatedAt: *k.RecordCreatedAt,
-		})
+		rows = append(rows, ucrecord.QueryRow{Row: sd, CreatedAt: *k.RecordCreatedAt})
 	}
 	return rows, nil
+}
+
+// commitRow builds the listing row of a state document (association, ack)
+// from the signed document it carries; owner is the namespace its ccfs URI
+// is composed in.
+func commitRow(owner, id, document, proof string, createdAt time.Time) (ucrecord.QueryRow, error) {
+	sd, err := repoutil.CommitDocument(owner, id, document, proof)
+	if err != nil {
+		return ucrecord.QueryRow{}, err
+	}
+	return ucrecord.QueryRow{Row: sd, CreatedAt: createdAt}, nil
 }

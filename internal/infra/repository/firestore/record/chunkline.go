@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -24,19 +22,30 @@ const (
 
 // children is the item query of a timeline: the keys whose parentURI is
 // the timeline, newest first when desc. Placeholders have no
-// recordCreatedAt and so never appear.
+// recordCreatedAt and so never appear. A chunkline view needs none of the
+// embedded document, so the query is projected to the item fields (and
+// recordID, which a cursor on this ordering takes from the snapshot).
 func (r *Repository) children(parentURI string, dir firestore.Direction) firestore.Query {
 	return r.col(fs.ColRecordKeys).
 		Where("parentURI", "==", parentURI).
 		OrderBy("recordCreatedAt", dir).
-		OrderBy("recordID", dir)
+		OrderBy("recordID", dir).
+		Select("uri", "redirect", "recordCreatedAt", "recordID")
 }
 
+// GetChunklineManifest asks for the timeline's earliest item and, in
+// parallel, for the timeline's key: an empty timeline and a missing one
+// only differ in the latter.
 func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	key, err := r.getKey(ctx, uri)
+	var snaps []*firestore.DocumentSnapshot
+	key, err := r.withKey(ctx, uri, func(ctx context.Context) error {
+		var err error
+		snaps, err = r.children(uri, firestore.Asc).Limit(1).Documents(ctx).GetAll()
+		return fs.QueryErr(err)
+	})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -48,11 +57,6 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	}
 
 	var firstChunk *int64
-	snaps, err := r.children(uri, firestore.Asc).Limit(1).Select("recordCreatedAt").Documents(ctx).GetAll()
-	if err != nil {
-		span.RecordError(err)
-		return nil, fs.QueryErr(err)
-	}
 	if len(snaps) == 1 {
 		if ts, ok := timeAt(snaps[0].Data(), "recordCreatedAt"); ok {
 			chunk := ts.Unix() / repoutil.ChunkSize
@@ -64,37 +68,30 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 }
 
 // LookupLocalItrs finds, per timeline, the chunk holding the newest item at
-// or before the requested chunk: one batch read of the timeline keys, then
-// one top-1 query per existing timeline, run in parallel. Timelines without
-// a key or without such an item are absent.
+// or before the requested chunk: one top-1 query per timeline, run in
+// parallel with each other and with one batch read of the timeline keys.
+// Timelines without a key or without such an item are absent.
 func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
 	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
 
-	refs := make([]*firestore.DocumentRef, 0, len(uris))
+	keys := newReadSet()
 	for _, uri := range uris {
-		refs = append(refs, r.col(fs.ColRecordKeys).Doc(keyID(uri)))
-	}
-	keys, err := r.getAll(ctx, refs)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+		keys.add(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
 	}
 
 	var mu sync.Mutex
-	lookup := make(map[string]int64)
+	found := make(map[string]int64)
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(lookupConcurrency)
+	g.Go(func() error { return keys.load(gctx, r.client) })
 	for _, uri := range uris {
-		if _, ok := keys[keyID(uri)]; !ok {
-			continue
-		}
 		g.Go(func() error {
 			snaps, err := r.children(uri, firestore.Desc).
 				Where("recordCreatedAt", "<", cutoff).
-				Limit(1).Select("recordCreatedAt").
+				Limit(1).
 				Documents(gctx).GetAll()
 			if err != nil {
 				return fs.QueryErr(err)
@@ -107,7 +104,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 				return nil
 			}
 			mu.Lock()
-			lookup[uri] = ts.Unix() / repoutil.ChunkSize
+			found[uri] = ts.Unix() / repoutil.ChunkSize
 			mu.Unlock()
 			return nil
 		})
@@ -116,9 +113,24 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 		span.RecordError(err)
 		return nil, err
 	}
+
+	lookup := make(map[string]int64, len(found))
+	for uri, chunk := range found {
+		if _, exists := keys.data(r.col(fs.ColRecordKeys).Doc(keyID(uri))); exists {
+			lookup[uri] = chunk
+		}
+	}
 	return lookup, nil
 }
 
+// LoadLocalBody reads the newest page of items before the chunk's end, in
+// parallel with the timeline's key (an empty timeline and a missing one
+// only differ there). That page is the body unless the window (the chunk
+// and the one before it) holds more than a page: then the rest of the
+// window is read from where the page stopped, so no item is read twice.
+// The SQL backends unite both in one statement; here a second query would
+// have to re-read the page, and a window of more than a page is the rare
+// case that pays the second round trip instead.
 func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
@@ -126,7 +138,13 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
 	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
 
-	key, err := r.getKey(ctx, uri)
+	base := r.children(uri, firestore.Desc).Where("recordCreatedAt", "<", chunkDate)
+	var snaps []*firestore.DocumentSnapshot
+	key, err := r.withKey(ctx, uri, func(ctx context.Context) error {
+		var err error
+		snaps, err = base.Limit(defaultChunkSize).Documents(ctx).GetAll()
+		return fs.QueryErr(err)
+	})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -137,36 +155,35 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		return nil, err
 	}
 
-	base := r.children(uri, firestore.Desc).Where("recordCreatedAt", "<", chunkDate)
-	snaps, err := base.Limit(defaultChunkSize).Documents(ctx).GetAll()
-	if err != nil {
-		span.RecordError(err)
-		return nil, fs.QueryErr(err)
-	}
-	members := decodeKeys(snaps, true)
-
-	// Judge window coverage by recordCreatedAt, the field the queries filter
-	// and order by. If the newest 32 items do not reach back past the
-	// previous chunk, load the whole window instead.
-	if len(members) == 0 || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
-		snaps, err = base.Where("recordCreatedAt", ">=", prevChunkDate).Documents(ctx).GetAll()
-		if err != nil {
-			span.RecordError(err)
-			return nil, fs.QueryErr(err)
+	// a full page whose oldest item is still inside the window: the window
+	// goes on past it
+	if len(snaps) == defaultChunkSize {
+		last := snaps[len(snaps)-1]
+		if ts, ok := timeAt(last.Data(), "recordCreatedAt"); ok && !ts.Before(prevChunkDate) {
+			rest, err := base.Where("recordCreatedAt", ">=", prevChunkDate).StartAfter(last).Documents(ctx).GetAll()
+			if err != nil {
+				span.RecordError(err)
+				return nil, fs.QueryErr(err)
+			}
+			snaps = append(snaps, rest...)
 		}
-		members = decodeKeys(snaps, true)
 	}
 
 	// every field a body item needs is on the key (redirect and
-	// recordCreatedAt are denormalised there), so no record is read
-	bodyItems := make([]chunkline.BodyItem, 0, len(members))
-	for _, member := range members {
-		href := member.URI
-		if member.Redirect != "" {
-			href = member.Redirect
+	// recordCreatedAt are denormalised there)
+	bodyItems := make([]chunkline.BodyItem, 0, len(snaps))
+	for _, snap := range snaps {
+		m := snap.Data()
+		ts, ok := timeAt(m, "recordCreatedAt")
+		if !ok {
+			continue
+		}
+		href := str(m, "uri")
+		if redirect := str(m, "redirect"); redirect != "" {
+			href = redirect
 		}
 		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   *member.RecordCreatedAt,
+			Timestamp:   ts.UTC(),
 			Href:        href,
 			ContentType: "application/concrnt.document+json",
 		})

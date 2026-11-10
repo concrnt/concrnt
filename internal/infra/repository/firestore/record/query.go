@@ -1,5 +1,3 @@
-//go:build contractv1
-
 package record
 
 import (
@@ -63,7 +61,7 @@ func (r *Repository) QueryByParent(
 		span.RecordError(err)
 		return nil, fs.QueryErr(err)
 	}
-	return r.keysToQueryRows(ctx, decodeKeys(snaps, true))
+	return keyRows(decodeKeys(snaps, true))
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
@@ -104,7 +102,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		span.RecordError(err)
 		return nil, fs.QueryErr(err)
 	}
-	return r.keysToQueryRows(ctx, decodeKeys(snaps, false))
+	return keyRows(decodeKeys(snaps, false))
 }
 
 // prefixOverfetch is the page size used while post-filtering a non-directory
@@ -114,8 +112,12 @@ const prefixOverfetch = 64
 // QueryByPrefix serves "uri LIKE prefix%". The prefix is split at its last
 // '/' into the directory that every match lives under, matched with
 // array-contains on the key's ancestors, and an optional last-segment prefix
-// that is checked client-side. A prefix without an owner and path (the
-// all-owners LIKE) is rejected: it has no indexed form.
+// that Firestore cannot combine with the createdAt ordering and is checked
+// here. A directory prefix (ending in '/') is therefore one query. One
+// ending inside a segment is one query too when it is unbounded or its
+// first page (overfetched) holds enough matches, and reads on otherwise. A
+// prefix without an owner and path (the all-owners LIKE) is rejected: it
+// has no indexed form.
 func (r *Repository) QueryByPrefix(
 	ctx context.Context,
 	prefix, schema, author string,
@@ -139,15 +141,22 @@ func (r *Repository) QueryByPrefix(
 	q := recordFilters(r.col(fs.ColRecordKeys).Where("ancestors", "array-contains", dir), schema, author)
 	q = applyWindow(q, "recordCreatedAt", "recordID", since, until, 0, order)
 
-	page := limit
-	if page <= 0 || !exact {
-		page = max(limit*2, prefixOverfetch)
+	// page 0 reads everything in one go
+	page := 0
+	if limit > 0 {
+		page = limit
+		if !exact {
+			page = max(limit*2, prefixOverfetch)
+		}
 	}
 
 	keys := []recordKeyDoc{}
 	var last *firestore.DocumentSnapshot
 	for {
-		pq := q.Limit(page)
+		pq := q
+		if page > 0 {
+			pq = pq.Limit(page)
+		}
 		if last != nil {
 			pq = pq.StartAfter(last)
 		}
@@ -161,7 +170,7 @@ func (r *Repository) QueryByPrefix(
 				keys = append(keys, k)
 			}
 		}
-		if len(snaps) < page || (limit > 0 && len(keys) >= limit) {
+		if page == 0 || len(snaps) < page || len(keys) >= limit {
 			break
 		}
 		last = snaps[len(snaps)-1]
@@ -170,7 +179,7 @@ func (r *Repository) QueryByPrefix(
 		keys = keys[:limit]
 	}
 
-	return r.keysToQueryRows(ctx, keys)
+	return keyRows(keys)
 }
 
 // QueryRecordSubtree returns every live record whose key is base itself
@@ -178,56 +187,61 @@ func (r *Repository) QueryByPrefix(
 // order) so base leads; afterURI and limit page it. The subtree is the byte
 // range [base+"/", base+"0") ('0' is the byte after '/'), so sibling keys
 // ("item2" for "item") never match. The second ordering field drops
-// placeholder keys, which lack it.
+// placeholder keys, which lack it. Base itself lies outside that range
+// (keys such as "item-2" sort between it and its subtree), so it is read
+// by id in parallel with the range query.
 func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
+	q := r.col(fs.ColRecordKeys).Query
+	if afterURI > base+"/" {
+		q = q.Where("uri", ">", afterURI)
+	} else {
+		q = q.Where("uri", ">=", base+"/")
+	}
+	q = q.Where("uri", "<", base+"0").
+		OrderBy("uri", firestore.Asc).
+		OrderBy("recordCreatedAt", firestore.Asc)
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+
+	var snaps []*firestore.DocumentSnapshot
+	subtree := func(ctx context.Context) error {
+		var err error
+		snaps, err = q.Documents(ctx).GetAll()
+		return fs.QueryErr(err)
+	}
+
 	keys := []recordKeyDoc{}
+	var err error
 	if includeSelf && afterURI < base {
-		self, err := r.getKey(ctx, base)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+		var self *recordKeyDoc
+		self, err = r.withKey(ctx, base, subtree)
 		if self != nil && !self.isPlaceholder() {
 			keys = append(keys, *self)
 		}
+	} else {
+		err = subtree(ctx)
 	}
-
-	remaining := 0
-	if limit > 0 {
-		remaining = limit - len(keys)
-	}
-	if limit <= 0 || remaining > 0 {
-		q := r.col(fs.ColRecordKeys).Query
-		if afterURI > base+"/" {
-			q = q.Where("uri", ">", afterURI)
-		} else {
-			q = q.Where("uri", ">=", base+"/")
-		}
-		q = q.Where("uri", "<", base+"0").
-			OrderBy("uri", firestore.Asc).
-			OrderBy("recordCreatedAt", firestore.Asc)
-		if remaining > 0 {
-			q = q.Limit(remaining)
-		}
-		snaps, err := q.Documents(ctx).GetAll()
-		if err != nil {
-			span.RecordError(err)
-			return nil, fs.QueryErr(err)
-		}
-		keys = append(keys, decodeKeys(snaps, true)...)
-	}
-
-	rows, err := r.keysToQueryRows(ctx, keys)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	sds := make([]concrnt.SignedDocument, 0, len(rows))
-	for _, row := range rows {
-		sds = append(sds, row.Row)
+	keys = append(keys, decodeKeys(snaps, true)...)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+
+	sds := make([]concrnt.SignedDocument, 0, len(keys))
+	for _, k := range keys {
+		sd, err := k.signedDocument()
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		sds = append(sds, sd)
 	}
 	return sds, nil
 }

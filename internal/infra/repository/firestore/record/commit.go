@@ -1,15 +1,11 @@
-//go:build contractv1
-
 package record
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
 	"cloud.google.com/go/firestore"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 
 	"github.com/concrnt/concrnt"
@@ -17,56 +13,6 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
-
-// CreateCommitLog stamps cDate with the server time of the commit. First
-// write wins, like INSERT ... ON CONFLICT DO NOTHING: a re-delivery of the
-// same id is ignored wholesale.
-func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
-	defer span.End()
-
-	t, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	proofBytes, err := json.Marshal(proof)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	ref := r.col(fs.ColCommits).Doc(id)
-	_, exists, err := t.read(ref)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-	if exists {
-		return ucrecord.ErrAlreadyCommitted
-	}
-	t.set(ref, commitDoc{IP: ip, Document: document, Proof: string(proofBytes), Owner: owner}.toMap())
-	return nil
-}
-
-func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
-	defer span.End()
-
-	t, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	// a missing commit is a no-op (UPDATE matching zero rows)
-	if err := t.updateIfExists(r.col(fs.ColCommits).Doc(documentID), []firestore.Update{{Path: "gcCandidate", Value: true}}); err != nil {
-		span.RecordError(err)
-		return err
-	}
-	return nil
-}
 
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
@@ -86,7 +32,7 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 			return nil, fs.QueryErr(err)
 		}
 		c := commitFromMap(snap.Data())
-		proof, err := c.proof()
+		proof, err := repoutil.ParseProof(c.Proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
@@ -167,15 +113,18 @@ func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afte
 	return commitLogEntries(snaps)
 }
 
-// deleteConcurrency bounds the parallel per-commit sweeps of DeleteCommitLogs.
-const deleteConcurrency = 16
-
 // DeleteCommitLogs removes the commits and, by hand, everything the SQL
-// backends drop through ON DELETE CASCADE: the record version, the key
-// pointing at it (and the associations targeting that key), the association
-// and its uniqueness marker, ack / acked states and entities carrying the
-// document id. Every step is idempotent, so a partial run is finished by
-// re-running. Not atomic over the list (offline tooling).
+// backends drop through ON DELETE CASCADE. A commit names what it anchors,
+// so the dependents are found by id: the commits are read in one batch get,
+// what they anchor in a second, and a dependent goes only if it still
+// points back at its commit (a key that has moved on to a newer version
+// stays) and has not changed since it was read. A key removed this way
+// ends its incarnation; its associations are cleaned up here, to the end.
+//
+// Dependents are deleted before the commits: a key never points at a
+// commit that is gone, which ApplyRecord relies on. Every step is
+// idempotent, so a partial run is finished by re-running. Not atomic over
+// the list (offline tooling).
 func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteCommitLogs")
 	defer span.End()
@@ -184,108 +133,111 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 		return 0, nil
 	}
 
-	refs := make([]*firestore.DocumentRef, 0, len(ids))
+	commits := newReadSet()
 	for _, id := range ids {
-		refs = append(refs, r.col(fs.ColCommits).Doc(id))
+		commits.add(r.col(fs.ColCommits).Doc(id))
 	}
-	existing := 0
-	for start := 0; start < len(refs); start += getAllBatch {
-		snaps, err := r.client.GetAll(ctx, refs[start:min(start+getAllBatch, len(refs))])
-		if err != nil {
-			span.RecordError(err)
-			return 0, err
-		}
-		for _, s := range snaps {
-			if s.Exists() {
-				existing++
-			}
-		}
-	}
-
-	// the queries run in parallel per commit, the deletes are collected and
-	// handed to one BulkWriter afterwards
-	targets := make([][]*firestore.DocumentRef, len(ids))
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(deleteConcurrency)
-	for i, id := range ids {
-		g.Go(func() error {
-			refs, err := r.commitDependents(gctx, id)
-			if err != nil {
-				return err
-			}
-			targets[i] = refs
-			return nil
-		})
-	}
-	if err := g.Wait(); err != nil {
+	if err := commits.load(ctx, r.client); err != nil {
 		span.RecordError(err)
 		return 0, err
 	}
 
-	b := fs.NewBulk(ctx, r.client)
-	for _, refs := range targets {
-		for _, ref := range refs {
-			b.Delete(ref)
+	type dependent struct {
+		commitID string
+		anchor   string
+		ref      *firestore.DocumentRef
+	}
+	var dependents []dependent
+	anchored := newReadSet()
+	var existing []*firestore.DocumentRef
+	for _, ref := range commits.refs {
+		m, exists := commits.data(ref)
+		if !exists {
+			continue
 		}
+		existing = append(existing, ref)
+		commit := commitFromMap(m)
+		var anchorRef *firestore.DocumentRef
+		switch commit.Anchor {
+		case fs.ColRecordKeys:
+			anchorRef = r.col(fs.ColRecordKeys).Doc(keyID(commit.AnchorID))
+		case fs.ColAssociations:
+			anchorRef = r.col(fs.ColAssociations).Doc(ref.ID)
+		case fs.ColAcks, fs.ColAckeds, fs.ColEntities:
+			anchorRef = r.col(commit.Anchor).Doc(commit.AnchorID)
+		default:
+			continue
+		}
+		dependents = append(dependents, dependent{commitID: ref.ID, anchor: commit.Anchor, ref: anchorRef})
+		anchored.add(anchorRef)
+	}
+	if err := anchored.load(ctx, r.client); err != nil {
+		span.RecordError(err)
+		return 0, err
+	}
+
+	// the uniqueness marker of an association goes with it, while it is
+	// still the marker of that association
+	markerOf := map[string]*firestore.DocumentRef{}
+	markers := newReadSet()
+	for _, d := range dependents {
+		if m, exists := anchored.data(d.ref); exists && d.anchor == fs.ColAssociations {
+			ref := r.col(fs.ColAssocUniques).Doc(uniqueID(str(m, "targetURI"), str(m, "unique")))
+			markerOf[d.commitID] = ref
+			markers.add(ref)
+		}
+	}
+	if err := markers.load(ctx, r.client); err != nil {
+		span.RecordError(err)
+		return 0, err
+	}
+
+	var gens []string
+	b := fs.NewBulk(ctx, r.client)
+	for _, d := range dependents {
+		snap := anchored.snap(d.ref)
+		if snap == nil {
+			continue
+		}
+		m := snap.Data()
+		switch d.anchor {
+		case fs.ColRecordKeys:
+			if str(m, "recordID") != d.commitID {
+				continue
+			}
+			gens = append(gens, str(m, "gen"))
+		case fs.ColAssociations:
+			if marker := markers.snap(markerOf[d.commitID]); marker != nil && str(marker.Data(), "associationID") == d.commitID {
+				b.DeleteIfUnchanged(marker)
+			}
+		default:
+			if str(m, "documentID") != d.commitID {
+				continue
+			}
+		}
+		b.DeleteIfUnchanged(snap)
+	}
+	for _, ref := range existing {
+		b.Delete(r.col(fs.ColRetainedVersions).Doc(ref.ID))
 	}
 	if err := b.End(); err != nil {
 		span.RecordError(err)
 		return 0, err
 	}
-	return existing, nil
-}
-
-// commitDependents lists every document that goes when commit id does.
-func (r *Repository) commitDependents(ctx context.Context, id string) ([]*firestore.DocumentRef, error) {
-	refs := []*firestore.DocumentRef{r.col(fs.ColCommits).Doc(id), r.col(fs.ColRecords).Doc(id)}
-
-	// the key pointing at this version goes, and with it the associations
-	// targeting the key (record_keys -> associations cascade)
-	keySnaps, err := r.col(fs.ColRecordKeys).Where("recordID", "==", id).Select("uri").Documents(ctx).GetAll()
-	if err != nil {
-		return nil, fs.QueryErr(err)
-	}
-	for _, keySnap := range keySnaps {
-		refs = append(refs, keySnap.Ref)
-		assocSnaps, err := r.col(fs.ColAssociations).Where("targetURI", "==", str(keySnap.Data(), "uri")).Select("unique").Documents(ctx).GetAll()
-		if err != nil {
-			return nil, fs.QueryErr(err)
-		}
-		refs = append(refs, associationRefs(r.client, assocSnaps)...)
+	if err := r.runCleanup(ctx, gens); err != nil {
+		span.RecordError(err)
+		return 0, err
 	}
 
-	assocSnap, err := r.col(fs.ColAssociations).Doc(id).Get(ctx)
-	if err != nil && !fs.IsNotFound(err) {
-		return nil, err
+	b = fs.NewBulk(ctx, r.client)
+	for _, ref := range existing {
+		b.Delete(ref)
 	}
-	if err == nil && assocSnap.Exists() {
-		refs = append(refs, assocSnap.Ref)
-		if unique := str(assocSnap.Data(), "unique"); unique != "" {
-			refs = append(refs, r.col(fs.ColAssocUniques).Doc(uniqueID(unique)))
-		}
+	if err := b.End(); err != nil {
+		span.RecordError(err)
+		return 0, err
 	}
-
-	for _, collection := range []string{fs.ColAcks, fs.ColAckeds, fs.ColEntities} {
-		snaps, err := r.col(collection).Where("documentID", "==", id).Select().Documents(ctx).GetAll()
-		if err != nil {
-			return nil, fs.QueryErr(err)
-		}
-		for _, snap := range snaps {
-			refs = append(refs, snap.Ref)
-		}
-	}
-	return refs, nil
-}
-
-func associationRefs(client *firestore.Client, snaps []*firestore.DocumentSnapshot) []*firestore.DocumentRef {
-	refs := make([]*firestore.DocumentRef, 0, 2*len(snaps))
-	for _, snap := range snaps {
-		refs = append(refs, snap.Ref)
-		if unique := str(snap.Data(), "unique"); unique != "" {
-			refs = append(refs, client.Collection(fs.ColAssocUniques).Doc(uniqueID(unique)))
-		}
-	}
-	return refs
+	return len(existing), nil
 }
 
 // ListCommitLogs orders, paginates and filters on the document id; cursors

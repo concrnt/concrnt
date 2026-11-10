@@ -27,8 +27,8 @@ func Collectors() []prometheus.Collector {
 	return []prometheus.Collector{txDuration, txAttempts}
 }
 
-// ObserveTx records one RunInTx call: its wall time, outcome and the number
-// of closure runs.
+// ObserveTx records one Apply* transaction: its wall time, outcome and the
+// number of closure runs.
 func ObserveTx(start time.Time, attempts int, err error) {
 	status := "ok"
 	if err != nil {
