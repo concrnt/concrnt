@@ -1,3 +1,5 @@
+//go:build contractv1
+
 // Package record is the Firestore implementation of record.Repository, file
 // for file and method for method the same as the Postgres, SQLite and
 // Spanner ones. A Firestore transaction must issue every read before its

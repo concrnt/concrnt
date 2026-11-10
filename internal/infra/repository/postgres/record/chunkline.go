@@ -2,13 +2,11 @@ package record
 
 import (
 	"context"
-	"errors"
+	"database/sql"
 	"time"
 
-	"gorm.io/gorm"
-
 	"github.com/concrnt/concrnt/chunkline"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 )
 
@@ -20,27 +18,31 @@ func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chu
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	recordKey, err := getRecordKeyByURI(ctx, r.db, uri)
+	// the timeline's key and its earliest member in one statement
+	var rows []struct {
+		First *time.Time
+	}
+	err := r.db.WithContext(ctx).Raw(`SELECT (
+			SELECT child.record_created_at FROM record_keys child
+			WHERE child.parent_id = parent.id AND child.record_created_at IS NOT NULL
+			ORDER BY child.record_created_at ASC LIMIT 1
+		) AS first
+		FROM record_keys parent WHERE parent.uri = ?`, uri).
+		Scan(&rows).Error
 	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if len(rows) == 0 {
+		err := domain.NotFoundError{Resource: "record key"}
 		span.RecordError(err)
 		return nil, err
 	}
 
 	var firstChunk *int64
-	firstCollectionMember := postgres.RecordKey{}
-	err = r.db.WithContext(ctx).
-		Model(&postgres.RecordKey{}).
-		Where("record_keys.parent_id = ?", recordKey.ID).
-		Where("record_keys.record_created_at IS NOT NULL").
-		Order("record_keys.record_created_at ASC").
-		Limit(1).
-		Take(&firstCollectionMember).Error
-	if err == nil {
-		chunk := firstCollectionMember.RecordCreatedAt.Unix() / repoutil.ChunkSize
+	if rows[0].First != nil {
+		chunk := rows[0].First.Unix() / repoutil.ChunkSize
 		firstChunk = &chunk
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		span.RecordError(err)
-		return nil, err
 	}
 
 	return repoutil.ChunklineManifest(uri, firstChunk), nil
@@ -88,6 +90,13 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 	return lookup, nil
 }
 
+// LoadLocalBody reads the body in one statement: the page of the newest
+// members before the chunk's end, united with every member of the window
+// (the chunk and the one before it), so a window holding more than a page
+// comes back whole and a sparse one is filled up from older members. The
+// outer row of the timeline's key tells an empty timeline from a missing
+// one. Every field a body item needs is on the key row (redirect and
+// record_created_at are denormalised there), so no record is read.
 func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
@@ -95,50 +104,49 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	chunkDate := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
 	prevChunkDate := time.Unix((chunkID-1)*repoutil.ChunkSize, 0)
 
-	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
+	var rows []struct {
+		URI             *string
+		Redirect        *string
+		RecordCreatedAt *time.Time
+	}
+	err := r.db.WithContext(ctx).Raw(`SELECT member.uri AS uri, member.redirect AS redirect, member.record_created_at AS record_created_at
+		FROM record_keys parent
+		LEFT JOIN (
+			SELECT page.* FROM (
+				SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+				WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end
+				ORDER BY record_created_at DESC LIMIT @page
+			) page
+			UNION
+			SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+			WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end AND record_created_at >= @start
+		) member ON member.parent_id = parent.id
+		WHERE parent.uri = @uri
+		ORDER BY member.record_created_at DESC`,
+		sql.Named("uri", uri), sql.Named("end", chunkDate), sql.Named("start", prevChunkDate), sql.Named("page", defaultChunkSize)).
+		Scan(&rows).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	var members []postgres.RecordKey
-	err = r.db.WithContext(ctx).
-		Where("parent_id = ?", parentRecordKey.ID).
-		Where("record_created_at < ?", chunkDate).
-		Order("record_created_at DESC").
-		Limit(defaultChunkSize).
-		Find(&members).Error
-	if err != nil {
+	if len(rows) == 0 {
+		err := domain.NotFoundError{Resource: "record key"}
 		span.RecordError(err)
 		return nil, err
 	}
 
-	// Judge window coverage by record_created_at — the same column the queries
-	// filter and order by — not the joined Record.CreatedAt, which can diverge
-	// (e.g. backdated records) and would skip the window scan.
-	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
-		err = r.db.WithContext(ctx).
-			Where("parent_id = ?", parentRecordKey.ID).
-			Where("record_created_at < ?", chunkDate).
-			Where("record_created_at >= ?", prevChunkDate).
-			Order("record_created_at DESC").
-			Find(&members).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
+	bodyItems := make([]chunkline.BodyItem, 0, len(rows))
+	for _, row := range rows {
+		if row.URI == nil || row.RecordCreatedAt == nil {
+			// the timeline's own row, without a member joined to it
+			continue
 		}
-	}
-
-	// every field a body item needs is on the key row (redirect and
-	// record_created_at are denormalised there), so no record is read
-	bodyItems := make([]chunkline.BodyItem, 0, len(members))
-	for _, member := range members {
-		href := member.URI
-		if member.Redirect != nil {
-			href = *member.Redirect
+		href := *row.URI
+		if row.Redirect != nil {
+			href = *row.Redirect
 		}
 		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   *member.RecordCreatedAt,
+			Timestamp:   *row.RecordCreatedAt,
 			Href:        href,
 			ContentType: "application/concrnt.document+json",
 		})

@@ -742,7 +742,12 @@
     },
     {
       "collectionGroup": "aggregate_entries",
-      "fieldPath": "value",
+      "fieldPath": "counters",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "aggregate_entries",
+      "fieldPath": "members",
       "indexes": []
     },
     {

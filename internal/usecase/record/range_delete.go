@@ -10,13 +10,13 @@ import (
 )
 
 // JobTypeRecordRangeDelete is the JobQueue job type that continues a range
-// delete too large for one transaction; its payload is a RangeDeleteJob and
+// delete too large for one write; its payload is a RangeDeleteJob and
 // its handler is ContinueRangeDelete.
 const JobTypeRecordRangeDelete = "RecordRangeDelete"
 
 // RangeDeleteJob is one page of a range delete whose commit is already
 // recorded: the subtree of Base after AfterURI (in key order) is removed
-// rangeDeleteSyncLimit targets per transaction, each page re-enqueueing the
+// rangeDeleteSyncLimit targets per ApplyDelete call, each page re-enqueueing the
 // next. Retained carries whether an earlier page removed a document with
 // onUpdate=retain, which keeps the delete commit itself.
 type RangeDeleteJob struct {
@@ -84,26 +84,26 @@ func (uc *Usecase) ContinueRangeDelete(ctx context.Context, job RangeDeleteJob) 
 		page.targetURIs = append(page.targetURIs, uri)
 	}
 
-	var postProcesses []PostProcessAction
-	retained := job.Retained
-	err = uc.repo.RunInTx(ctx, func(tx RepositoryTx) error {
-		actions, _, pageRetained, err := uc.deleteTargets(ctx, tx, page)
-		if err != nil {
-			return err
-		}
-		postProcesses = actions
-		retained = job.Retained || pageRetained
-		if !more && !retained {
-			return uc.repo.MarkCommitLogGcCandidate(ctx, tx, documentID)
-		}
-		return nil
-	})
+	pagePlan, err := uc.planDeleteTargets(ctx, page)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
+	retained := job.Retained || pagePlan.retained
+	if !more && !retained {
+		pagePlan.gcCommitIDs = append(pagePlan.gcCommitIDs, documentID)
+	}
 
-	for _, task := range postProcesses {
+	// the delete commit is in the log since the first page: this page only
+	// removes, which is idempotent, so a retried job is safe
+	if len(pagePlan.removals) > 0 || len(pagePlan.gcCommitIDs) > 0 {
+		if _, err := uc.applyDeletePage(ctx, nil, pagePlan); err != nil {
+			span.RecordError(err)
+			return err
+		}
+	}
+
+	for _, task := range pagePlan.postProcesses {
 		if err := task(ctx); err != nil {
 			slog.Error("failed to run post-commit action", slog.String("error", err.Error()))
 			span.RecordError(err)

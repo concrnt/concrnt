@@ -94,13 +94,13 @@ func newOperationContext() (*operationContext, error) {
 	// migrates, the server does that at start
 	switch conf.Backends.Database {
 	case "", "postgres":
-		pool, _ := conf.Backends.Postgres.WithDefaults()
+		pool := conf.Backends.Postgres.WithDefaults()
 		db, err := database.NewPostgres(conf.Backends.PostgresDsn, pool.MaxOpenConns)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect database: %w", err)
 		}
 		op.DB = db
-		op.Record = pgrecord.New(db, pool.MaxConcurrentTx)
+		op.Record = pgrecord.New(db)
 		op.EntityMeta = postgres.NewEntityMetaRepository(db)
 		op.Server = postgres.NewServerRepository(db, cl)
 		op.Notification = postgres.NewNotificationRepository(db)

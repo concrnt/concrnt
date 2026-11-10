@@ -9,7 +9,6 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/utils"
 )
 
@@ -64,10 +63,11 @@ func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, sch
 	}
 	// one entry per side holds every schema; the schema filter is applied
 	// on the way out
-	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.acks, ackTarget(from, to))
+	entry, err := uc.agg.Get(ctx, uc.aggs.acks, ackTarget(from, to))
 	if err != nil {
 		return nil, err
 	}
+	counts := ackCountsOf(entry)
 	if schema == "" {
 		return counts, nil
 	}

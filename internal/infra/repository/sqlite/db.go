@@ -98,8 +98,8 @@ func Open(path string, pragmas ...string) (*DB, error) {
 		sqlDB.Close()
 		return nil, err
 	}
-	// never a single connection: usecase code reads outside the transaction
-	// it has open (through ctx, not tx), which needs a second connection
+	// several connections: under WAL the readers run beside the single
+	// writer instead of queueing behind it
 	sqlDB.SetMaxOpenConns(8)
 	sqlDB.SetMaxIdleConns(8)
 

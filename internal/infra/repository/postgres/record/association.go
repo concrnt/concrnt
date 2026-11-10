@@ -4,68 +4,65 @@ import (
 	"context"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
-	"github.com/concrnt/concrnt/internal/utils"
 )
 
-func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
+func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+
+		// the association references the key row itself, which is what
+		// binds it to the key's incarnation: the row goes when the key is
+		// removed (taking the association along) and a key recreated later
+		// is another row
+		targetRK, err := getRecordKeyByURI(ctx, tx, commit.Target)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+
+		association := postgres.Association{
+			TargetID:   targetRK.ID,
+			DocumentID: commit.ID,
+			Unique:     commit.Unique,
+
+			Owner:     commit.Owner,
+			Author:    commit.Author,
+			Variant:   commit.Variant,
+			Schema:    commit.Schema,
+			CreatedAt: commit.CreatedAt,
+		}
+
+		// ON CONFLICT DO NOTHING on uni_associations_unique: the same
+		// logical association under another document id is Stale
+		result := tx.Clauses(clause.OnConflict{
+			DoNothing: true,
+		}).Create(&association)
+		if result.Error != nil {
+			return ucrecord.Applied, result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ucrecord.Stale, nil
+		}
+		return ucrecord.Applied, nil
+	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
 	}
-
-	targetRK, err := getRecordKeyByURI(ctx, db, targetURI)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-
-	association := postgres.Association{
-		TargetID:   targetRK.ID,
-		DocumentID: documentID,
-		Unique:     unique,
-
-		Owner:     owner,
-		Author:    author,
-		Variant:   variant,
-		Schema:    schema,
-		CreatedAt: createdAt,
-	}
-
-	// A targetless ON CONFLICT DO NOTHING suppresses duplicates on both the
-	// document_id primary key (same document re-delivered) and
-	// uni_associations_unique (same logical association under a new document
-	// id), making duplicate deliveries a silent success like record/ack.
-	result := db.Clauses(clause.OnConflict{
-		DoNothing: true,
-	}).Create(&association)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
-	}
-
-	return result.RowsAffected > 0, nil
-}
-
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return db.Delete(&postgres.Association{}, "document_id = ?", documentID).Error
+	return status, err
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -143,67 +140,52 @@ func commitRows(rows []commitRow) ([]ucrecord.QueryRow, error) {
 	return out, nil
 }
 
-func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
+// ComputeAssociationSummary reads a target's associations once: the CTE is
+// scanned for the counts per (schema, variant) and again, from the same
+// materialised rows, for the distinct authors, which stop one past
+// maxAuthors (that one row is what tells an overflow).
+func (r *Repository) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (ucrecord.AssociationSummary, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationSummary")
 	defer span.End()
 
-	// the scan target is named after the SELECT alias (gorm maps MinCreatedAt
-	// to min_created_at); the earliest association of each variant decides
-	// the variant order
-	var counts []struct {
-		Schema       string
-		Variant      *string
-		Count        int64
-		MinCreatedAt time.Time
+	var rows []struct {
+		Kind     int
+		Schema   *string
+		Variant  *string
+		Author   *string
+		Count    int64
+		Earliest *time.Time
 	}
-
-	err := r.db.WithContext(ctx).
-		Model(&postgres.Association{}).
-		Select("associations.schema, associations.variant, COUNT(*) AS count, MIN(associations.created_at) AS min_created_at").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Group("associations.schema, associations.variant").
-		Scan(&counts).Error
+	err := r.db.WithContext(ctx).Raw(`WITH a AS MATERIALIZED (
+			SELECT associations.schema, associations.variant, associations.author, associations.created_at
+			FROM associations JOIN record_keys rk ON rk.id = associations.target_id
+			WHERE rk.uri = ?
+		)
+		SELECT 0 AS kind, schema, variant, NULL AS author, COUNT(*) AS count, MIN(created_at) AS earliest
+			FROM a GROUP BY schema, variant
+		UNION ALL
+		SELECT 1, NULL, NULL, author, 0, NULL
+			FROM (SELECT DISTINCT author FROM a LIMIT ?) d`, targetURI, maxAuthors+1).
+		Scan(&rows).Error
 	if err != nil {
 		span.RecordError(err)
-		return nil, err
+		return ucrecord.AssociationSummary{}, err
 	}
 
-	result := make(map[string]utils.OrderedKVMap[int64])
-	for _, c := range counts {
-		variants, ok := result[c.Schema]
-		if !ok {
-			variants = make(utils.OrderedKVMap[int64])
-			result[c.Schema] = variants
+	var summary ucrecord.AssociationSummary
+	for _, row := range rows {
+		if row.Kind == 1 {
+			summary.Authors = append(summary.Authors, deref(row.Author))
+			continue
 		}
-		variant := ""
-		if c.Variant != nil {
-			variant = *c.Variant
+		variant := ucrecord.AssociationVariant{Schema: deref(row.Schema), Variant: deref(row.Variant), Count: row.Count}
+		if row.Earliest != nil {
+			variant.Earliest = *row.Earliest
 		}
-		variants[variant] = utils.OrderedKV[int64]{
-			Value: c.Count,
-			Order: c.MinCreatedAt.UnixNano(),
-		}
+		summary.Variants = append(summary.Variants, variant)
 	}
-
-	return result, nil
-}
-
-func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
-	defer span.End()
-
-	var authors []string
-	err := r.db.WithContext(ctx).
-		Model(&postgres.Association{}).
-		Distinct("associations.author").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Limit(limit).
-		Pluck("associations.author", &authors).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	if len(summary.Authors) > maxAuthors {
+		summary.Authors, summary.AuthorsOverflow = nil, true
 	}
-	return authors, nil
+	return summary, nil
 }

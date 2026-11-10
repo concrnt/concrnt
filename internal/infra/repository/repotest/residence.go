@@ -7,9 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // RunResidenceSuite runs the registration-state (EntityMetaRepository) and
@@ -104,26 +102,19 @@ func testResidenceEntityMetaLifecycle(t *testing.T, be Backend) {
 func testResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
-	in := be.Inspect
 
 	userA := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	userB := "con1pppppppppppppppppppppppppppppppppppppppp"
 
-	seed := func(id string, owner string) {
-		t.Helper()
-		inTx(t, ctx, be.Record, func(tx record.RepositoryTx) {
-			require.NoError(t, be.Record.CreateCommitLog(ctx, tx, id, "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, owner))
-		})
-	}
-	seed("log-a-ack", userA)
-	seed("log-b-mirror", userB)
-	seed("log-unowned", "")
+	putCommit(t, ctx, repo, "log-a-ack", userA, "{}")
+	putCommit(t, ctx, repo, "log-b-mirror", userB, "{}")
+	putCommit(t, ctx, repo, "log-unowned", "", "{}")
 
 	flagged := func() map[string]bool {
 		t.Helper()
 		out := map[string]bool{}
 		for _, id := range []string{"log-a-ack", "log-b-mirror", "log-unowned"} {
-			out[id] = mustCommit(t, ctx, in, id).GcCandidate
+			out[id] = gcFlagged(t, ctx, repo, id)
 		}
 		return out
 	}

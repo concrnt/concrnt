@@ -75,7 +75,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	steps := countMigrations(t, client)
-	require.Equal(t, int64(2), steps, "baseline and the ack index drop")
+	require.Equal(t, int64(3), steps, "baseline, the ack index drop and the count cache tables")
 	require.ElementsMatch(t, expectedIndexes, listIndexes(t, client))
 
 	require.NoError(t, spannerrepo.Migrate(ctx, admin, client))
@@ -91,6 +91,7 @@ var expectedIndexes = []indexRow{
 	{"acks", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
 	{"acks", "idx_ack_from_to_schema", "INDEX", true, false, "from_ccid ASC, to_ccid ASC, schema ASC"},
 	{"acks", "idx_acks_from_valid_created_at", "INDEX", false, false, "from_ccid ASC, valid ASC, created_at ASC"},
+	{"aggregate_deltas", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC, id ASC"},
 	{"aggregate_entries", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "key ASC"},
 	{"associations", "PRIMARY_KEY", "PRIMARY_KEY", true, false, "id ASC"},
 	{"associations", "idx_associations_target_schema_variant_author", "INDEX", false, false, "target_uri ASC, schema ASC, variant ASC, author ASC"},

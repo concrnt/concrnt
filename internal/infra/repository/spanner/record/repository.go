@@ -1,3 +1,5 @@
+//go:build contractv1
+
 // Package record is the Spanner implementation of record.Repository, file
 // for file and method for method the same as the Postgres and SQLite ones.
 // Writes are DML statements inside a ReadWriteTransaction, so a method sees

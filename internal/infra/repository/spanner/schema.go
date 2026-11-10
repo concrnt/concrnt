@@ -57,7 +57,9 @@ type migration struct {
 //   - entities: PK (ccid); (alias) GetEntityByAlias.
 //   - entity_meta: PK (ccid). servers: PK (fqdn); (cs_id). subscriptions:
 //     PK (vendor_id, owner). abuse_reports: PK (id). aggregate_entries:
-//     PK (key), rows past expires_at are dropped by the row deletion policy.
+//     PK (key), rows past expires_at are dropped by the row deletion policy;
+//     aggregate_deltas: PK (key, id), interleaved in aggregate_entries and
+//     deleted with its row.
 var migrations = []migration{
 	{1, "baseline_tables", []string{
 		`CREATE TABLE IF NOT EXISTS commit_logs (
@@ -209,5 +211,24 @@ var migrations = []migration{
 		`DROP INDEX IF EXISTS idx_acks_schema_valid_created_at`,
 		`DROP INDEX IF EXISTS idx_acked_from_valid_created_at`,
 		`DROP INDEX IF EXISTS idx_acked_schema_valid_created_at`,
+	}},
+	// the count cache holds counters and takes its writes as delta rows
+	// (internal/infra/aggregate/spanner). It is a cache, so the old rows
+	// are dropped with the table rather than converted
+	{3, "aggregate_entries_counters", []string{
+		`DROP TABLE IF EXISTS aggregate_deltas`,
+		`DROP TABLE IF EXISTS aggregate_entries`,
+		`CREATE TABLE aggregate_entries (
+			key STRING(MAX) NOT NULL,
+			value BYTES(MAX) NOT NULL,
+			as_of TIMESTAMP NOT NULL,
+			deltas INT64 NOT NULL,
+			expires_at TIMESTAMP NOT NULL
+		) PRIMARY KEY (key), ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`,
+		`CREATE TABLE aggregate_deltas (
+			key STRING(MAX) NOT NULL,
+			id STRING(36) NOT NULL,
+			delta BYTES(MAX) NOT NULL
+		) PRIMARY KEY (key, id), INTERLEAVE IN PARENT aggregate_entries ON DELETE CASCADE`,
 	}},
 }

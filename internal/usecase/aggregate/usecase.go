@@ -2,7 +2,6 @@ package aggregate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,20 +13,19 @@ const (
 	DefaultMaxDeltas = 10000
 )
 
-// Definition describes one aggregate: how to compute its value for a target
-// from the primary data (expensive) and how to apply a write's delta to a
-// cached value (cheap). Apply nil means the aggregate has no delta form and
-// every write invalidates instead.
-type Definition[V any, D any] struct {
+// Definition describes one aggregate: how to compute a target's counters
+// from the primary data (expensive). A write is folded into a cached entry
+// with Touch when it has a delta form and drops the entry with Invalidate
+// when it has none.
+type Definition struct {
 	Name    string
-	Compute func(ctx context.Context, target string) (V, error)
-	Apply   func(cur V, delta D) V
+	Compute func(ctx context.Context, target string) (Counters, error)
 }
 
 type Usecase struct {
 	store     Store
 	ttl       time.Duration
-	maxDeltas int
+	maxDeltas int64
 }
 
 // New wraps store; a zero ttl or maxDeltas takes the default.
@@ -38,93 +36,82 @@ func New(store Store, ttl time.Duration, maxDeltas int) *Usecase {
 	if maxDeltas <= 0 {
 		maxDeltas = DefaultMaxDeltas
 	}
-	return &Usecase{store: store, ttl: ttl, maxDeltas: maxDeltas}
+	return &Usecase{store: store, ttl: ttl, maxDeltas: int64(maxDeltas)}
 }
 
-// Get is the read-through: the cached value, or a fresh computation that is
+// Get is the read-through: the cached entry, or a fresh computation that is
 // stored for the next reader. A concurrent computation that stored first
-// wins and its value is returned.
-func Get[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string) (V, error) {
+// wins and its entry is returned. Writers add their deltas blind, so it is
+// the reader that bounds the drift of an entry: one that has absorbed more
+// than MaxDeltas deltas is dropped and recomputed here.
+func (uc *Usecase) Get(ctx context.Context, def *Definition, target string) (Counters, error) {
 	key := Key(def.Name, target)
 
 	entry, ok, err := uc.store.Get(ctx, key)
 	if err != nil {
-		return *new(V), err
+		return Counters{}, err
+	}
+	if ok && entry.Deltas <= uc.maxDeltas {
+		return normalized(*entry), nil
 	}
 	if ok {
-		return decode[V](entry.Value)
+		if err := uc.store.Invalidate(ctx, key); err != nil {
+			return Counters{}, err
+		}
 	}
 
-	value, won, err := computeAndPut(ctx, uc, def, target)
+	computed, won, err := uc.computeAndPut(ctx, def, target)
 	if err != nil || won {
-		return value, err
+		return computed, err
 	}
 	entry, ok, err = uc.store.Get(ctx, key)
 	if err != nil || !ok {
 		// the winner is already gone again: our own computation is as good
-		return value, err
+		return computed, err
 	}
-	return decode[V](entry.Value)
+	return normalized(*entry), nil
 }
 
-// Touch folds a committed write into the cache: the delta is applied to an
-// existing entry, or the value is recomputed (the write is committed, so the
-// computation includes it). receivedAt is when the write became part of the
-// primary data; a concurrent computation older than that may have missed
-// it and gets the delta as well. The entry is dropped once it has absorbed
-// more than MaxDeltas deltas, so drift from lost races is bounded by the
-// next recomputation. Errors are returned for logging only: the write is
-// already committed and the cache recovers by recomputation.
-func Touch[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string, delta D, receivedAt time.Time) error {
+// Touch folds a committed write into the cache: the delta is added to an
+// existing entry without reading it, or the entry is recomputed (the write
+// is committed, so the computation includes it). receivedAt is when the
+// write became part of the primary data; a concurrent computation older
+// than that may have missed it and gets the delta as well. Errors are
+// returned for logging only: the write is already committed and the cache
+// recovers by recomputation.
+func (uc *Usecase) Touch(ctx context.Context, def *Definition, target string, delta Delta, receivedAt time.Time) error {
 	key := Key(def.Name, target)
-	if def.Apply == nil {
-		return uc.store.Invalidate(ctx, key)
-	}
 
-	apply := func(old []byte) ([]byte, error) {
-		cur, err := decode[V](old)
-		if err != nil {
-			return nil, err
-		}
-		return json.Marshal(def.Apply(cur, delta))
-	}
-
-	entry, ok, err := uc.store.Apply(ctx, key, apply)
+	ok, err := uc.store.Add(ctx, key, delta)
 	if err != nil {
 		return errors.Join(err, uc.store.Invalidate(ctx, key))
 	}
 	if ok {
-		if entry.Deltas > uc.maxDeltas {
-			return uc.store.Invalidate(ctx, key)
-		}
 		return nil
 	}
 
-	_, won, err := computeAndPut(ctx, uc, def, target)
+	_, won, err := uc.computeAndPut(ctx, def, target)
 	if err != nil || won {
 		return err
 	}
-	entry, ok, err = uc.store.Get(ctx, key)
+	entry, ok, err := uc.store.Get(ctx, key)
 	if err != nil || !ok {
 		return err
 	}
 	if entry.AsOf.Before(receivedAt) {
-		if _, _, err := uc.store.Apply(ctx, key, apply); err != nil {
+		if _, err := uc.store.Add(ctx, key, delta); err != nil {
 			return errors.Join(err, uc.store.Invalidate(ctx, key))
 		}
 	}
 	return nil
 }
 
-// Seed stores value for target when the cache has no entry, for a writer
+// Seed stores counters for target when the cache has no entry, for a writer
 // that knows the value without computing it (a record just created has no
 // associations). A concurrent computation that stored first wins.
-func Seed[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string, value V) error {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	_, err = uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: time.Now()}, uc.ttl)
+func (uc *Usecase) Seed(ctx context.Context, def *Definition, target string, counters Counters) error {
+	counters.AsOf = time.Now()
+	_, err := uc.store.PutIfAbsent(ctx, Key(def.Name, target), counters, uc.ttl)
 	return err
 }
 
@@ -143,41 +130,42 @@ func (uc *Usecase) InvalidateAll(ctx context.Context) error {
 	return uc.store.InvalidateAll(ctx)
 }
 
-// Cached returns the stored value for target without computing it; false
+// Cached returns the stored entry for target without computing it; false
 // when the cache has none (verification tooling).
-func Cached[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string) (V, bool, error) {
+func (uc *Usecase) Cached(ctx context.Context, def *Definition, target string) (Counters, bool, error) {
 	entry, ok, err := uc.store.Get(ctx, Key(def.Name, target))
 	if err != nil || !ok {
-		return *new(V), false, err
+		return Counters{}, false, err
 	}
-	value, err := decode[V](entry.Value)
-	return value, err == nil, err
+	return normalized(*entry), true, nil
 }
 
-// computeAndPut computes the value for target and offers it to the store;
-// won is false when another entry got there first.
-func computeAndPut[V, D any](ctx context.Context, uc *Usecase, def *Definition[V, D], target string) (V, bool, error) {
+// computeAndPut computes the counters for target and offers them to the
+// store; won is false when another entry got there first.
+func (uc *Usecase) computeAndPut(ctx context.Context, def *Definition, target string) (Counters, bool, error) {
 	asOf := time.Now()
-	value, err := def.Compute(ctx, target)
+	computed, err := def.Compute(ctx, target)
 	if err != nil {
-		return value, false, fmt.Errorf("aggregate %s: compute %q: %w", def.Name, target, err)
+		return Counters{}, false, fmt.Errorf("aggregate %s: compute %q: %w", def.Name, target, err)
 	}
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return value, false, err
-	}
-	won, err := uc.store.PutIfAbsent(ctx, Key(def.Name, target), Entry{Value: encoded, AsOf: asOf}, uc.ttl)
+	computed.AsOf, computed.Deltas = asOf, 0
+	computed = normalized(computed)
+	won, err := uc.store.PutIfAbsent(ctx, Key(def.Name, target), computed, uc.ttl)
 	if err != nil {
 		slog.Warn("aggregate: store rejected a computed value", slog.String("name", def.Name), slog.String("error", err.Error()))
-		return value, false, err
+		return computed, false, err
 	}
-	return value, won, nil
+	return computed, won, nil
 }
 
-func decode[V any](raw []byte) (V, error) {
-	var value V
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return value, fmt.Errorf("aggregate: corrupt cached value: %w", err)
+// normalized gives the callers maps they can index and serialise without
+// telling an empty entry from one a store read back as nil.
+func normalized(c Counters) Counters {
+	if c.Counts == nil {
+		c.Counts = map[string]int64{}
 	}
-	return value, nil
+	if c.Minima == nil {
+		c.Minima = map[string]int64{}
+	}
+	return c
 }

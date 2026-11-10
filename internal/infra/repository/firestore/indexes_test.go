@@ -118,7 +118,7 @@ var exemptFields = map[string][]string{
 	ColServers:          {"wellKnown", "tag", "layer"},
 	ColSubscriptions:    {"subscription", "schemas", "prefixes"},
 	ColAbuseReports:     {"body", "ip", "reporter", "targetURI"},
-	ColAggregateEntries: {"value", "asOf", "deltas"},
+	ColAggregateEntries: {"counters", "members", "asOf", "deltas"},
 }
 
 // requiredIndexes derives the composite indexes the registered shapes need.

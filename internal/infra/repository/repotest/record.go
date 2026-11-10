@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"github.com/zeebo/xxh3"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
@@ -17,18 +17,24 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-// RunRecordSuite runs the record.Repository contract tests. open must return
-// a fresh, isolated backend per call; it is called once per top-level test.
+// RunRecordSuite runs the record.Repository contract tests of records, keys,
+// entities and the commit log. open must return a fresh, isolated backend
+// per call; it is called once per top-level test.
 func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
-	t.Run("Writes", func(t *testing.T) { testRecordWrites(t, open(t)) })
-	t.Run("SubtreeQueryAndDelete", func(t *testing.T) { testRecordSubtreeQueryAndDelete(t, open(t)) })
+	t.Run("ApplyRecord", func(t *testing.T) { testApplyRecord(t, open(t)) })
+	t.Run("DuplicateLeavesNoTrace", func(t *testing.T) { testDuplicateLeavesNoTrace(t, open(t)) })
+	t.Run("OnUpdate", func(t *testing.T) { testRecordOnUpdate(t, open(t)) })
+	t.Run("ApplyEntity", func(t *testing.T) { testApplyEntity(t, open(t)) })
+	t.Run("ReferenceRecord", func(t *testing.T) { testReferenceRecord(t, open(t)) })
+	t.Run("SubtreeQuery", func(t *testing.T) { testRecordSubtreeQuery(t, open(t)) })
 	t.Run("QueryAuthorFilter", func(t *testing.T) { testRecordQueryAuthorFilter(t, open(t)) })
+	t.Run("QueryByCreatedAt", func(t *testing.T) { testRecordQueryByCreatedAt(t, open(t)) })
 	t.Run("HierarchicalRecordPoliciesRootFirst", func(t *testing.T) { testHierarchicalRecordPoliciesRootFirst(t, open(t)) })
 	t.Run("HierarchicalRecordPoliciesEmitsPolicylessDistributingLevel", func(t *testing.T) {
 		testHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t, open(t))
 	})
-	t.Run("CreateRecordAppliesOverParentPlaceholder", func(t *testing.T) { testCreateRecordAppliesOverParentPlaceholder(t, open(t)) })
-	t.Run("CreateRecordFreshKeyConditionalUpsert", func(t *testing.T) { testCreateRecordFreshKeyConditionalUpsert(t, open(t)) })
+	t.Run("ApplyRecordOverParentPlaceholder", func(t *testing.T) { testApplyRecordOverParentPlaceholder(t, open(t)) })
+	t.Run("ApplyRecordFreshKeyRace", func(t *testing.T) { testApplyRecordFreshKeyRace(t, open(t)) })
 	t.Run("GetAllCommitLogsByOwner", func(t *testing.T) { testGetAllCommitLogsByOwner(t, open(t)) })
 	t.Run("QueryByParentOrderByKey", func(t *testing.T) { testRecordQueryByParentOrderByKey(t, open(t)) })
 	t.Run("GetSignedDocumentByCCFS", func(t *testing.T) { testGetSignedDocumentByCCFS(t, open(t)) })
@@ -37,592 +43,384 @@ func RunRecordSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("GetEntityByCCIDAndAlias", func(t *testing.T) { testGetEntityByCCIDAndAlias(t, open(t)) })
 }
 
-func testRecordWrites(t *testing.T, be Backend) {
+// A record is stored with its commit and read back whole from its key; a
+// newer document takes the key and reports what it replaced; an older or
+// equal one is Stale and leaves nothing behind, not even its commit.
+func testApplyRecord(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
-	in := be.Inspect
 
 	key := "cckv://con1owner/timeline/post-1"
+	createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	distributions := []string{"cckv://con1channel/timeline"}
+	href := "cckv://con1owner/timeline/proof"
 
-	t.Run("commit log first write wins", func(t *testing.T) {
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-			require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "has-1", "127.0.0.1", "{\"other\":1}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"), record.ErrAlreadyCommitted)
-		})
-		require.Equal(t, "{}", mustCommit(t, ctx, in, "has-1").Document)
+	oldRC := recordCommit(t, "record-1-old", key, createdAt, func(rc *record.RecordCommit) {
+		rc.Author = "con1author"
+		rc.Distributions = distributions
+	})
+	oldRC.Proof.Href = &href
+	outcome, err := repo.ApplyRecord(ctx, oldRC)
+	require.NoError(t, err)
+	require.Equal(t, record.RecordOutcome{Status: record.Applied, FreshKey: true}, outcome)
 
-		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "has-2", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-		})
-		require.False(t, commitExists(t, ctx, in, "has-2"), "a rolled-back write leaves nothing behind")
+	t.Run("the commit is in the log as given", func(t *testing.T) {
+		entry := commitEntry(t, ctx, repo, "record-1-old")
+		require.NotNil(t, entry)
+		require.Equal(t, "127.0.0.1", entry.IP)
+		require.Equal(t, oldRC.Document, entry.Document)
+		require.Equal(t, oldRC.Proof, entry.Proof, "the proof round-trips, optional fields included")
+		require.Equal(t, "con1owner", entry.Owner)
+		require.False(t, entry.CDate.IsZero())
+		require.False(t, gcFlagged(t, ctx, repo, "record-1-old"))
 	})
 
-	t.Run("create and update record", func(t *testing.T) {
-		createdAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-		distributions := []string{"cckv://con1channel/timeline"}
-		oldSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:        "record",
-			Key:         key,
-			Value:       map[string]string{"body": "old"},
-			Author:      "con1author",
-			Schema:      "https://schema.example/post.json",
-			CreatedAt:   createdAt,
-			Distributes: &distributions,
-		})
-		onUpdate := "forget"
-		withCommit(t, ctx, repo, "record-1-old", "127.0.0.1", oldSD, "con1owner", func(tx record.RepositoryTx) error {
-			applied, err := repo.CreateRecord(ctx, tx, "record-1-old", key, "con1owner", "con1owner", "https://schema.example/post.json", &onUpdate, nil, distributions, nil, createdAt)
-			require.True(t, applied)
-			return err
-		})
+	t.Run("the key resolves to the complete document", func(t *testing.T) {
+		got := resolve(t, ctx, repo, key)
+		require.NotNil(t, got)
+		require.Equal(t, oldRC.Document, got.Document)
+		require.Equal(t, oldRC.Proof, got.Proof)
+		require.Equal(t, key, *got.CCKV)
+		require.Equal(t, ccfsOf("con1owner", "record-1-old"), *got.CCFS)
 
-		commit := mustCommit(t, ctx, in, "record-1-old")
-		require.Equal(t, oldSD.Document, commit.Document)
-		require.JSONEq(t, `{"type":"none"}`, commit.Proof)
-		require.False(t, commit.GcCandidate)
-
-		requireCommitOwner(t, ctx, in, "record-1-old", "con1owner")
-
-		stored := mustRecord(t, ctx, in, "record-1-old")
-		require.Equal(t, "con1owner", stored.Owner)
-		require.Equal(t, "https://schema.example/post.json", stored.Schema)
-		require.Equal(t, distributions, stored.Distributions)
-		require.True(t, stored.CreatedAt.Equal(createdAt))
-
-		recordKey := mustRecordKey(t, ctx, in, key)
-		require.NotNil(t, recordKey.RecordID)
-		require.Equal(t, "record-1-old", *recordKey.RecordID)
-		require.NotNil(t, recordKey.RecordCreatedAt)
-		require.True(t, recordKey.RecordCreatedAt.Equal(createdAt))
-
-		gotSD, err := repo.GetSignedDocument(ctx, key)
+		rows, err := repo.QueryByParent(ctx, "cckv://con1owner/timeline", postSchema, "con1author", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, oldSD.Document, gotSD.Document)
-		require.Equal(t, oldSD.Proof, gotSD.Proof)
+		require.Len(t, rows, 1)
+		require.Equal(t, got, &rows[0].Row, "a listing row is the same complete document")
+		require.True(t, rows[0].CreatedAt.Equal(createdAt), "the row's sort key is the record's createdAt")
 
-		newCreatedAt := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
-		newSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": "new"},
-			Author:    "con1author",
-			Schema:    "https://schema.example/post.v2.json",
-			CreatedAt: newCreatedAt,
-		})
-		withCommit(t, ctx, repo, "record-2-new", "127.0.0.1", newSD, "con1owner", func(tx record.RepositoryTx) error {
-			applied, err := repo.CreateRecord(ctx, tx, "record-2-new", key, "con1owner", "con1owner", "https://schema.example/post.v2.json", &onUpdate, nil, []string{}, nil, newCreatedAt)
-			require.True(t, applied)
-			return err
-		})
-
-		recordKey = mustRecordKey(t, ctx, in, key)
-		require.NotNil(t, recordKey.RecordID)
-		require.Equal(t, "record-2-new", *recordKey.RecordID)
-		require.NotNil(t, recordKey.RecordCreatedAt)
-		require.True(t, recordKey.RecordCreatedAt.Equal(newCreatedAt))
-
-		commit = mustCommit(t, ctx, in, "record-1-old")
-		require.True(t, commit.GcCandidate)
-
-		require.False(t, recordExists(t, ctx, in, "record-1-old"))
-
-		newRecord := mustRecord(t, ctx, in, "record-2-new")
-		require.Equal(t, "https://schema.example/post.v2.json", newRecord.Schema)
-		require.True(t, newRecord.CreatedAt.Equal(newCreatedAt))
-
-		// accept-if-newer: a replayed older (or identical) document must not
-		// roll the key back, and must not tombstone the stored newer version.
-		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-			applied, err := repo.CreateRecord(ctx, tx, "record-0-stale", key, "con1owner", "con1owner", "https://schema.example/post.json", &onUpdate, nil, distributions, nil, createdAt)
-			require.NoError(t, err)
-			require.False(t, applied)
-			applied, err = repo.CreateRecord(ctx, tx, "record-2-new", key, "con1owner", "con1owner", "https://schema.example/post.v2.json", &onUpdate, nil, []string{}, nil, newCreatedAt)
-			require.NoError(t, err)
-			require.False(t, applied)
-		})
-
-		keptRecordKey := mustRecordKey(t, ctx, in, key)
-		require.NotNil(t, keptRecordKey.RecordID)
-		require.Equal(t, "record-2-new", *keptRecordKey.RecordID)
-		keptCommit := mustCommit(t, ctx, in, "record-2-new")
-		require.False(t, keptCommit.GcCandidate)
-		require.True(t, recordExists(t, ctx, in, "record-2-new"))
-	})
-
-	// CIP-1 §5.7: omitting onUpdate means forget — replacing the key must drop
-	// the old record and mark its commit for GC. Only an explicit "retain"
-	// keeps the old generation.
-	t.Run("onUpdate defaults to forget, explicit retain keeps history", func(t *testing.T) {
-		for _, tc := range []struct {
-			name     string
-			onUpdate *string
-			forgets  bool
-		}{
-			{"default", nil, true},
-			{"retain", ptr("retain"), false},
-		} {
-			t.Run(tc.name, func(t *testing.T) {
-				key := "cckv://con1owner/timeline/onupdate-" + tc.name
-				oldID := "onupdate-" + tc.name + "-1-old"
-				newID := "onupdate-" + tc.name + "-2-new"
-				for i, id := range []string{oldID, newID} {
-					createdAt := time.Date(2026, 1, 2, 3, 4, 5+i, 0, time.UTC)
-					sd := SignedDocument(t, concrnt.Document[map[string]string]{
-						Kind:      "record",
-						Key:       key,
-						Value:     map[string]string{"body": id},
-						Author:    "con1author",
-						Schema:    "https://schema.example/post.json",
-						CreatedAt: createdAt,
-						OnUpdate:  tc.onUpdate,
-					})
-					withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-						applied, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", tc.onUpdate, nil, []string{}, nil, createdAt)
-						require.True(t, applied)
-						return err
-					})
-				}
-
-				recordKey := mustRecordKey(t, ctx, in, key)
-				require.NotNil(t, recordKey.RecordID)
-				require.Equal(t, newID, *recordKey.RecordID)
-
-				commit := mustCommit(t, ctx, in, oldID)
-				require.Equal(t, tc.forgets, commit.GcCandidate)
-
-				require.Equal(t, !tc.forgets, recordExists(t, ctx, in, oldID))
-			})
-		}
-	})
-
-	// CIP-0 §8.4: entities are exempt from onUpdate — replacing an entity
-	// document must keep the old commit intact (no GC flag), even when the
-	// document itself declares onUpdate: forget.
-	t.Run("entity replacement retains the old document", func(t *testing.T) {
-		for i, id := range []string{"entity-1-old", "entity-2-new"} {
-			createdAt := time.Date(2026, 1, 2, 3, 4, 5+i, 0, time.UTC)
-			sd := SignedDocument(t, concrnt.Document[schemas.Entity]{
-				Kind:      "entity",
-				Value:     schemas.Entity{Domain: "example.com"},
-				Author:    "con1entity",
-				Schema:    schemas.EntityURL,
-				CreatedAt: createdAt,
-				OnUpdate:  ptr("forget"),
-			})
-			withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1entity", func(tx record.RepositoryTx) error {
-				applied, err := repo.CreateEntity(ctx, tx, "con1entity", nil, "example.com", id, createdAt)
-				require.True(t, applied)
-				return err
-			})
-		}
-
-		entity := mustEntity(t, ctx, in, "con1entity")
-		require.Equal(t, "entity-2-new", entity.DocumentID)
-		require.True(t, entity.CreatedAt.Equal(time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC)))
-
-		oldCommit := mustCommit(t, ctx, in, "entity-1-old")
-		require.False(t, oldCommit.GcCandidate)
-
-		// CIP-3 §3.4: the key is createdAt alone — an equal-createdAt
-		// document is a no-op whatever its id, an older one too
-		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "entity-9-same-time", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1entity"))
-			applied, err := repo.CreateEntity(ctx, tx, "con1entity", nil, "other.example.net", "entity-9-same-time", time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC))
-			require.NoError(t, err)
-			require.False(t, applied, "same createdAt must be a no-op")
-			applied, err = repo.CreateEntity(ctx, tx, "con1entity", nil, "other.example.net", "entity-0-older", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
-			require.NoError(t, err)
-			require.False(t, applied, "older createdAt must be a no-op")
-		})
-		entity = mustEntity(t, ctx, in, "con1entity")
-		require.Equal(t, "example.com", entity.Domain)
-	})
-
-	t.Run("create reference record", func(t *testing.T) {
-		targetURI := "cckv://con1target/timeline/post-2"
-		targetCreatedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
-		targetSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       targetURI,
-			Value:     map[string]string{"body": "target"},
-			Author:    "con1target",
-			Schema:    "https://schema.example/target.json",
-			CreatedAt: targetCreatedAt,
-		})
-
-		refSD := SignedDocument(t, concrnt.Document[schemas.Reference]{
-			Kind: "record",
-			Key:  "cckv://con1owner/timeline/ref-1",
-			Value: schemas.Reference{
-				Href: targetURI,
-			},
-			Author:    "con1owner",
-			Schema:    schemas.ReferenceURL,
-			CreatedAt: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-		})
-		refSD.References = map[string]concrnt.SignedDocument{
-			targetURI: targetSD,
-		}
-
-		withCommit(t, ctx, repo, "reference-record", "127.0.0.1", refSD, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, "reference-record", "cckv://con1owner/timeline/ref-1", "con1owner", "con1owner", "https://schema.example/target.json", nil, nil, []string{}, &targetURI, targetCreatedAt)
-			return err
-		})
-
-		stored := mustRecord(t, ctx, in, "reference-record")
-		require.NotNil(t, stored.Redirect)
-		require.Equal(t, targetURI, *stored.Redirect)
-		require.Equal(t, "https://schema.example/target.json", stored.Schema)
-		require.True(t, stored.CreatedAt.Equal(targetCreatedAt))
-
-		// the key carries the redirect too (chunkline reads it from the key)
-		refKey := mustRecordKey(t, ctx, in, "cckv://con1owner/timeline/ref-1")
-		require.NotNil(t, refKey.Redirect)
-		require.Equal(t, targetURI, *refKey.Redirect)
-		require.Nil(t, mustRecordKey(t, ctx, in, key).Redirect, "a plain record's key has no redirect")
-	})
-
-	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
-
-		// plain record: item ID is the record key URI
-		timeline, itemID, err := repo.GetTimelineRemoval(ctx, key)
+		stack, err := repo.GetHierarchicalRecordPolicies(ctx, key)
 		require.NoError(t, err)
-		require.Equal(t, "cckv://con1owner/timeline", timeline)
-		require.Equal(t, key, itemID)
+		require.Len(t, stack, 1)
+		require.Equal(t, distributions, *stack[0].VirtualParents, "the distributions are stored with the record")
+	})
 
-		// reference record: item ID is the redirect target
-		refKey := "cckv://con1owner/timeline/ref-1"
-		refTarget := "cckv://con1target/timeline/post-2"
-		timeline, itemID, err = repo.GetTimelineRemoval(ctx, refKey)
+	newCreatedAt := createdAt.Add(24 * time.Hour)
+	newRC := recordCommit(t, "record-2-new", key, newCreatedAt, func(rc *record.RecordCommit) {
+		rc.Author = "con1author"
+		rc.Schema = "https://schema.example/post.v2.json"
+	})
+
+	t.Run("a newer document takes the key", func(t *testing.T) {
+		outcome, err := repo.ApplyRecord(ctx, newRC)
 		require.NoError(t, err)
-		require.Equal(t, "cckv://con1owner/timeline", timeline)
-		require.Equal(t, refTarget, itemID)
+		require.Equal(t, record.RecordOutcome{Status: record.Applied, PreviousID: "record-1-old"}, outcome)
 
-		// the advertised ID must equal the BodyItem.ID() the body endpoint
-		// serves for the same member, or readers can't match them up
-		for keyURI, wantID := range map[string]string{key: key, refKey: refTarget} {
-			recordKey := mustRecordKey(t, ctx, in, keyURI)
-			require.NotNil(t, recordKey.RecordCreatedAt)
-			chunkID := recordKey.RecordCreatedAt.Unix() / 600
+		got := resolve(t, ctx, repo, key)
+		require.NotNil(t, got)
+		require.Equal(t, newRC.Document, got.Document)
+		require.Equal(t, ccfsOf("con1owner", "record-2-new"), *got.CCFS)
 
-			items, err := be.Record.LoadLocalBody(ctx, "cckv://con1owner/timeline", chunkID)
+		rows, err := repo.QueryByParent(ctx, "cckv://con1owner/timeline", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{"record-2-new"}, rowIDs(t, rows), "the key lists once, as its current version")
+		require.True(t, rows[0].CreatedAt.Equal(newCreatedAt))
+
+		rows, err = repo.QueryByParent(ctx, "cckv://con1owner/timeline", postSchema, "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows, "the replaced version's schema no longer matches")
+
+		stack, err := repo.GetHierarchicalRecordPolicies(ctx, key)
+		require.NoError(t, err)
+		require.Empty(t, stack, "the new version distributes nothing")
+
+		// onUpdate defaults to forget: the replaced commit is up for gc
+		require.True(t, gcFlagged(t, ctx, repo, "record-1-old"))
+		require.False(t, gcFlagged(t, ctx, repo, "record-2-new"))
+	})
+
+	// accept-if-newer: a replayed older (or equal-createdAt) document must
+	// not roll the key back, and stores nothing at all
+	t.Run("an older or equal document is stale and leaves no trace", func(t *testing.T) {
+		for id, at := range map[string]time.Time{"record-0-stale": createdAt, "record-9-same-time": newCreatedAt} {
+			outcome, err := repo.ApplyRecord(ctx, recordCommit(t, id, key, at))
 			require.NoError(t, err)
-			ids := make([]string, 0, len(items))
-			for _, item := range items {
-				ids = append(ids, item.ID())
-			}
-			require.Contains(t, ids, wantID)
+			require.Equal(t, record.Stale, outcome.Status, id)
+			require.False(t, commitExists(t, ctx, repo, id), "a stale write must not leave its commit")
+			require.Nil(t, resolve(t, ctx, repo, ccfsOf("con1owner", id)))
 		}
 
-		// the timeline row itself is not a chunkline member
-		timeline, itemID, err = repo.GetTimelineRemoval(ctx, "cckv://con1owner/timeline")
+		got := resolve(t, ctx, repo, key)
+		require.NotNil(t, got)
+		require.Equal(t, newRC.Document, got.Document)
+		require.False(t, gcFlagged(t, ctx, repo, "record-2-new"), "the stored version is untouched")
+	})
+
+	t.Run("a stale write creates no ancestor placeholders", func(t *testing.T) {
+		deep := "cckv://con1owner/stale/a/b"
+		putRecord(t, ctx, repo, "deep-2-new", deep, newCreatedAt)
+		removeKeys(t, ctx, repo, "deep-delete", "con1owner", deep)
+		// the key is gone; its ancestors remain as placeholders, so a stale
+		// write cannot be told from one that created them. Use a tree of
+		// its own: the losing write's ancestors must not appear
+		lone := "cckv://con1owner/stale2/x/y"
+		putRecord(t, ctx, repo, "lone-2-new", lone, newCreatedAt)
+		outcome, err := repo.ApplyRecord(ctx, recordCommit(t, "lone-1-old", lone, createdAt))
 		require.NoError(t, err)
-		require.Empty(t, timeline)
-		require.Empty(t, itemID)
-
-		// unknown keys report not-found
-		_, _, err = repo.GetTimelineRemoval(ctx, "cckv://con1owner/timeline/no-such-key")
-		require.Error(t, err)
-	})
-
-	t.Run("create association and toggle ack", func(t *testing.T) {
-		variant := "reply"
-		associationSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:               "association",
-			Value:              map[string]string{"body": "comment"},
-			Author:             "con1author",
-			Schema:             "https://schema.example/comment.json",
-			CreatedAt:          time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC),
-			Associate:          &key,
-			AssociationVariant: &variant,
-		})
-		associationUnique := fmt.Sprintf("%x", xxh3.HashString("con1owner"+"con1author"+key+variant))
-		associationCreatedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
-		var inserted bool
-		withCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
-			var err error
-			inserted, err = repo.CreateAssociation(ctx, tx, "association-record", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
-			return err
-		})
-		require.True(t, inserted)
-
-		association := mustAssociation(t, ctx, in, "association-record")
-		require.Equal(t, "con1owner", association.Owner)
-		require.Equal(t, "con1author", association.Author)
-		require.NotNil(t, association.Variant)
-		require.Equal(t, variant, *association.Variant)
-		require.Equal(t, associationUnique, association.Unique)
-		requireCommitOwner(t, ctx, in, "association-record", "con1owner")
-
-		// duplicate deliveries are silent no-ops: the same document re-sent
-		// (primary-key conflict)...
-		withCommit(t, ctx, repo, "association-record", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
-			var err error
-			inserted, err = repo.CreateAssociation(ctx, tx, "association-record", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
-			return err
-		})
-		require.False(t, inserted)
-
-		// ...and the same logical association re-signed under a new document id
-		// (unique-key conflict)
-		withCommit(t, ctx, repo, "association-record-retry", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
-			var err error
-			inserted, err = repo.CreateAssociation(ctx, tx, "association-record-retry", key, "con1owner", "con1author", "https://schema.example/comment.json", &variant, associationUnique, associationCreatedAt)
-			return err
-		})
-		require.False(t, inserted)
-
-		associationCount, err := in.AssociationCountByUnique(ctx, associationUnique)
+		require.Equal(t, record.Stale, outcome.Status)
+		rows, err := repo.QueryByParentOrderByKey(ctx, "cckv://con1owner/stale2/x", "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.EqualValues(t, 1, associationCount)
+		require.Equal(t, []string{lone}, rowKeys(t, rows))
+	})
+}
 
-		ackSchema := "https://schema.example/like.json"
-		ackCreatedAt := time.Date(2026, 4, 5, 6, 7, 8, 0, time.UTC)
-		ackDoc := func(kind string, createdAt time.Time) concrnt.SignedDocument {
-			return SignedDocument(t, concrnt.Document[map[string]string]{
-				Kind:      kind,
-				Value:     map[string]string{"context": "like"},
-				Author:    "con1author",
-				Schema:    ackSchema,
-				CreatedAt: createdAt,
-				Associate: &key,
-			})
+// A commit id already in the log makes every Apply* a Duplicate: nothing
+// the second call describes is stored and the log entry stays as first
+// written.
+func testDuplicateLeavesNoTrace(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	key := "cckv://con1owner/dup/first"
+	first, _ := putRecord(t, ctx, repo, "dup-1", key, at)
+
+	sameLog := func(t *testing.T) {
+		t.Helper()
+		entry := commitEntry(t, ctx, repo, "dup-1")
+		require.NotNil(t, entry)
+		require.Equal(t, first.Document, entry.Document)
+		require.Equal(t, "con1owner", entry.Owner)
+		require.Equal(t, "127.0.0.1", entry.IP)
+		rows, err := repo.QueryCommitLogs(ctx, "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Len(t, rows, 1, "the log holds the one commit")
+	}
+
+	t.Run("record", func(t *testing.T) {
+		other := recordCommit(t, "dup-1", "cckv://con1other/dup/second", at.Add(time.Hour))
+		other.IP = "192.0.2.1"
+		outcome, err := repo.ApplyRecord(ctx, other)
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, outcome.Status)
+		require.Nil(t, resolve(t, ctx, repo, "cckv://con1other/dup/second"))
+		rows, err := repo.QueryByParentOrderByKey(ctx, "cckv://con1other", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows, "not even a placeholder of the second key's ancestors")
+
+		// the same document again, the redelivery proper
+		outcome, err = repo.ApplyRecord(ctx, first)
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, outcome.Status)
+		sameLog(t)
+	})
+
+	t.Run("entity", func(t *testing.T) {
+		status, err := repo.ApplyEntity(ctx, record.EntityCommit{
+			Commit: record.Commit{ID: "dup-1", Document: "{}", Owner: "con1dupentity"},
+			CCID:   "con1dupentity", Domain: "example.com", CreatedAt: at,
+		})
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, status)
+		_, err = repo.GetEntityByCCID(ctx, "con1dupentity")
+		require.True(t, errors.Is(err, domain.ErrNotFound))
+		sameLog(t)
+	})
+
+	t.Run("association", func(t *testing.T) {
+		status, err := repo.ApplyAssociation(ctx, record.AssociationCommit{
+			Commit: record.Commit{ID: "dup-1", Document: "{}", Owner: "con1owner"},
+			Target: key, Author: "con1author", Schema: "https://schema.example/like.json", Unique: "dup-unique", CreatedAt: at,
+		})
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, status)
+		rows, err := repo.GetAssociatedRecords(ctx, key, "", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows)
+		sameLog(t)
+	})
+
+	t.Run("ack", func(t *testing.T) {
+		outcome, err := repo.ApplyAck(ctx, record.AckCommit{
+			Commit: record.Commit{ID: "dup-1", Document: "{}", Owner: "con1author"},
+			Side:   record.AckerSide, From: "con1author", To: "con1owner", Schema: "https://schema.example/follow.json", Valid: true, CreatedAt: at,
+		})
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, outcome.Status)
+		rows, err := repo.GetAcknowledgeRecords(ctx, "con1author", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Empty(t, rows)
+		sameLog(t)
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		outcome, err := repo.ApplyDelete(ctx, record.DeleteCommit{
+			Commit:      &record.Commit{ID: "dup-1", Document: "{}", Owner: "con1owner"},
+			Removals:    []record.Removal{{Kind: record.RemoveKey, URI: key}},
+			GcCommitIDs: []string{"dup-1"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, record.Duplicate, outcome.Status)
+		require.Empty(t, outcome.Removed)
+		require.Empty(t, outcome.Cleanups)
+		require.NotNil(t, resolve(t, ctx, repo, key), "a duplicate delete removes nothing")
+		require.False(t, gcFlagged(t, ctx, repo, "dup-1"), "and flags nothing")
+		sameLog(t)
+	})
+}
+
+// CIP-1 §5.7: omitting onUpdate means forget — replacing the key flags the
+// old commit for gc. Only an explicit "retain" on the version being replaced
+// keeps it. Either way the old document stays readable by its ccfs URI for
+// as long as its commit is in the log, without a key pointing at it.
+func testRecordOnUpdate(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	for _, tc := range []struct {
+		name     string
+		onUpdate *string
+		forgets  bool
+	}{
+		{"default", nil, true},
+		{"forget", ptr("forget"), true},
+		{"retain", ptr("retain"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "cckv://con1owner/timeline/onupdate-" + tc.name
+			oldID := "onupdate-" + tc.name + "-1-old"
+			newID := "onupdate-" + tc.name + "-2-new"
+			at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+			withOnUpdate := func(rc *record.RecordCommit) { rc.OnUpdate = tc.onUpdate }
+
+			old, _ := putRecord(t, ctx, repo, oldID, key, at, withOnUpdate)
+			_, outcome := putRecord(t, ctx, repo, newID, key, at.Add(time.Second), withOnUpdate)
+			require.Equal(t, oldID, outcome.PreviousID)
+			require.False(t, outcome.FreshKey)
+
+			require.Equal(t, tc.forgets, gcFlagged(t, ctx, repo, oldID))
+			require.False(t, gcFlagged(t, ctx, repo, newID))
+
+			got := resolve(t, ctx, repo, ccfsOf("con1owner", oldID))
+			require.NotNil(t, got, "the replaced document is still in the log")
+			require.Equal(t, old.Document, got.Document)
+			require.Nil(t, got.CCKV, "the key has moved on from it")
+
+			current := resolve(t, ctx, repo, key)
+			require.NotNil(t, current)
+			require.Equal(t, ccfsOf("con1owner", newID), *current.CCFS)
+		})
+	}
+}
+
+// Entities are accept-if-newer on createdAt alone (CIP-3 §3.4) and exempt
+// from onUpdate (CIP-0 §8.4): replacing an entity document keeps the old
+// commit unflagged.
+func testApplyEntity(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	ccid := "con1entity"
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	entityCommit := func(id, domainName string, createdAt time.Time) record.EntityCommit {
+		sd := SignedDocument(t, concrnt.Document[schemas.Entity]{
+			Kind:      "entity",
+			Value:     schemas.Entity{Domain: domainName},
+			Author:    ccid,
+			Schema:    schemas.EntityURL,
+			CreatedAt: createdAt,
+			OnUpdate:  ptr("forget"),
+		})
+		return record.EntityCommit{Commit: commitOf(id, sd, ccid), CCID: ccid, Domain: domainName, CreatedAt: createdAt}
+	}
+
+	first := entityCommit("entity-1-old", "example.com", at)
+	status, err := repo.ApplyEntity(ctx, first)
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, status)
+
+	second := entityCommit("entity-2-new", "example.org", at.Add(time.Second))
+	status, err = repo.ApplyEntity(ctx, second)
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, status)
+
+	entity, err := repo.GetEntityByCCID(ctx, ccid)
+	require.NoError(t, err)
+	require.Equal(t, "example.org", entity.Domain)
+	require.Equal(t, second.Document, entity.SignedDocument.Document)
+	require.False(t, gcFlagged(t, ctx, repo, "entity-1-old"), "the replaced entity document is kept")
+	require.True(t, commitExists(t, ctx, repo, "entity-1-old"))
+
+	// the key is createdAt alone: an equal-createdAt document is stale
+	// whatever its id, an older one too
+	for id, createdAt := range map[string]time.Time{"entity-9-same-time": at.Add(time.Second), "entity-0-older": at} {
+		status, err := repo.ApplyEntity(ctx, entityCommit(id, "other.example.net", createdAt))
+		require.NoError(t, err)
+		require.Equal(t, record.Stale, status, id)
+		require.False(t, commitExists(t, ctx, repo, id), "a stale write must not leave its commit")
+	}
+	entity, err = repo.GetEntityByCCID(ctx, ccid)
+	require.NoError(t, err)
+	require.Equal(t, "example.org", entity.Domain)
+	require.Equal(t, second.Document, entity.SignedDocument.Document)
+}
+
+// A reference record is listed under its target's schema and createdAt and
+// stands in a chunkline body as its target; GetTimelineRemoval names the
+// same item id the body serves.
+func testReferenceRecord(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	timeline := "cckv://con1owner/timeline"
+	plainKey := timeline + "/post-1"
+	plainAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	putRecord(t, ctx, repo, "plain-record", plainKey, plainAt)
+
+	refKey := timeline + "/ref-1"
+	targetURI := "cckv://con1target/timeline/post-2"
+	targetSchema := "https://schema.example/target.json"
+	targetCreatedAt := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+	putRecord(t, ctx, repo, "reference-record", refKey, targetCreatedAt, func(rc *record.RecordCommit) {
+		rc.Schema = targetSchema
+		rc.Redirect = &targetURI
+	})
+
+	rows, err := repo.QueryByParent(ctx, timeline, targetSchema, "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{refKey}, rowKeys(t, rows), "the reference lists under the schema it was stored with")
+	require.True(t, rows[0].CreatedAt.Equal(targetCreatedAt))
+
+	// plain record: the item id is the record key
+	tl, itemID, err := repo.GetTimelineRemoval(ctx, plainKey)
+	require.NoError(t, err)
+	require.Equal(t, timeline, tl)
+	require.Equal(t, plainKey, itemID)
+
+	// reference record: the item id is the redirect target
+	tl, itemID, err = repo.GetTimelineRemoval(ctx, refKey)
+	require.NoError(t, err)
+	require.Equal(t, timeline, tl)
+	require.Equal(t, targetURI, itemID)
+
+	// the advertised id must equal the BodyItem.ID() the body endpoint
+	// serves for the same member, or readers can't match them up
+	for wantID, at := range map[string]time.Time{plainKey: plainAt, targetURI: targetCreatedAt} {
+		items, err := repo.LoadLocalBody(ctx, timeline, at.Unix()/600)
+		require.NoError(t, err)
+		ids := make([]string, 0, len(items))
+		for _, item := range items {
+			ids = append(ids, item.ID())
 		}
-		ackState := func() AckState {
-			t.Helper()
-			return mustAck(t, ctx, in, "con1author", "con1owner", ackSchema)
-		}
-		// attempt runs a transition in a transaction that is always rolled
-		// back, so only the reported applied flag matters
-		attempt := func(id string, unack bool, createdAt time.Time) bool {
-			t.Helper()
-			kind := "ack"
-			if unack {
-				kind = "unack"
-			}
-			sd := ackDoc(kind, createdAt)
-			var applied bool
-			inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-				require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, "con1author"))
-				transition := repo.Acknowledge
-				if unack {
-					transition = repo.UnAcknowledge
-				}
-				var err error
-				applied, err = transition(ctx, tx, id, "con1author", "con1owner", ackSchema, createdAt)
-				require.NoError(t, err)
-			})
-			return applied
-		}
+		require.Contains(t, ids, wantID)
+	}
 
-		withCommit(t, ctx, repo, "ack-1-on", "127.0.0.1", ackDoc("ack", ackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
-			applied, err := repo.Acknowledge(ctx, tx, "ack-1-on", "con1author", "con1owner", ackSchema, ackCreatedAt)
-			require.True(t, applied)
-			return err
-		})
-		ack := ackState()
-		require.True(t, ack.Valid)
-		require.Equal(t, "ack-1-on", ack.DocumentID)
-		// the ack commit is the acker's alone (CIP-10 §5); the target side is
-		// held as an acked commit, see the AckedAcceptIfNewer suite
-		requireCommitOwner(t, ctx, in, "ack-1-on", "con1author")
+	// the timeline key itself (a placeholder here) is no chunkline member
+	tl, itemID, err = repo.GetTimelineRemoval(ctx, timeline)
+	require.NoError(t, err)
+	require.Empty(t, tl)
+	require.Empty(t, itemID)
 
-		// CIP-10 §4: the transition key is createdAt alone. An unack with the
-		// same createdAt is not strictly newer and must no-op even though its
-		// document id sorts above the stored one.
-		require.False(t, attempt("ack-9-same-time", true, ackCreatedAt), "same createdAt must be a no-op: the transition key is createdAt, not the document id")
-		require.Equal(t, "ack-1-on", ackState().DocumentID)
-
-		unackCreatedAt := ackCreatedAt.Add(time.Hour)
-		withCommit(t, ctx, repo, "ack-2-off", "127.0.0.1", ackDoc("unack", unackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
-			applied, err := repo.UnAcknowledge(ctx, tx, "ack-2-off", "con1author", "con1owner", ackSchema, unackCreatedAt)
-			require.True(t, applied)
-			return err
-		})
-		unack := ackState()
-		require.False(t, unack.Valid)
-		require.Equal(t, "ack-2-off", unack.DocumentID)
-		requireCommitOwner(t, ctx, in, "ack-2-off", "con1author")
-
-		// a replayed ack older than the stored unack must not resurrect it...
-		require.False(t, attempt("ack-0-stale", false, ackCreatedAt))
-		afterStaleAck := ackState()
-		require.False(t, afterStaleAck.Valid)
-		require.Equal(t, "ack-2-off", afterStaleAck.DocumentID)
-
-		// ...and after a newer ack (t2), an unack replayed from before it (t1)
-		// must not roll the state back either.
-		reackCreatedAt := ackCreatedAt.Add(24 * time.Hour)
-		withCommit(t, ctx, repo, "ack-3-on", "127.0.0.1", ackDoc("ack", reackCreatedAt), "con1author", func(tx record.RepositoryTx) error {
-			applied, err := repo.Acknowledge(ctx, tx, "ack-3-on", "con1author", "con1owner", ackSchema, reackCreatedAt)
-			require.True(t, applied)
-			return err
-		})
-		require.False(t, attempt("ack-2x-stale", true, unackCreatedAt))
-		afterStaleUnack := ackState()
-		require.True(t, afterStaleUnack.Valid)
-		require.Equal(t, "ack-3-on", afterStaleUnack.DocumentID)
-		require.True(t, afterStaleUnack.CreatedAt.Equal(reackCreatedAt))
-	})
-
-	t.Run("rollback removes commit and record", func(t *testing.T) {
-		rollbackKey := "cckv://con1owner/timeline/rollback"
-		rollbackSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       rollbackKey,
-			Value:     map[string]string{"body": "rollback"},
-			Author:    "con1author",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC),
-		})
-
-		inTxRollback(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "rollback-record", "127.0.0.1", rollbackSD.Document, rollbackSD.Proof, "con1owner"))
-			_, err := repo.CreateRecord(ctx, tx, "rollback-record", rollbackKey, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC))
-			require.NoError(t, err)
-		})
-
-		require.False(t, commitExists(t, ctx, in, "rollback-record"))
-		require.False(t, recordExists(t, ctx, in, "rollback-record"))
-	})
-
-	t.Run("delete removes record payload and keeps commits", func(t *testing.T) {
-		deleteKey := "cckv://con1owner/timeline/delete-target"
-		deleteTargetSD := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       deleteKey,
-			Value:     map[string]string{"body": "delete target"},
-			Author:    "con1author",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC),
-		})
-		withCommit(t, ctx, repo, "delete-target", "127.0.0.1", deleteTargetSD, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, "delete-target", deleteKey, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC))
-			return err
-		})
-
-		deleteSD := SignedDocument(t, concrnt.Document[schemas.Delete]{
-			Kind:      "delete",
-			Value:     schemas.Delete(deleteKey),
-			Author:    "con1author",
-			CreatedAt: time.Date(2026, 6, 8, 8, 9, 10, 0, time.UTC),
-		})
-		withCommit(t, ctx, repo, "delete-commit", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
-			return repo.DeleteRecordByKey(ctx, tx, deleteKey)
-		})
-
-		require.False(t, recordExists(t, ctx, in, "delete-target"))
-		require.True(t, commitExists(t, ctx, in, "delete-target"))
-
-		commit := mustCommit(t, ctx, in, "delete-commit")
-		require.Equal(t, deleteSD.Document, commit.Document)
-		requireCommitOwner(t, ctx, in, "delete-commit", "con1owner")
-	})
-
-	t.Run("mark commit log gc candidate", func(t *testing.T) {
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       "cckv://con1owner/timeline/gc-flag",
-			Value:     map[string]string{"body": "flag me"},
-			Author:    "con1owner",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC),
-		})
-		withCommit(t, ctx, repo, "gc-flag", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-			return nil
-		})
-
-		commit := mustCommit(t, ctx, in, "gc-flag")
-		require.False(t, commit.GcCandidate)
-
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "gc-flag"))
-			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "no-such-commit"))
-		})
-
-		commit = mustCommit(t, ctx, in, "gc-flag")
-		require.True(t, commit.GcCandidate)
-
-		err := repo.MarkCommitLogGcCandidate(ctx, nil, "gc-flag")
-		require.Error(t, err)
-	})
-
-	t.Run("commit log methods marshal proof and ignore conflicts", func(t *testing.T) {
-		href := "cckv://con1owner/timeline/conflict"
-		proof := concrnt.Proof{
-			Type: concrnt.ProofTypeNone,
-			Href: &href,
-		}
-
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "127.0.0.1", "first", proof, "con1owner"))
-			// a re-delivery of the same id is ignored wholesale: document, proof
-			// and owner all stay as first written, and the caller is told
-			require.ErrorIs(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "192.0.2.1", "second", concrnt.Proof{Type: "ignored"}, "con1other"), record.ErrAlreadyCommitted)
-		})
-
-		commit := mustCommit(t, ctx, in, "commit-methods")
-		require.Equal(t, "127.0.0.1", commit.IP)
-		require.Equal(t, "first", commit.Document)
-		require.JSONEq(t, `{"type":"none","href":"cckv://con1owner/timeline/conflict"}`, commit.Proof)
-		require.Equal(t, "con1owner", commit.Owner)
-	})
-
-	// any backend must reject both a nil tx and a tx handle of a foreign type
-	t.Run("write methods reject invalid tx", func(t *testing.T) {
-		err := repo.CreateCommitLog(ctx, nil, "invalid", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner")
-		require.Error(t, err)
-
-		err = repo.CreateCommitLog(ctx, foreignTx{}, "invalid", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner")
-		require.Error(t, err)
-
-		_, err = repo.Acknowledge(ctx, nil, "invalid", "con1author", "con1owner", "https://schema.example/like.json", time.Now())
-		require.Error(t, err)
-
-		_, err = repo.Acknowledge(ctx, foreignTx{}, "invalid", "con1author", "con1owner", "https://schema.example/like.json", time.Now())
-		require.Error(t, err)
-
-		_, err = repo.Acknowledged(ctx, nil, "invalid", "con1author", "con1owner", "https://schema.example/like.json", time.Now())
-		require.Error(t, err)
-
-		_, err = repo.Acknowledged(ctx, foreignTx{}, "invalid", "con1author", "con1owner", "https://schema.example/like.json", time.Now())
-		require.Error(t, err)
-
-		_, err = repo.CreateRecord(ctx, nil, "invalid", key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Now())
-		require.Error(t, err)
-
-		_, err = repo.CreateRecord(ctx, foreignTx{}, "invalid", key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, time.Now())
-		require.Error(t, err)
-
-		err = repo.DeleteRecordByKey(ctx, nil, key)
-		require.Error(t, err)
-
-		err = repo.DeleteRecordByKey(ctx, foreignTx{}, key)
-		require.Error(t, err)
-
-		err = repo.DeleteRecordByDocumentID(ctx, nil, "invalid")
-		require.Error(t, err)
-
-		err = repo.DeleteRecordByDocumentID(ctx, foreignTx{}, "invalid")
-		require.Error(t, err)
-
-		err = repo.DeleteAssociation(ctx, nil, "invalid")
-		require.Error(t, err)
-
-		err = repo.DeleteAssociation(ctx, foreignTx{}, "invalid")
-		require.Error(t, err)
-	})
+	_, _, err = repo.GetTimelineRemoval(ctx, timeline+"/no-such-key")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "an unknown key is not found, got %v", err)
 }
 
 // QueryRecordSubtree must match by path hierarchy — never siblings sharing a
 // string prefix, never keys that only match via unescaped pattern
-// metacharacters — and deleting the enumerated keys must remove exactly those
-// records (with their associations) while leaving siblings and commitlogs in
-// place.
-func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
+// metacharacters — in key order, paged by an exclusive cursor.
+func testRecordSubtreeQuery(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
-	in := be.Inspect
 
 	base := "cckv://con1owner/lists/item"
 	keys := []string{
@@ -635,41 +433,15 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 	}
 	createdAt := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
 	for i, key := range keys {
-		id := fmt.Sprintf("subtree-%d", i)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": key},
-			Author:    "con1owner",
-			Schema:    "https://schema.example/item.json",
-			CreatedAt: createdAt,
-		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
-			return err
-		})
+		putRecord(t, ctx, repo, fmt.Sprintf("subtree-%d", i), key, createdAt)
 	}
-
-	// an association targeting a subtree member must cascade with the delete
-	variant := "reply"
-	associationSD := SignedDocument(t, concrnt.Document[map[string]string]{
-		Kind:      "association",
-		Value:     map[string]string{"body": "on child"},
-		Author:    "con1author",
-		Schema:    "https://schema.example/comment.json",
-		CreatedAt: createdAt,
-		Associate: &keys[1],
-	})
-	withCommit(t, ctx, repo, "subtree-association", "127.0.0.1", associationSD, "con1owner", func(tx record.RepositoryTx) error {
-		_, err := repo.CreateAssociation(ctx, tx, "subtree-association", keys[1], "con1owner", "con1author", "https://schema.example/comment.json", &variant, "subtree-unique", createdAt)
-		return err
-	})
 
 	urisOf := func(sds []concrnt.SignedDocument) []string {
 		uris := make([]string, 0, len(sds))
 		for _, sd := range sds {
 			require.NotNil(t, sd.CCKV)
 			require.NotNil(t, sd.CCFS)
+			require.NotEmpty(t, sd.Document)
 			uris = append(uris, *sd.CCKV)
 		}
 		return uris
@@ -702,8 +474,8 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 	})
 
 	t.Run("pages in key order", func(t *testing.T) {
-		// the cursor and the limit page a large subtree one transaction at
-		// a time (the range delete jobs); the page after the last key is empty
+		// the cursor and the limit page a large subtree one write at a time
+		// (the range delete jobs); the page after the last key is empty
 		sds, err := repo.QueryRecordSubtree(ctx, base, true, "", 2)
 		require.NoError(t, err)
 		require.Equal(t, []string{base, base + "/a"}, urisOf(sds))
@@ -721,44 +493,24 @@ func testRecordSubtreeQueryAndDelete(t *testing.T, be Backend) {
 		require.Equal(t, []string{base + "/a", base + "/a/b"}, urisOf(sds), "the cursor is exclusive and ignores includeSelf")
 	})
 
-	t.Run("subtree delete removes exactly the enumerated keys", func(t *testing.T) {
+	t.Run("deleting the enumerated keys removes exactly the subtree", func(t *testing.T) {
+		outcome := removeKeys(t, ctx, repo, "subtree-delete", "con1owner", base, base+"/a", base+"/a/b")
+		require.Equal(t, []bool{true, true, true}, outcome.Removed)
+
+		for _, uri := range []string{base, base + "/a", base + "/a/b"} {
+			require.Nil(t, resolve(t, ctx, repo, uri), "key %s must no longer resolve", uri)
+		}
 		sds, err := repo.QueryRecordSubtree(ctx, base, true, "", 0)
 		require.NoError(t, err)
-
-		deleteSD := SignedDocument(t, concrnt.Document[schemas.Delete]{
-			Kind:      "delete",
-			Value:     schemas.Delete(base + "*"),
-			Author:    "con1owner",
-			CreatedAt: createdAt,
-		})
-		withCommit(t, ctx, repo, "subtree-delete", "127.0.0.1", deleteSD, "con1owner", func(tx record.RepositoryTx) error {
-			for _, uri := range urisOf(sds) {
-				if err := repo.DeleteRecordByKey(ctx, tx, uri); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-
-		// the subtree is gone: records and their key rows
-		for i := range 3 {
-			require.False(t, recordExists(t, ctx, in, fmt.Sprintf("subtree-%d", i)), "record %d must be deleted", i)
-		}
-		for _, uri := range []string{base, base + "/a", base + "/a/b"} {
-			require.False(t, keyPointsAtRecord(t, ctx, in, uri), "key %s must no longer resolve", uri)
-		}
-
-		// the association on the deleted child cascaded away
-		require.False(t, associationExists(t, ctx, in, "subtree-association"))
+		require.Empty(t, sds)
 
 		// siblings and decoys survive
-		for i := 3; i < 6; i++ {
-			require.True(t, recordExists(t, ctx, in, fmt.Sprintf("subtree-%d", i)), "record %d must survive", i)
+		for _, uri := range keys[3:] {
+			require.NotNil(t, resolve(t, ctx, repo, uri), "key %s must survive", uri)
 		}
-
-		// commitlogs of the deleted records stay (delete never erases history)
+		// commits of the deleted records stay (delete never erases history)
 		for i := range 3 {
-			require.True(t, commitExists(t, ctx, in, fmt.Sprintf("subtree-%d", i)), "commitlog %d must survive", i)
+			require.True(t, commitExists(t, ctx, repo, fmt.Sprintf("subtree-%d", i)), "commit %d must survive", i)
 		}
 	})
 }
@@ -784,71 +536,87 @@ func testRecordQueryAuthorFilter(t *testing.T, be Backend) {
 	}
 	createdAt := time.Date(2026, 8, 14, 9, 10, 11, 0, time.UTC)
 	for i, e := range entries {
-		id := fmt.Sprintf("authorfilter-%d", i)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       e.key,
-			Value:     map[string]string{"body": e.key},
-			Author:    e.author,
-			Schema:    "https://schema.example/item.json",
-			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
+		putRecord(t, ctx, repo, fmt.Sprintf("authorfilter-%d", i), e.key, createdAt.Add(time.Duration(i)*time.Second), func(rc *record.RecordCommit) {
+			rc.Author = e.author
 		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, e.key, "con1owner", e.author, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
-			return err
-		})
-	}
-
-	urisOfRows := func(rows []record.QueryRow) []string {
-		uris := make([]string, 0, len(rows))
-		for _, row := range rows {
-			require.NotNil(t, row.Row.CCKV)
-			uris = append(uris, *row.Row.CCKV)
-		}
-		return uris
 	}
 
 	t.Run("by parent with author", func(t *testing.T) {
 		rows, err := repo.QueryByParent(ctx, parent, "", "con1alice", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/e1", parent + "/e3"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/e1", parent + "/e3"}, rowKeys(t, rows))
 	})
 
 	t.Run("by parent without author returns all", func(t *testing.T) {
 		rows, err := repo.QueryByParent(ctx, parent, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/e1", parent + "/e2", parent + "/e3"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/e1", parent + "/e2", parent + "/e3"}, rowKeys(t, rows))
 	})
 
 	t.Run("by prefix with author", func(t *testing.T) {
 		rows, err := repo.QueryByPrefix(ctx, parent+"/", "", "con1bob", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/e2"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/e2"}, rowKeys(t, rows))
 	})
 
 	// the prefix is a literal: "_" in it matches itself only (a raw "%" cannot
 	// appear in a key, so only "_" is observable)
 	t.Run("prefix metacharacters are literal", func(t *testing.T) {
 		for i, key := range []string{parent + "/t_1", parent + "/tx1"} {
-			id := fmt.Sprintf("prefixmeta-%d", i)
-			sd := SignedDocument(t, concrnt.Document[map[string]string]{
-				Kind:      "record",
-				Key:       key,
-				Value:     map[string]string{"body": key},
-				Author:    "con1alice",
-				Schema:    "https://schema.example/item.json",
-				CreatedAt: createdAt.Add(time.Duration(10+i) * time.Second),
-			})
-			withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-				_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1alice", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(10+i)*time.Second))
-				return err
-			})
+			putRecord(t, ctx, repo, fmt.Sprintf("prefixmeta-%d", i), key, createdAt.Add(time.Duration(10+i)*time.Second))
 		}
 
 		rows, err := repo.QueryByPrefix(ctx, parent+"/t_", "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/t_1"}, urisOfRows(rows), "underscore must not match any character")
+		require.Equal(t, []string{parent + "/t_1"}, rowKeys(t, rows), "underscore must not match any character")
 	})
+}
+
+// The createdAt listings order by (createdAt, id) in either direction,
+// window inclusively, bound the page, and a prefix reaches below direct
+// children while a parent does not.
+func testRecordQueryByCreatedAt(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	parent := "cckv://con1owner/feed"
+	t0 := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	// two records share a createdAt: the id breaks the tie
+	putRecord(t, ctx, repo, "feed-a", parent+"/k3", t0)
+	putRecord(t, ctx, repo, "feed-b", parent+"/k1", t0.Add(time.Minute))
+	putRecord(t, ctx, repo, "feed-c", parent+"/k2", t0.Add(time.Minute))
+	putRecord(t, ctx, repo, "feed-d", parent+"/sub/k4", t0.Add(2*time.Minute))
+
+	for name, query := range map[string]func(since, until *time.Time, limit int, order string) ([]record.QueryRow, error){
+		"parent": func(since, until *time.Time, limit int, order string) ([]record.QueryRow, error) {
+			return repo.QueryByParent(ctx, parent, "", "", since, until, limit, order)
+		},
+		"prefix": func(since, until *time.Time, limit int, order string) ([]record.QueryRow, error) {
+			return repo.QueryByPrefix(ctx, parent+"/k", "", "", since, until, limit, order)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rows, err := query(nil, nil, 0, "asc")
+			require.NoError(t, err)
+			require.Equal(t, []string{"feed-a", "feed-b", "feed-c"}, rowIDs(t, rows))
+
+			rows, err = query(nil, nil, 2, "desc")
+			require.NoError(t, err)
+			require.Equal(t, []string{"feed-c", "feed-b"}, rowIDs(t, rows))
+
+			rows, err = query(ptr(t0.Add(time.Minute)), nil, 0, "asc")
+			require.NoError(t, err)
+			require.Equal(t, []string{"feed-b", "feed-c"}, rowIDs(t, rows), "since is inclusive")
+
+			rows, err = query(nil, ptr(t0), 0, "desc")
+			require.NoError(t, err)
+			require.Equal(t, []string{"feed-a"}, rowIDs(t, rows), "until is inclusive")
+		})
+	}
+
+	rows, err := repo.QueryByPrefix(ctx, parent+"/", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{"feed-a", "feed-b", "feed-c", "feed-d"}, rowIDs(t, rows), "a prefix reaches the whole subtree")
 }
 
 // CIP-12 §5.3: the hierarchical policy stack is emitted root-first with the
@@ -864,21 +632,8 @@ func testHierarchicalRecordPoliciesRootFirst(t *testing.T, be Backend) {
 		"cckv://con1powner/l1/l2/l3",
 	}
 	for i, key := range keys {
-		id := fmt.Sprintf("policy-record-%d", i)
-		createdAt := time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": "x"},
-			Author:    "con1powner",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-		p := policyJSON
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1powner", func(tx record.RepositoryTx) error {
-			applied, err := repo.CreateRecord(ctx, tx, id, key, "con1powner", "con1powner", "https://schema.example/post.json", nil, &p, []string{}, nil, createdAt)
-			require.True(t, applied)
-			return err
+		putRecord(t, ctx, repo, fmt.Sprintf("policy-record-%d", i), key, time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC), func(rc *record.RecordCommit) {
+			rc.Policies = &policyJSON
 		})
 	}
 
@@ -890,6 +645,14 @@ func testHierarchicalRecordPoliciesRootFirst(t *testing.T, be Backend) {
 		sources[i] = layer.Source
 	}
 	require.Equal(t, keys, sources, "layers must be emitted root-first, self last")
+
+	// a ccfs URI is mapped to the key pointing at it
+	byCCFS, err := repo.GetHierarchicalRecordPolicies(ctx, ccfsOf("con1powner", "policy-record-2"))
+	require.NoError(t, err)
+	require.Equal(t, stack, byCCFS)
+
+	_, err = repo.GetHierarchicalRecordPolicies(ctx, ccfsOf("con1powner", "policy-record-none"))
+	require.True(t, errors.Is(err, domain.ErrNotFound), "a ccfs URI no key points at is not found, got %v", err)
 }
 
 // A level with no policy of its own but with distributions must still be
@@ -904,30 +667,12 @@ func testHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T
 	leafKey := "cckv://con1downer/d1/post"
 	timeline := "cckv://con1tl/timelines/home"
 
-	for i, tc := range []struct {
-		key           string
-		policies      *string
-		distributions []string
-	}{
-		{parentKey, &policyJSON, []string{}},
-		{leafKey, nil, []string{timeline}},
-	} {
-		id := fmt.Sprintf("distributing-record-%d", i)
-		createdAt := time.Date(2026, 6, 2, 0, 0, i, 0, time.UTC)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       tc.key,
-			Value:     map[string]string{"body": "x"},
-			Author:    "con1downer",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1downer", func(tx record.RepositoryTx) error {
-			applied, err := repo.CreateRecord(ctx, tx, id, tc.key, "con1downer", "con1downer", "https://schema.example/post.json", nil, tc.policies, tc.distributions, nil, createdAt)
-			require.True(t, applied)
-			return err
-		})
-	}
+	putRecord(t, ctx, repo, "distributing-record-0", parentKey, time.Date(2026, 6, 2, 0, 0, 0, 0, time.UTC), func(rc *record.RecordCommit) {
+		rc.Policies = &policyJSON
+	})
+	putRecord(t, ctx, repo, "distributing-record-1", leafKey, time.Date(2026, 6, 2, 0, 0, 1, 0, time.UTC), func(rc *record.RecordCommit) {
+		rc.Distributions = []string{timeline}
+	})
 
 	stack, err := repo.GetHierarchicalRecordPolicies(ctx, leafKey)
 	require.NoError(t, err)
@@ -940,123 +685,88 @@ func testHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T
 	require.Equal(t, []string{timeline}, *stack[1].VirtualParents)
 }
 
-// A parent placeholder (a key with no record) must not trip the conditional
-// upsert: writing a record to a key that so far only exists as a placeholder
-// parent must apply.
-func testCreateRecordAppliesOverParentPlaceholder(t *testing.T, be Backend) {
+// Committing a child materialises its ancestors as placeholders: listed as
+// key-only rows, resolving to nothing. Writing a record to a key that so
+// far only exists as a placeholder must apply, as a fresh key.
+func testApplyRecordOverParentPlaceholder(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
-	in := be.Inspect
 
 	parentKey := "cckv://con1ph/parent"
 	childKey := "cckv://con1ph/parent/child"
 
-	commit := func(id, key string, createdAt time.Time) {
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": "x"},
-			Author:    "con1ph",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1ph", func(tx record.RepositoryTx) error {
-			applied, err := repo.CreateRecord(ctx, tx, id, key, "con1ph", "con1ph", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
-			require.True(t, applied)
-			return err
-		})
-	}
+	putRecord(t, ctx, repo, "placeholder-child", childKey, time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC))
 
-	// committing the child materializes the parent as a placeholder
-	commit("placeholder-child", childKey, time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC))
+	require.Nil(t, resolve(t, ctx, repo, parentKey), "a placeholder resolves to nothing")
+	rows, err := repo.QueryByParentOrderByKey(ctx, "cckv://con1ph", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{parentKey}, rowKeys(t, rows))
+	require.Empty(t, rows[0].Row.Document, "the parent exists as a placeholder")
 
-	rk := mustRecordKey(t, ctx, in, parentKey)
-	require.Nil(t, rk.RecordID, "the parent must exist as a placeholder")
+	_, outcome := putRecord(t, ctx, repo, "placeholder-parent", parentKey, time.Date(2026, 6, 3, 0, 0, 1, 0, time.UTC))
+	require.True(t, outcome.FreshKey, "a placeholder held no record")
+	require.Empty(t, outcome.PreviousID)
 
-	commit("placeholder-parent", parentKey, time.Date(2026, 6, 3, 0, 0, 1, 0, time.UTC))
+	rows, err = repo.QueryByParentOrderByKey(ctx, "cckv://con1ph", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{"placeholder-parent"}, rowIDs(t, rows))
 
-	rk = mustRecordKey(t, ctx, in, parentKey)
-	require.NotNil(t, rk.RecordID)
-	require.Equal(t, "placeholder-parent", *rk.RecordID)
+	// the child is still the parent's child
+	rows, err = repo.QueryByParent(ctx, parentKey, "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{childKey}, rowKeys(t, rows))
 }
 
-// A key that does not exist yet cannot be locked, so two commits racing on a
-// fresh key both pass any fast-path check — the conditional write is what
-// keeps the newer document. The older commit must come back unapplied whether
-// it lands while the newer one is still in flight or after it committed.
-func testCreateRecordFreshKeyConditionalUpsert(t *testing.T, be Backend) {
+// Two commits racing on a key that does not exist yet: whatever the
+// interleaving, the newer document holds the key afterwards, and the
+// outcomes tell one consistent story (the older one either lost, or was
+// applied first and then replaced).
+func testApplyRecordFreshKeyRace(t *testing.T, be Backend) {
 	ctx := context.Background()
 	repo := be.Record
-	in := be.Inspect
 
-	key := "cckv://con1race/fresh"
-	newID, newAt := "race-2-new", time.Date(2026, 6, 4, 0, 0, 1, 0, time.UTC)
-	oldID, oldAt := "race-1-old", time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
-	signedFor := func(createdAt time.Time) concrnt.SignedDocument {
-		return SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": "x"},
-			Author:    "con1race",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-	}
+	oldAt := time.Date(2026, 6, 4, 0, 0, 0, 0, time.UTC)
+	newAt := oldAt.Add(time.Second)
 
-	type outcome struct {
-		applied bool
-		err     error
-	}
-	done := make(chan outcome, 1)
+	for round := range 20 {
+		key := fmt.Sprintf("cckv://con1race/fresh/%02d", round)
+		oldID, newID := fmt.Sprintf("race-%02d-1-old", round), fmt.Sprintf("race-%02d-2-new", round)
+		commits := []record.RecordCommit{recordCommit(t, oldID, key, oldAt), recordCommit(t, newID, key, newAt)}
+		outcomes := make([]record.RecordOutcome, 2)
+		errs := make([]error, 2)
 
-	// the newer commit writes the fresh key but holds its tx open, so the
-	// older commit can neither see nor lock it
-	sdNew := signedFor(newAt)
-	require.NoError(t, repo.RunInTx(ctx, func(tx1 record.RepositoryTx) error {
-		if err := repo.CreateCommitLog(ctx, tx1, newID, "127.0.0.1", sdNew.Document, sdNew.Proof, "con1owner"); err != nil {
-			return err
+		var wg sync.WaitGroup
+		for i := range commits {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				outcomes[i], errs[i] = repo.ApplyRecord(ctx, commits[i])
+			}()
 		}
-		applied, err := repo.CreateRecord(ctx, tx1, newID, key, "con1race", "con1race", "https://schema.example/post.json", nil, nil, []string{}, nil, newAt)
-		if err != nil {
-			return err
+		wg.Wait()
+		require.NoError(t, errs[0])
+		require.NoError(t, errs[1])
+		older, newer := outcomes[0], outcomes[1]
+
+		got := resolve(t, ctx, repo, key)
+		require.NotNil(t, got)
+		require.Equal(t, ccfsOf("con1race", newID), *got.CCFS, "the newer document must hold the key")
+		require.Equal(t, record.Applied, newer.Status)
+
+		switch older.Status {
+		case record.Stale:
+			require.True(t, newer.FreshKey)
+			require.Empty(t, newer.PreviousID)
+			require.False(t, commitExists(t, ctx, repo, oldID))
+		case record.Applied:
+			require.True(t, older.FreshKey)
+			require.False(t, newer.FreshKey, "the newer document replaced the older one")
+			require.Equal(t, oldID, newer.PreviousID)
+			require.True(t, gcFlagged(t, ctx, repo, oldID), "the replaced version is forgotten")
+		default:
+			t.Fatalf("unexpected status %v for the older document", older.Status)
 		}
-		require.True(t, applied)
-
-		go func() {
-			var applied bool
-			err := repo.RunInTx(ctx, func(tx2 record.RepositoryTx) error {
-				sdOld := signedFor(oldAt)
-				if err := repo.CreateCommitLog(ctx, tx2, oldID, "127.0.0.1", sdOld.Document, sdOld.Proof, "con1owner"); err != nil {
-					return err
-				}
-				var err error
-				applied, err = repo.CreateRecord(ctx, tx2, oldID, key, "con1race", "con1race", "https://schema.example/post.json", nil, nil, []string{}, nil, oldAt)
-				if err != nil {
-					return err
-				}
-				if !applied {
-					return errTestRollback
-				}
-				return nil
-			})
-			if errors.Is(err, errTestRollback) {
-				err = nil
-			}
-			done <- outcome{applied: applied, err: err}
-		}()
-
-		// let the older commit reach its wait on the key, then land the newer one
-		time.Sleep(200 * time.Millisecond)
-		return nil
-	}))
-
-	res := <-done
-	require.NoError(t, res.err)
-	require.False(t, res.applied, "the older document must lose the fresh-key race")
-
-	rk := mustRecordKey(t, ctx, in, key)
-	require.NotNil(t, rk.RecordID)
-	require.Equal(t, newID, *rk.RecordID)
+	}
 }
 
 // The repository dump (/repository, conctl dump-commitlog) is scoped by the
@@ -1067,30 +777,17 @@ func testGetAllCommitLogsByOwner(t *testing.T, be Backend) {
 	repo := be.Record
 
 	userA, userB := "con1aaaa", "con1bbbb"
-	seed := func(id, owner string) {
-		t.Helper()
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       "cckv://" + owner + "/" + id,
-			Value:     map[string]string{"id": id},
-			Author:    owner,
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: time.Now(),
-		})
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, owner))
-		})
-	}
-	seed("a-1", userA)
-	seed("b-1", userB)
-	seed("a-2", userA)
-	seed("unowned", "")
+	putCommit(t, ctx, repo, "a-1", userA, `{"id":"a-1"}`)
+	putCommit(t, ctx, repo, "b-1", userB, `{"id":"b-1"}`)
+	putCommit(t, ctx, repo, "a-2", userA, `{"id":"a-2"}`)
+	putCommit(t, ctx, repo, "unowned", "", `{"id":"unowned"}`)
 
 	logs, err := repo.GetAllCommitLogs(ctx, userA)
 	require.NoError(t, err)
 	require.Len(t, logs, 2)
 	require.Contains(t, logs[0].Document, `"id":"a-1"`)
 	require.Contains(t, logs[1].Document, `"id":"a-2"`)
+	require.Equal(t, concrnt.ProofTypeNone, logs[0].Proof.Type)
 
 	logs, err = repo.GetAllCommitLogs(ctx, userB)
 	require.NoError(t, err)
@@ -1114,34 +811,15 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 	keys := []string{parent + "/b", parent + "/a", parent + "/posts/1"}
 	createdAt := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
 	for i, key := range keys {
-		id := fmt.Sprintf("keyorder-%d", i)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": key},
-			Author:    owner,
-			Schema:    "https://schema.example/item.json",
-			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
+		putRecord(t, ctx, repo, fmt.Sprintf("keyorder-%d", i), key, createdAt.Add(time.Duration(i)*time.Second), func(rc *record.RecordCommit) {
+			rc.Schema = "https://schema.example/item.json"
 		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
-			return err
-		})
-	}
-
-	urisOfRows := func(rows []record.QueryRow) []string {
-		uris := make([]string, 0, len(rows))
-		for _, row := range rows {
-			require.NotNil(t, row.Row.CCKV)
-			uris = append(uris, *row.Row.CCKV)
-		}
-		return uris
 	}
 
 	t.Run("ascending with the placeholder as a key-only row", func(t *testing.T) {
 		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/a", parent + "/b", parent + "/posts"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/a", parent + "/b", parent + "/posts"}, rowKeys(t, rows))
 		require.NotEmpty(t, rows[0].Row.Document)
 		require.NotNil(t, rows[0].Row.CCFS)
 		require.Empty(t, rows[2].Row.Document, "a placeholder key carries no document")
@@ -1152,29 +830,29 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 	t.Run("descending", func(t *testing.T) {
 		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "desc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/posts", parent + "/b", parent + "/a"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/posts", parent + "/b", parent + "/a"}, rowKeys(t, rows))
 	})
 
 	t.Run("since and until are inclusive key bounds", func(t *testing.T) {
 		since := parent + "/b"
 		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", &since, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/b", parent + "/posts"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/b", parent + "/posts"}, rowKeys(t, rows))
 
 		until := parent + "/b"
 		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, &until, 0, "desc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/b", parent + "/a"}, rowKeys(t, rows))
 
 		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 2, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/a", parent + "/b"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/a", parent + "/b"}, rowKeys(t, rows))
 	})
 
 	t.Run("schema filter drops placeholders", func(t *testing.T) {
 		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "https://schema.example/item.json", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/a", parent + "/b"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/a", parent + "/b"}, rowKeys(t, rows))
 
 		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "con1someoneelse", nil, nil, 0, "asc")
 		require.NoError(t, err)
@@ -1184,7 +862,7 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 	t.Run("owner root lists the top-level keys", func(t *testing.T) {
 		rows, err := repo.QueryByParentOrderByKey(ctx, root, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent}, urisOfRows(rows))
+		require.Equal(t, []string{parent}, rowKeys(t, rows))
 		require.Empty(t, rows[0].Row.Document)
 
 		rows, err = repo.QueryByParentOrderByKey(ctx, "cckv://con1keyorderx", "", "", nil, nil, 0, "asc")
@@ -1197,29 +875,17 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 	t.Run("key order is byte order", func(t *testing.T) {
 		parent := root + "/bytes"
 		for i, key := range []string{parent + "/a_b", parent + "/B", parent + "/a-b", parent + "/a"} {
-			id := fmt.Sprintf("byteorder-%d", i)
-			sd := SignedDocument(t, concrnt.Document[map[string]string]{
-				Kind:      "record",
-				Key:       key,
-				Value:     map[string]string{"body": key},
-				Author:    owner,
-				Schema:    "https://schema.example/item.json",
-				CreatedAt: createdAt,
-			})
-			withCommit(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx record.RepositoryTx) error {
-				_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
-				return err
-			})
+			putRecord(t, ctx, repo, fmt.Sprintf("byteorder-%d", i), key, createdAt)
 		}
 
 		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows))
+		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, rowKeys(t, rows))
 
 		since := parent + "/a"
 		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", &since, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows), "the since bound is a byte-order bound too")
+		require.Equal(t, []string{parent + "/a", parent + "/a-b", parent + "/a_b"}, rowKeys(t, rows), "the since bound is a byte-order bound too")
 
 		sds, err := repo.QueryRecordSubtree(ctx, parent, false, "", 0)
 		require.NoError(t, err)
@@ -1237,7 +903,7 @@ func testRecordQueryByParentOrderByKey(t *testing.T, be Backend) {
 
 		rows, err = repo.QueryByParent(ctx, parent, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)
-		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows), "placeholders stay out of the createdAt listing")
+		require.Equal(t, []string{parent + "/b", parent + "/a"}, rowKeys(t, rows), "placeholders stay out of the createdAt listing")
 	})
 }
 
@@ -1251,28 +917,14 @@ func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
 	repo := be.Record
 
 	key := "cckv://con1owner/notes/n1"
-	createdAt := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
-	sd := SignedDocument(t, concrnt.Document[map[string]string]{
-		Kind:      "record",
-		Key:       key,
-		Value:     map[string]string{"body": "n1"},
-		Author:    "con1owner",
-		Schema:    "https://schema.example/note.json",
-		CreatedAt: createdAt,
-	})
-	withCommit(t, ctx, repo, "ccfs-record", "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-		_, err := repo.CreateRecord(ctx, tx, "ccfs-record", key, "con1owner", "con1owner", "https://schema.example/note.json", nil, nil, []string{}, nil, createdAt)
-		return err
-	})
-	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		require.NoError(t, repo.CreateCommitLog(ctx, tx, "ccfs-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-	})
+	rc, _ := putRecord(t, ctx, repo, "ccfs-record", key, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	putCommit(t, ctx, repo, "ccfs-keyless", "con1owner", "{}")
 
-	ccfs := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-record")
+	ccfs := ccfsOf("con1owner", "ccfs-record")
 	got, err := repo.GetSignedDocument(ctx, ccfs)
 	require.NoError(t, err)
-	require.Equal(t, sd.Document, got.Document)
-	require.Equal(t, sd.Proof, got.Proof)
+	require.Equal(t, rc.Document, got.Document)
+	require.Equal(t, rc.Proof, got.Proof)
 	require.NotNil(t, got.CCFS)
 	require.Equal(t, ccfs, *got.CCFS)
 	require.NotNil(t, got.CCKV)
@@ -1284,13 +936,13 @@ func testGetSignedDocumentByCCFS(t *testing.T, be Backend) {
 	require.NotNil(t, got.CCFS)
 	require.Equal(t, ccfs, *got.CCFS)
 
-	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-keyless")
+	keyless := ccfsOf("con1owner", "ccfs-keyless")
 	got, err = repo.GetSignedDocument(ctx, keyless)
 	require.NoError(t, err)
 	require.Equal(t, "{}", got.Document)
 	require.Nil(t, got.CCKV, "a commit no key points at has no cckv")
 
-	_, err = repo.GetSignedDocument(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "ccfs-unknown"))
+	_, err = repo.GetSignedDocument(ctx, ccfsOf("con1owner", "ccfs-unknown"))
 	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown id must be not found, got %v", err)
 
 	_, err = repo.GetSignedDocument(ctx, "cckv://con1owner/notes")
@@ -1312,37 +964,19 @@ func testGetSignedDocuments(t *testing.T, be Backend) {
 	repo := be.Record
 
 	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
-	seed := func(id, key string) concrnt.SignedDocument {
-		t.Helper()
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"id": id},
-			Author:    "con1owner",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
-			return err
-		})
-		return sd
-	}
-	sd1 := seed("multi-1", "cckv://con1owner/posts/p1")
-	sd2 := seed("multi-2", "cckv://con1owner/posts/p2")
-	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		require.NoError(t, repo.CreateCommitLog(ctx, tx, "multi-keyless", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"))
-	})
+	rc1, _ := putRecord(t, ctx, repo, "multi-1", "cckv://con1owner/posts/p1", createdAt)
+	rc2, _ := putRecord(t, ctx, repo, "multi-2", "cckv://con1owner/posts/p2", createdAt)
+	putCommit(t, ctx, repo, "multi-keyless", "con1owner", "{}")
 
-	ccfs2 := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-2")
-	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-keyless")
+	ccfs2 := ccfsOf("con1owner", "multi-2")
+	keyless := ccfsOf("con1owner", "multi-keyless")
 	uris := []string{
 		"cckv://con1owner/posts/p1",
 		ccfs2,
 		keyless,
 		"cckv://con1owner/posts/none",
 		"cckv://con1owner/posts", // placeholder
-		concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-none"),
+		ccfsOf("con1owner", "multi-none"),
 		"ccfs://con1owner/" + concrnt.CCFSTypeBlob + "/" + strings.Repeat("0", 64),
 	}
 	got, err := repo.GetSignedDocuments(ctx, uris)
@@ -1351,14 +985,14 @@ func testGetSignedDocuments(t *testing.T, be Backend) {
 
 	p1 := got["cckv://con1owner/posts/p1"]
 	require.NotNil(t, p1)
-	require.Equal(t, sd1.Document, p1.Document)
-	require.Equal(t, sd1.Proof, p1.Proof)
+	require.Equal(t, rc1.Document, p1.Document)
+	require.Equal(t, rc1.Proof, p1.Proof)
 	require.Equal(t, "cckv://con1owner/posts/p1", *p1.CCKV)
-	require.Equal(t, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-1"), *p1.CCFS)
+	require.Equal(t, ccfsOf("con1owner", "multi-1"), *p1.CCFS)
 
 	p2 := got[ccfs2]
 	require.NotNil(t, p2)
-	require.Equal(t, sd2.Document, p2.Document)
+	require.Equal(t, rc2.Document, p2.Document)
 	require.Equal(t, ccfs2, *p2.CCFS)
 	require.Equal(t, "cckv://con1owner/posts/p2", *p2.CCKV)
 
@@ -1385,27 +1019,13 @@ func testHierarchicalRecordPoliciesMulti(t *testing.T, be Backend) {
 	policyJSON := `{"entries":[{"url":"https://example.com/p.json"}]}`
 	dist := []string{"cckv://con1elsewhere/tl"}
 	for i, key := range []string{"cckv://con1multi/l1", "cckv://con1multi/l1/l2", "cckv://con1multi/other"} {
-		id := fmt.Sprintf("multi-policy-%d", i)
-		createdAt := time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC)
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       key,
-			Value:     map[string]string{"body": "x"},
-			Author:    "con1multi",
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: createdAt,
-		})
-		var policies *string
-		var distributions []string
-		switch i {
-		case 0:
-			policies = ptr(policyJSON)
-		case 1:
-			distributions = dist
-		}
-		withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1multi", func(tx record.RepositoryTx) error {
-			_, err := repo.CreateRecord(ctx, tx, id, key, "con1multi", "con1multi", "https://schema.example/post.json", nil, policies, distributions, nil, createdAt)
-			return err
+		putRecord(t, ctx, repo, fmt.Sprintf("multi-policy-%d", i), key, time.Date(2026, 6, 1, 0, 0, i, 0, time.UTC), func(rc *record.RecordCommit) {
+			switch i {
+			case 0:
+				rc.Policies = ptr(policyJSON)
+			case 1:
+				rc.Distributions = dist
+			}
 		})
 	}
 
@@ -1424,7 +1044,7 @@ func testHierarchicalRecordPoliciesMulti(t *testing.T, be Backend) {
 	require.Equal(t, dist, *stacks["cckv://con1multi/l1/l2"][1].VirtualParents)
 	require.Empty(t, stacks["cckv://con1multi/other"])
 
-	_, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{concrnt.ComposeCCFSURI("con1multi", concrnt.CCFSTypeConcrnt, "multi-policy-0")})
+	_, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{ccfsOf("con1multi", "multi-policy-0")})
 	require.Error(t, err, "the multi lookup is keyed by cckv")
 
 	stacks, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, nil)
@@ -1448,11 +1068,11 @@ func testGetEntityByCCIDAndAlias(t *testing.T, be Backend) {
 		Schema:    schemas.EntityURL,
 		CreatedAt: createdAt,
 	})
-	withCommit(t, ctx, repo, "entity-lookup", "127.0.0.1", sd, ccid, func(tx record.RepositoryTx) error {
-		applied, err := repo.CreateEntity(ctx, tx, ccid, &alias, "example.com", "entity-lookup", createdAt)
-		require.True(t, applied)
-		return err
+	status, err := repo.ApplyEntity(ctx, record.EntityCommit{
+		Commit: commitOf("entity-lookup", sd, ccid), CCID: ccid, Alias: &alias, Domain: "example.com", CreatedAt: createdAt,
 	})
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, status)
 
 	for _, lookup := range []struct {
 		name string
@@ -1474,7 +1094,7 @@ func testGetEntityByCCIDAndAlias(t *testing.T, be Backend) {
 		})
 	}
 
-	_, err := repo.GetEntityByCCID(ctx, "con1nobodynobodynobodynobodynobodynobodyno")
+	_, err = repo.GetEntityByCCID(ctx, "con1nobodynobodynobodynobodynobodynobodyno")
 	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown ccid must be not found, got %v", err)
 	_, err = repo.GetEntityByAlias(ctx, "nobody.example.com")
 	require.True(t, errors.Is(err, domain.ErrNotFound), "unknown alias must be not found, got %v", err)

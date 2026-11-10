@@ -2,91 +2,79 @@ package repotest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/concrnt/concrnt/internal/domain"
 )
 
 // RunChunklineSuite runs the chunkline contract tests of record.Repository. open must
 // return a fresh, isolated backend per call; it is called once per top-level
 // test.
 func RunChunklineSuite(t *testing.T, open func(t *testing.T) Backend) {
-	t.Run("UsesRecordCreatedAt", func(t *testing.T) { testChunklineUsesRecordCreatedAt(t, open(t)) })
+	t.Run("ManifestItrAndBody", func(t *testing.T) { testChunklineManifestItrAndBody(t, open(t)) })
 	t.Run("ChunkBoundaryIsHalfOpen", func(t *testing.T) { testChunklineChunkBoundaryIsHalfOpen(t, open(t)) })
-	t.Run("ManifestEmptyFeedHasNullFirstChunk", func(t *testing.T) { testChunklineManifestEmptyFeedHasNullFirstChunk(t, open(t)) })
-	t.Run("LoadLocalBodySurvivesRecordCreatedAtDivergence", func(t *testing.T) {
-		testChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t, open(t))
-	})
+	t.Run("EmptyAndMissingTimelines", func(t *testing.T) { testChunklineEmptyAndMissingTimelines(t, open(t)) })
+	t.Run("WindowLargerThanAPage", func(t *testing.T) { testChunklineWindowLargerThanAPage(t, open(t)) })
+	t.Run("SparseWindowIsFilledFromOlderItems", func(t *testing.T) { testChunklineSparseWindow(t, open(t)) })
 }
 
-// chunkPageSize is the number of items the backends' first LoadLocalBody
-// query is limited to (their defaultChunkSize).
+// chunkPageSize is the number of items a body holds at least when the
+// timeline has that many at or before the chunk.
 const chunkPageSize = 32
 
-// LoadLocalBody must judge window coverage and emit timestamps by the
-// key's recordCreatedAt — what its queries filter and order by — not the
-// record's own createdAt, which can diverge (a backdated write).
-func testChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T, be Backend) {
-	ctx := context.Background()
-	parentURI := "cckv://con2owner/timeline"
-
-	// more records than one page inside chunk 20's window, so the limited
-	// first query cannot cover the window on its own
-	count := chunkPageSize + 1
-	for i := range count {
-		createdAt := time.Unix(20*600+int64(i)+1, 0).UTC()
-		id := fmt.Sprintf("div-record-%02d", i)
-		createChunklineRecord(t, ctx, be.Record, id, fmt.Sprintf("%s/%s", parentURI, id), createdAt)
-	}
-
-	// backdate the record of the limited query's last member (the oldest of
-	// the top chunkPageSize records) to before the window start; the
-	// window-coverage guard must ignore the diverged column or the oldest
-	// record in the window gets dropped
-	require.NoError(t, be.Inspect.SetRecordCreatedAt(ctx, "div-record-01", time.Unix(18*600, 0).UTC()))
-
-	body, err := be.Record.LoadLocalBody(ctx, parentURI, 20)
-	require.NoError(t, err)
-	require.Len(t, body, count)
-	for _, item := range body {
-		require.True(t, item.Timestamp.After(time.Unix(20*600, 0)), "timestamp %v must be the key's recordCreatedAt, not the backdated createdAt", item.Timestamp)
-	}
+func chunkTime(chunk, offset int64) time.Time {
+	return time.Unix(chunk*600+offset, 0).UTC()
 }
 
-func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
+func testChunklineManifestItrAndBody(t *testing.T, be Backend) {
 	ctx := context.Background()
-	recordRepo := be.Record
+	repo := be.Record
 
 	parentURI := "cckv://con1owner/timeline"
-	createdAt10 := time.Unix(10*600+10, 0).UTC()
-	createdAt11 := time.Unix(11*600+20, 0).UTC()
-	createdAt12 := time.Unix(12*600+30, 0).UTC()
+	createdAt10 := chunkTime(10, 10)
+	createdAt11 := chunkTime(11, 20)
+	createdAt12 := chunkTime(12, 30)
 
-	createChunklineRecord(t, ctx, recordRepo, "record-10", parentURI+"/record-10", createdAt10)
-	createChunklineRecord(t, ctx, recordRepo, "record-11", parentURI+"/record-11", createdAt11)
-	createChunklineRecord(t, ctx, recordRepo, "record-12", parentURI+"/record-12", createdAt12)
+	putRecord(t, ctx, repo, "record-10", parentURI+"/record-10", createdAt10)
+	putRecord(t, ctx, repo, "record-11", parentURI+"/record-11", createdAt11)
+	putRecord(t, ctx, repo, "record-12", parentURI+"/record-12", createdAt12)
+	// a grandchild is not an item of the timeline
+	putRecord(t, ctx, repo, "record-deep", parentURI+"/record-11/deep", chunkTime(9, 0))
 
-	parent := mustRecordKey(t, ctx, be.Inspect, parentURI)
-	require.Nil(t, parent.RecordCreatedAt)
-
-	manifest, err := be.Record.GetChunklineManifest(ctx, parentURI)
+	manifest, err := repo.GetChunklineManifest(ctx, parentURI)
 	require.NoError(t, err)
 	require.NotNil(t, manifest.FirstChunk)
 	require.EqualValues(t, 10, *manifest.FirstChunk)
 
-	itrs, err := be.Record.LookupLocalItrs(ctx, []string{parentURI}, 11)
+	other := "cckv://con1owner/other"
+	putRecord(t, ctx, repo, "other-20", other+"/x", chunkTime(20, 0))
+	itrs, err := repo.LookupLocalItrs(ctx, []string{parentURI, other, "cckv://con1owner/unknown"}, 11)
 	require.NoError(t, err)
-	require.EqualValues(t, 11, itrs[parentURI])
+	require.Equal(t, map[string]int64{parentURI: 11}, itrs, "a timeline without an item at or before the chunk has no entry")
 
-	body, err := be.Record.LoadLocalBody(ctx, parentURI, 11)
+	itrs, err = repo.LookupLocalItrs(ctx, []string{parentURI, other}, 30)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{parentURI: 12, other: 20}, itrs)
+
+	body, err := repo.LoadLocalBody(ctx, parentURI, 11)
 	require.NoError(t, err)
 	require.Len(t, body, 2)
 	require.Equal(t, parentURI+"/record-11", body[0].Href)
 	require.True(t, body[0].Timestamp.Equal(createdAt11))
 	require.Equal(t, parentURI+"/record-10", body[1].Href)
 	require.True(t, body[1].Timestamp.Equal(createdAt10))
+
+	// a removed item leaves the body
+	removeKeys(t, ctx, repo, "record-11-delete", "con1owner", parentURI+"/record-11")
+	body, err = repo.LoadLocalBody(ctx, parentURI, 11)
+	require.NoError(t, err)
+	require.Len(t, body, 1)
+	require.Equal(t, parentURI+"/record-10", body[0].Href)
 }
 
 // Chunks are half-open intervals [chunkID*600, (chunkID+1)*600) — a record
@@ -94,36 +82,97 @@ func testChunklineUsesRecordCreatedAt(t *testing.T, be Backend) {
 // chunk, and one exactly at the chunk's start time belongs to it.
 func testChunklineChunkBoundaryIsHalfOpen(t *testing.T, be Backend) {
 	ctx := context.Background()
-	recordRepo := be.Record
+	repo := be.Record
 
 	parentURI := "cckv://con3owner/timeline"
-	chunkStart := time.Unix(30*600, 0).UTC()
-	inChunk := time.Unix(30*600+10, 0).UTC()
-	nextChunkStart := time.Unix(31*600, 0).UTC()
+	putRecord(t, ctx, repo, "boundary-start", parentURI+"/boundary-start", chunkTime(30, 0))
+	putRecord(t, ctx, repo, "boundary-mid", parentURI+"/boundary-mid", chunkTime(30, 10))
+	putRecord(t, ctx, repo, "boundary-next", parentURI+"/boundary-next", chunkTime(31, 0))
 
-	createChunklineRecord(t, ctx, recordRepo, "boundary-start", parentURI+"/boundary-start", chunkStart)
-	createChunklineRecord(t, ctx, recordRepo, "boundary-mid", parentURI+"/boundary-mid", inChunk)
-	createChunklineRecord(t, ctx, recordRepo, "boundary-next", parentURI+"/boundary-next", nextChunkStart)
-
-	itrs, err := be.Record.LookupLocalItrs(ctx, []string{parentURI}, 30)
+	itrs, err := repo.LookupLocalItrs(ctx, []string{parentURI}, 30)
 	require.NoError(t, err)
 	require.EqualValues(t, 30, itrs[parentURI])
 
-	body, err := be.Record.LoadLocalBody(ctx, parentURI, 30)
+	body, err := repo.LoadLocalBody(ctx, parentURI, 30)
 	require.NoError(t, err)
 	require.Len(t, body, 2)
 	require.Equal(t, parentURI+"/boundary-mid", body[0].Href)
 	require.Equal(t, parentURI+"/boundary-start", body[1].Href)
 }
 
-func testChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T, be Backend) {
+// A key without items is an empty feed (no first chunk, an empty body); a
+// key that does not exist is not found.
+func testChunklineEmptyAndMissingTimelines(t *testing.T, be Backend) {
 	ctx := context.Background()
-	recordRepo := be.Record
+	repo := be.Record
 
 	feedURI := "cckv://con4owner/timeline"
-	createChunklineRecord(t, ctx, recordRepo, "empty-feed", feedURI, time.Unix(40*600, 0).UTC())
+	putRecord(t, ctx, repo, "empty-feed", feedURI, chunkTime(40, 0))
 
-	manifest, err := be.Record.GetChunklineManifest(ctx, feedURI)
+	manifest, err := repo.GetChunklineManifest(ctx, feedURI)
 	require.NoError(t, err)
 	require.Nil(t, manifest.FirstChunk)
+
+	body, err := repo.LoadLocalBody(ctx, feedURI, 40)
+	require.NoError(t, err)
+	require.Empty(t, body)
+
+	itrs, err := repo.LookupLocalItrs(ctx, []string{feedURI}, 40)
+	require.NoError(t, err)
+	require.Empty(t, itrs)
+
+	_, err = repo.GetChunklineManifest(ctx, "cckv://con4owner/missing")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "expected not found, got %v", err)
+	_, err = repo.LoadLocalBody(ctx, "cckv://con4owner/missing", 40)
+	require.True(t, errors.Is(err, domain.ErrNotFound), "expected not found, got %v", err)
+}
+
+// A window (the chunk and the one before it) holding more items than a
+// page comes back whole, newest first.
+func testChunklineWindowLargerThanAPage(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+	parentURI := "cckv://con2owner/timeline"
+
+	count := chunkPageSize + 9
+	for i := range count {
+		id := fmt.Sprintf("window-record-%02d", i)
+		// spread over both chunks of the window
+		putRecord(t, ctx, repo, id, parentURI+"/"+id, chunkTime(19, 300+int64(i)*20))
+	}
+
+	body, err := repo.LoadLocalBody(ctx, parentURI, 20)
+	require.NoError(t, err)
+	require.Len(t, body, count)
+	for i, item := range body {
+		require.Equal(t, fmt.Sprintf("%s/window-record-%02d", parentURI, count-1-i), item.Href)
+	}
+}
+
+// A window with fewer items than a page is filled up with the newest items
+// before it, so a reader of a quiet timeline gets a page from one request.
+func testChunklineSparseWindow(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+	parentURI := "cckv://con5owner/timeline"
+
+	for i := range chunkPageSize + 8 {
+		id := fmt.Sprintf("old-record-%02d", i)
+		putRecord(t, ctx, repo, id, parentURI+"/"+id, chunkTime(10, int64(i)))
+	}
+	for i := range 3 {
+		id := fmt.Sprintf("recent-record-%d", i)
+		putRecord(t, ctx, repo, id, parentURI+"/"+id, chunkTime(50, int64(i)))
+	}
+	putRecord(t, ctx, repo, "future-record", parentURI+"/future-record", chunkTime(51, 0))
+
+	body, err := repo.LoadLocalBody(ctx, parentURI, 50)
+	require.NoError(t, err)
+	require.Len(t, body, chunkPageSize)
+	require.Equal(t, parentURI+"/recent-record-2", body[0].Href)
+	require.Equal(t, parentURI+"/recent-record-0", body[2].Href)
+	require.Equal(t, fmt.Sprintf("%s/old-record-%02d", parentURI, chunkPageSize+7), body[3].Href, "then the newest of the older items")
+	for i := 1; i < len(body); i++ {
+		require.False(t, body[i].Timestamp.After(body[i-1].Timestamp), "newest first")
+	}
 }

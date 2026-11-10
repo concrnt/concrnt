@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -170,11 +171,11 @@ func TestDeliverLocalCommit(t *testing.T) {
 		t.Fatalf("Deliver returned error: %v", err)
 	}
 	id := documentIDOf(t, sd)
-	if len(repo.createdCommitLogs) != 1 || repo.createdCommitLogs[0] != id {
-		t.Fatalf("CreateCommitLog calls = %v, want exactly [%s]: a local commit job must re-enter Commit", repo.createdCommitLogs, id)
+	if len(repo.commitIDs) != 1 || repo.commitIDs[0] != id {
+		t.Fatalf("Apply calls = %v, want exactly [%s]: a local commit job must re-enter Commit", repo.commitIDs, id)
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("expected a committed tx, got %+v", repo.txs)
+	if !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+		t.Fatalf("expected one applied write, got %v", repo.statuses)
 	}
 }
 
@@ -201,7 +202,7 @@ func TestDeliverRemoteCommit(t *testing.T) {
 	if len(got) != 1 || got[0].Document != payload.Document {
 		t.Fatalf("remote commits = %+v, want exactly the job payload", got)
 	}
-	if len(signal.channels) != 0 || len(repo.createdCommitLogs) != 0 {
+	if len(signal.channels) != 0 || len(repo.commitIDs) != 0 {
 		t.Fatal("a remote destination must not be acted on locally")
 	}
 }

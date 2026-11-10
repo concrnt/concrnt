@@ -35,12 +35,9 @@ backends:
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # postgres sizes the connection pool of each replica. replicas x
-  # maxOpenConns must stay under the server's max_connections. a
-  # transaction's reads take a second connection, so maxConcurrentTx is
-  # capped at maxOpenConns/2 (a larger value is lowered with a warning).
+  # maxOpenConns must stay under the server's max_connections.
   # postgres:
   #   maxOpenConns: 64      # default 64
-  #   maxConcurrentTx: 32   # default maxOpenConns/2
   # sqlite:
   #   path: /var/lib/concrnt/concrnt.db
   # spanner reaches Cloud Spanner (mode cloud, the ambient credentials),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
@@ -13,62 +14,40 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
+// insertCommit writes the commit log entry; false when the id is already
+// in the log, which is left as first written (Duplicate).
+func insertCommit(tx *gorm.DB, commit ucrecord.Commit) (bool, error) {
+	proofBytes, err := json.Marshal(commit.Proof)
 	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	proofBytes, err := json.Marshal(proof)
-	if err != nil {
-		span.RecordError(err)
-		return err
+		return false, err
 	}
 
 	commitLog := postgres.CommitLog{
-		ID:       id,
-		IP:       ip,
-		Document: document,
-		Owner:    owner,
+		ID:       commit.ID,
+		IP:       commit.IP,
+		Document: commit.Document,
+		Owner:    commit.Owner,
 		Proof:    string(proofBytes),
 	}
 
-	result := db.Clauses(clause.OnConflict{
+	result := tx.Clauses(clause.OnConflict{
 		DoNothing: true,
 	}).Create(&commitLog)
 	if result.Error != nil {
-		span.RecordError(result.Error)
-		return result.Error
+		return false, result.Error
 	}
-	if result.RowsAffected == 0 {
-		return ucrecord.ErrAlreadyCommitted
-	}
-
-	return nil
+	return result.RowsAffected > 0, nil
 }
 
-func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
+// markGcCandidates flags the commit logs ids for `conctl op gc-commitlog`;
+// unknown ids are ignored.
+func markGcCandidates(tx *gorm.DB, ids []string) error {
+	if len(ids) == 0 {
+		return nil
 	}
-
-	if err := db.Model(&postgres.CommitLog{}).
-		Where("id = ?", documentID).
-		Update("gc_candidate", true).Error; err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return nil
+	return tx.Model(&postgres.CommitLog{}).
+		Where("id IN ?", ids).
+		Update("gc_candidate", true).Error
 }
 
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
