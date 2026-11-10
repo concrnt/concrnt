@@ -117,6 +117,11 @@ docker compose --profile firestore up -d firestore-emulator redis memcached
   re-running it finishes a partially failed pass, except that a pass that
   died while cleaning up a removed key's associations leaves those
   documents behind (unreadable, storage only).
+- Readiness (`/ready`) is backed by one read of `_meta/ready` per replica
+  every 15s while Firestore answers (about 5,800 reads a day per replica,
+  whatever the number of probers); a failed read is retried after 1s, and
+  the replica leaves rotation after 3 consecutive failures (within 23s of a
+  real outage). The document does not need to exist.
 - A listing returns the signed documents from the `record_keys` (or
   `associations`, `acks`, `ackeds`) documents its query lands on: one read
   per row, no second fetch from `commits`.

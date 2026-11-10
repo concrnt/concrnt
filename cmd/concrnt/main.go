@@ -67,14 +67,11 @@ import (
 	"github.com/concrnt/concrnt/internal/worker"
 )
 
-// readinessTimeout bounds one /ready sweep. The kubelet gives a probe one
-// second by default, so a backend that has not answered by then must
-// already be reported as down inside that window.
-const readinessTimeout = 800 * time.Millisecond
-
-// firestoreReadinessTTL memoizes the Firestore readiness probe between
-// /ready polls.
-const firestoreReadinessTTL = 15 * time.Second
+// firestoreCheckInterval is how often a healthy Firestore is checked for
+// readiness. Each check is a billed document read, so it runs less often
+// than the other backends' (health.DefaultCheckInterval); a failed check
+// is retried on the watcher's short retry interval all the same.
+const firestoreCheckInterval = 15 * time.Second
 
 var (
 	version      = "unknown"
@@ -232,7 +229,9 @@ func main() {
 		serverRepo       server.Repository
 		notificationRepo notification.Repository
 		abuseRepo        abuse.Repository
-		databaseReady    func(ctx context.Context) error
+		databaseReady    health.Check
+		// how often databaseReady runs while it succeeds
+		databaseCheckInterval = health.DefaultCheckInterval
 		// the count cache table in the record database, under its
 		// backends.aggregate.store name; nil on sqlite, which has none
 		databaseAggregate     aggregate.Store
@@ -260,7 +259,14 @@ func main() {
 		// and wait time are the first thing to check when everything gets slow
 		prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-		databaseReady = sqlDB.PingContext
+		// readiness pings through a connection of its own: the pool above
+		// is what a burst saturates
+		pgProbe, err := database.NewPostgresProbe(conf.Backends.PostgresDsn)
+		if err != nil {
+			panic("failed to open the database readiness connection: " + err.Error())
+		}
+		defer pgProbe.Close()
+		databaseReady = pgProbe.PingContext
 		recordRepo = pgrecord.New(pg)
 		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
 		serverRepo = postgres.NewServerRepository(pg, cl)
@@ -317,7 +323,8 @@ func main() {
 		go fsrepo.VerifyIndexes(context.WithoutCancel(ctx), fsc)
 		prometheus.MustRegister(fsrepo.Collectors()...)
 
-		databaseReady = fsrepo.NewReadiness(fsc, firestoreReadinessTTL).Check
+		databaseReady = func(ctx context.Context) error { return fsrepo.Ping(ctx, fsc) }
+		databaseCheckInterval = firestoreCheckInterval
 		recordRepo = fsrecord.New(fsc)
 		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
 		serverRepo = fsrepo.NewServerRepository(fsc, cl)
@@ -331,7 +338,8 @@ func main() {
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
 
-	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	redis := database.NewRedisServing(conf.Backends.RedisAddr, "", conf.Backends.RedisDB, jobQueueConcurrency)
 
 	// the count cache store, built here like the repositories: "" keeps
 	// the counts in the record database (redis on sqlite), and a database
@@ -386,7 +394,6 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
 	slog.Info("concurrency settings", append(concurrencySettings, slog.Int("jobQueueConsumers", jobQueueConcurrency))...)
 	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
@@ -579,17 +586,22 @@ func main() {
 
 	// every backend the public API needs gates readiness: the database
 	// holds the data, redis carries delivery jobs and realtime events,
-	// memcached serves the timeline chunks. the sweep stays under the
-	// kubelet's probe timeout so a hung backend reads as "down" rather than
-	// as a timed-out probe with no body
-	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("database", databaseReady)
-	readiness.Add("redis", func(ctx context.Context) error {
-		return redis.Ping(ctx).Err()
+	// memcached serves the timeline chunks. they are watched in the
+	// background and /ready reads the verdict, so the probe answers at once
+	// however busy the process and its connection pools are
+	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	defer redisProbe.Close()
+	readiness := health.NewReadiness(health.DefaultReadinessPolicy)
+	readiness.Add("database", databaseCheckInterval, databaseReady)
+	readiness.Add("redis", health.DefaultCheckInterval, func(ctx context.Context) error {
+		return redisProbe.Ping(ctx).Err()
 	})
-	readiness.Add("memcached", func(ctx context.Context) error {
+	// gomemcache dials past its idle connections instead of queueing, so
+	// the serving client is already independent of the load
+	readiness.Add("memcached", health.DefaultCheckInterval, func(ctx context.Context) error {
 		return mc.Ping()
 	})
+	readiness.Start(ctx)
 
 	probes := rest.NewProbeHandler(watchdog, readiness)
 	probes.RegisterRoutes(internal)

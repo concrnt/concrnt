@@ -2,43 +2,18 @@ package firestore
 
 import (
 	"context"
-	"sync"
-	"time"
 
 	"cloud.google.com/go/firestore"
 )
 
-// Readiness probes the database with one cheap document read, memoized so a
-// fleet of replicas polled every few seconds neither burns reads nor
-// amplifies an outage.
-type Readiness struct {
-	client *firestore.Client
-	ttl    time.Duration
-
-	mu      sync.Mutex
-	checked time.Time
-	last    error
-}
-
-func NewReadiness(client *firestore.Client, ttl time.Duration) *Readiness {
-	return &Readiness{client: client, ttl: ttl}
-}
-
-// Check returns nil when Firestore answered (a missing probe document still
-// proves authentication and connectivity).
-func (r *Readiness) Check(ctx context.Context) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if !r.checked.IsZero() && time.Since(r.checked) < r.ttl {
-		return r.last
-	}
-
-	_, err := r.client.Collection(ColMeta).Doc("ready").Get(ctx)
+// Ping checks that the database answers with one document read (a missing
+// probe document still proves authentication and connectivity). Every call
+// is a billed read, so the caller sets the cadence: the readiness watcher
+// runs it on an interval of its own, not once per probe.
+func Ping(ctx context.Context, client *firestore.Client) error {
+	_, err := client.Collection(ColMeta).Doc("ready").Get(ctx)
 	if err != nil && IsNotFound(err) {
-		err = nil
+		return nil
 	}
-	r.checked = time.Now()
-	r.last = err
 	return err
 }

@@ -178,6 +178,28 @@ captcha/VAPID keys, `meta` for instance branding served via well-known,
 `services` for pluggable modules). `domain.Config` is the resulting in-process
 representation.
 
+### Probes
+
+The internal listener (`:8001`, `CONCRNT_INTERNAL_PORT`) serves both probes;
+each answers with a JSON body naming every check.
+
+- `/health` (liveness) fails only when one of the process's own loops has
+  stalled (`internal/infra/health` watchdog). A backend outage never fails it:
+  a restart would not bring the backend back.
+- `/ready` (readiness) fails until every backend (record database, Redis,
+  Memcached) has answered once, while one of them is down, and from SIGTERM
+  on (draining). The backends are checked in the background — every 2s,
+  Postgres and Redis over a connection reserved for the check, Firestore
+  every 15s because each check is a billed read — and the probe only reads
+  the verdict, so it answers in microseconds however busy the replica and
+  its connection pools are. One check may take up to 2s, a failed one is
+  retried after 1s, and a backend is down after 3 consecutive failures and up
+  again after one success: a backend that hangs is reported within 10s (23s
+  on Firestore), one that refuses connections within about 4s (17s), and a
+  burst that merely slows the checks takes no replica out of rotation.
+  Because the hysteresis is in the server, the prober needs none of its own:
+  `periodSeconds: 5`, `timeoutSeconds: 2`, `failureThreshold: 2` is enough.
+
 ### Backends
 
 `backends.database` selects the record store; every repository of the chosen
@@ -190,8 +212,9 @@ see `internal/infra/repository/CONTRACT.md`).
   `backends.postgresDsn`. Schema changes are numbered steps in
   `postgres/migrations.go`, applied at server start. A commit is one
   transaction on one connection. Each replica opens up
-  to `backends.postgres.maxOpenConns` connections (default 64), so keep
-  replicas × maxOpenConns (+ conctl and exporters) under the
+  to `backends.postgres.maxOpenConns` connections (default 64) plus one for
+  the readiness check, so keep
+  replicas × (maxOpenConns + 1) (+ conctl and exporters) under the
   server's `max_connections` (`SHOW max_connections`; Cloud SQL sizes it
   from memory, e.g. 100 on db-custom-1-3840, so set the flag explicitly).
 - `sqlite`: `internal/infra/repository/sqlite`, GORM over the pure-Go (wasm,

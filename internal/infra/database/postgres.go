@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"log"
 	"log/slog"
 	"os"
@@ -73,5 +74,21 @@ func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 		slog.Error("failed to enable tracing plugin for postgres", slog.String("error", err.Error()))
 	}
 
+	return db, nil
+}
+
+// NewPostgresProbe opens a single connection for the readiness check alone.
+// A ping through the serving pool queues behind the requests when every
+// connection is in use (database/sql serves its waiters in random order),
+// so under a burst it times out although the database is answering; this
+// connection is never handed to a request. It is untraced: a ping every
+// few seconds is noise in the spans.
+func NewPostgresProbe(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	return db, nil
 }
