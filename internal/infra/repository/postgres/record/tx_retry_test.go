@@ -5,10 +5,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -90,4 +92,56 @@ func TestApplyRollsBackUnappliedWrites(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&postgres.RecordKey{}).Count(&count).Error)
 	require.Zero(t, count)
+}
+
+// With a bounded pool, transactions take at most half of it: the one that
+// would go beyond waits without a connection, so reads still get one.
+func TestApplyLeavesConnectionsToReads(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	defer cleanup()
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(4)
+	repo := New(db).(*Repository)
+	ctx := context.Background()
+
+	inside := make(chan struct{})
+	finish := make(chan struct{})
+	var held sync.WaitGroup
+	hold := func() {
+		defer held.Done()
+		_, err := repo.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+			inside <- struct{}{}
+			<-finish
+			return ucrecord.Applied, nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	held.Add(2)
+	go hold()
+	go hold()
+	<-inside
+	<-inside
+
+	// the third transaction never starts while the two are open
+	waiting, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer cancel()
+	_, err = repo.apply(waiting, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		t.Error("a transaction ran beyond the slots")
+		return ucrecord.Applied, nil
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 2, sqlDB.Stats().InUse, "the waiting transaction holds no connection")
+
+	// and the other half of the pool serves reads meanwhile
+	_, err = repo.GetSignedDocument(ctx, "cckv://con1slots/missing")
+	require.ErrorIs(t, err, domain.ErrNotFound)
+
+	close(finish)
+	held.Wait()
+	status, err := repo.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) { return ucrecord.Applied, nil })
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.Applied, status)
 }

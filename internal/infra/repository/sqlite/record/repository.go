@@ -25,10 +25,18 @@ import (
 // as on Postgres, so nothing is left for Cleanup.
 type Repository struct {
 	db *gorm.DB
+	// writer admits one Apply* transaction at a time. SQLite has a single
+	// writer anyway, and a transaction waiting for its lock does so on a
+	// pooled connection: a burst of commits would park every connection
+	// in BEGIN IMMEDIATE and the reads, which WAL lets run beside the
+	// writer, would queue behind them for a connection. Waiting here
+	// holds none. (Another process writing the file is still met by
+	// busy_timeout and the retry in apply.)
+	writer chan struct{}
 }
 
 func New(db *gorm.DB) ucrecord.Repository {
-	return &Repository{db: db}
+	return &Repository{db: db, writer: make(chan struct{}, 1)}
 }
 
 var tracer = otel.Tracer("repository")
@@ -58,6 +66,11 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 	backoff := txBackoffStart
 	for attempt := 1; ; attempt++ {
 		status := ucrecord.Applied
+		select {
+		case r.writer <- struct{}{}:
+		case <-ctx.Done():
+			return status, ctx.Err()
+		}
 		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
 			status, err = fn(tx)
@@ -66,6 +79,7 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 			}
 			return err
 		})
+		<-r.writer
 		if err == nil || errors.Is(err, errNotStored) {
 			return status, nil
 		}

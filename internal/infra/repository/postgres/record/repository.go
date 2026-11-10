@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
@@ -26,10 +28,24 @@ import (
 // starts without any. Nothing is left for Cleanup.
 type Repository struct {
 	db *gorm.DB
+	// txSlots bounds the Apply* transactions open at once, nil when the
+	// pool is unbounded. A transaction keeps its connection for several
+	// round trips and a read for one, and the pool gives a freed
+	// connection to any waiter: without the bound a burst of commits
+	// takes every connection and each read waits among them.
+	txSlots chan struct{}
 }
 
+// New builds the repository over db. Half of a bounded pool is the most
+// its transactions take at once; the rest stays with the reads.
 func New(db *gorm.DB) ucrecord.Repository {
-	return &Repository{db: db}
+	r := &Repository{db: db}
+	if sqlDB, err := db.DB(); err == nil {
+		if maxOpen := sqlDB.Stats().MaxOpenConnections; maxOpen > 1 {
+			r.txSlots = make(chan struct{}, maxOpen/2)
+		}
+	}
+	return r
 }
 
 var tracer = otel.Tracer("repository")
@@ -39,6 +55,14 @@ const (
 	txBackoffStart = 10 * time.Millisecond
 	txBackoffMax   = 500 * time.Millisecond
 )
+
+var txSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+	Namespace: "concrnt",
+	Subsystem: "record",
+	Name:      "tx_slot_wait_seconds",
+	Help:      "Time an Apply* transaction waited for one of the transaction slots (half the connection pool).",
+	Buckets:   []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+})
 
 // errNotStored rolls back a transaction whose write ended Stale or
 // Duplicate: neither leaves a trace, not even the commit log entry.
@@ -57,7 +81,11 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 	backoff := txBackoffStart
 	for attempt := 1; ; attempt++ {
 		status := ucrecord.Applied
-		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		release, err := r.txSlot(ctx)
+		if err != nil {
+			return status, err
+		}
+		err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
 			status, err = fn(tx)
 			if err == nil && status != ucrecord.Applied {
@@ -65,6 +93,7 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 			}
 			return err
 		})
+		release()
 		if err == nil || errors.Is(err, errNotStored) {
 			return status, nil
 		}
@@ -81,6 +110,22 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 		case <-timer.C:
 		}
 		backoff = min(backoff*2, txBackoffMax)
+	}
+}
+
+// txSlot waits for one of the transaction slots and returns what gives it
+// back. The wait holds no connection.
+func (r *Repository) txSlot(ctx context.Context) (release func(), err error) {
+	if r.txSlots == nil {
+		return func() {}, nil
+	}
+	start := time.Now()
+	select {
+	case r.txSlots <- struct{}{}:
+		txSlotWait.Observe(time.Since(start).Seconds())
+		return func() { <-r.txSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

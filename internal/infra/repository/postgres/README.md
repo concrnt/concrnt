@@ -11,10 +11,21 @@ outcome is `Stale` or `Duplicate`, which is how those leave no trace. The
 usecase issues its reads before the call, never inside the transaction.
 
 What that removed: the rule that a transaction needs a second connection
-for its reads, the transaction slots that enforced it, the setting
-`backends.postgres.maxConcurrentTx` (a config that still has it loads; the
-key is ignored) and the `concrnt_record_tx_slot*` metrics. Size the pool
-with `backends.postgres.maxOpenConns` alone.
+for its reads and the setting `backends.postgres.maxConcurrentTx` (a config
+that still has it loads; the key is ignored). Size the pool with
+`backends.postgres.maxOpenConns` alone.
+
+What stays bounded: at most `maxOpenConns / 2` `Apply*` transactions are
+open at once (`Repository.txSlots`, derived from the pool; none when the
+pool is unbounded). A transaction holds its connection for five or more
+round trips and a read for one, and `database/sql` gives a freed
+connection to any waiter, so without the bound a burst of commits (a seed,
+an import, a delivery backlog) takes every connection and each read waits
+among them: with 128 writers on a pool of 64 and a 2 ms round trip, the
+reads beside them took p95 95 ms without the bound and p95 4 ms with it
+(`record/loadshape_test.go`, scenario `writers`). A transaction waiting
+for a slot holds no connection; the wait is the histogram
+`concrnt_record_tx_slot_wait_seconds`.
 
 Dependents go by `ON DELETE CASCADE` inside the same transaction
 (`record_keys.record_id` → `records`, `associations.target_id` →

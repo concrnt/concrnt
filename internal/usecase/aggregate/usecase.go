@@ -26,6 +26,7 @@ type Usecase struct {
 	store     Store
 	ttl       time.Duration
 	maxDeltas int64
+	reads     *coalescer
 }
 
 // New wraps store; a zero ttl or maxDeltas takes the default.
@@ -36,7 +37,7 @@ func New(store Store, ttl time.Duration, maxDeltas int) *Usecase {
 	if maxDeltas <= 0 {
 		maxDeltas = DefaultMaxDeltas
 	}
-	return &Usecase{store: store, ttl: ttl, maxDeltas: int64(maxDeltas)}
+	return &Usecase{store: store, ttl: ttl, maxDeltas: int64(maxDeltas), reads: newCoalescer()}
 }
 
 // Get is the read-through: the cached entry, or a fresh computation that is
@@ -44,7 +45,18 @@ func New(store Store, ttl time.Duration, maxDeltas int) *Usecase {
 // wins and its entry is returned. Writers add their deltas blind, so it is
 // the reader that bounds the drift of an entry: one that has absorbed more
 // than MaxDeltas deltas is dropped and recomputed here.
+//
+// Callers asking for one entry at the same time share one read of the store
+// (coalescer), and one computation when the entry is missing. The result
+// reflects every write folded in before the call, and it may be the value
+// other callers hold too: it must not be modified.
 func (uc *Usecase) Get(ctx context.Context, def *Definition, target string) (Counters, error) {
+	return uc.reads.do(ctx, Key(def.Name, target), func(ctx context.Context) (Counters, error) {
+		return uc.get(ctx, def, target)
+	})
+}
+
+func (uc *Usecase) get(ctx context.Context, def *Definition, target string) (Counters, error) {
 	key := Key(def.Name, target)
 
 	entry, ok, err := uc.store.Get(ctx, key)

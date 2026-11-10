@@ -7,16 +7,18 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// While one transaction holds the writer lock longer than the busy timeout,
-// a raw BEGIN IMMEDIATE fails with SQLITE_BUSY (the retryable error), and
-// an Apply* call keeps retrying until the lock is free and the write lands.
+// While a connection outside the repository (another process, in practice)
+// holds the writer lock longer than the busy timeout, a raw BEGIN IMMEDIATE
+// fails with SQLITE_BUSY (the retryable error), and an Apply* call keeps
+// retrying until the lock is free and the write lands. Apply* calls of one
+// process never meet this way: they take turns before they begin
+// (Repository.writer).
 func TestApplyRetriesOnBusy(t *testing.T) {
 	ctx := context.Background()
 	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "busy.db"), "busy_timeout(20)")
@@ -29,20 +31,14 @@ func TestApplyRetriesOnBusy(t *testing.T) {
 		return ucrecord.Commit{ID: id, IP: "127.0.0.1", Document: "{}", Proof: concrnt.Proof{Type: concrnt.ProofTypeNone}, Owner: "con1owner"}
 	}
 
-	holding := make(chan struct{})
+	holder, err := db.SQL().BeginTx(ctx, nil)
+	require.NoError(t, err)
 	released := make(chan struct{})
 	go func() {
 		defer close(released)
-		_, _ = repo.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
-			if _, err := insertCommit(tx, commit("busy-holder")); err != nil {
-				return ucrecord.Applied, err
-			}
-			close(holding)
-			time.Sleep(300 * time.Millisecond)
-			return ucrecord.Applied, nil
-		})
+		time.Sleep(300 * time.Millisecond)
+		_ = holder.Rollback()
 	}()
-	<-holding
 
 	_, err = db.SQL().BeginTx(ctx, nil)
 	require.Error(t, err, "a second writer cannot begin while the lock is held")
@@ -58,5 +54,5 @@ func TestApplyRetriesOnBusy(t *testing.T) {
 
 	entries, err := repo.ListCommitLogs(ctx, ucrecord.CommitLogPage{Limit: 10})
 	require.NoError(t, err)
-	require.Len(t, entries, 2, "both writes must be committed")
+	require.Len(t, entries, 1, "the write must be committed")
 }
