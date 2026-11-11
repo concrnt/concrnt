@@ -9,34 +9,24 @@ contract is the interfaces plus the invariants below. What a backend does
 internally (SQL joins, cascades, serial ids, which collections exist) is its
 own business as long as the contract's meaning never depends on it.
 
-This is the second version of the contract ("v2"). The first one was the
-method surface of the Postgres implementation turned into an interface, and
-building and load-testing four backends on it showed where that fails:
+The contract is shaped by what four very different stores can all do well,
+which is why it asks for less than a relational database offers:
 
-- A write was a set of table operations composed inside a closure
-  transaction (`RunInTx` with `CreateCommitLog`, `CreateRecord`, ...). That
-  asks every backend for interactive serializable transactions with
-  read-your-writes. Firestore had to build a write-buffer overlay to fake
-  it, and Postgres needed a second connection per transaction for the
-  closure's reads, which is where the pool exhaustion and the commit
-  deadlock came from.
-- "No joins" only constrained single queries. The signed document every
-  read returns lived in the commit log and was fetched again for every
-  listed row: two round trips and 2N document reads per page.
-- The aggregate store was an opaque byte blob with compare-and-swap, so
-  every backend serialised the writers of one key. `aggregate_entries` was
-  the top lock wait on Spanner and the point where Firestore collapsed in
-  the 1000 DAU load test.
-- Cascades were synchronous and unbounded: removing a key removed its
-  associations in the same transaction (a range query inside the
-  transaction on Firestore, the per-commit mutation cap on Spanner).
-- `repotest` pinned Postgres behaviour method by method through a white-box
-  `Inspector`, which fixed the internal model of every backend.
-
-v2 answers these with C4 (one commit-level write, no transaction handle),
-C1 (complete rows from one access path, with a round-trip budget), C2
-(commutative counters), C11 (dependents leave reads at once and storage
-later) and C7 (conformance at the protocol level, black-box below it).
+- A write is one commit-level operation, not table operations composed in a
+  closure transaction (C4). Interactive serializable transactions with
+  read-your-writes are not something every store has, and a transaction
+  that reads while it holds a connection is where pools run dry.
+- A read returns complete rows from one access path (C1). A listing that
+  fetches the signed document of every row separately costs two round trips
+  and 2N document reads per page on a store without joins.
+- A count is a cache of commutative counters (C2). An entry that is one
+  value under compare-and-swap serialises every writer of a popular key.
+- Removing a key ends its dependents for every read at once and removes
+  them physically later (C11). A synchronous cascade is an unbounded write:
+  a range query inside the transaction on Firestore, the per-commit
+  mutation cap on Spanner.
+- Conformance is tested at the protocol level and black-box below it (C7),
+  so the suites fix what a backend means, never how it stores it.
 
 ## Principles
 
@@ -235,31 +225,6 @@ several timelines in one call was not added for manifests and bodies: on
 Firestore it would be the same N parallel queries, so only the SQL backends
 would gain.
 
-#### v1 methods that no longer exist
-
-| v1 | v2 |
-|---|---|
-| `RunInTx`, `RepositoryTx`, every method taking a `tx` | gone; one `Apply*` call per commit (C4) |
-| `CreateCommitLog`, `MarkCommitLogGcCandidate` | part of every `Apply*` (`Commit`, `Duplicate`, `GcCommitIDs`) |
-| `CreateRecord`, `CreateEntity`, `CreateAssociation` | `ApplyRecord`, `ApplyEntity`, `ApplyAssociation` |
-| `Acknowledge`, `UnAcknowledge`, `Acknowledged`, `UnAcknowledged` | `ApplyAck` (`Side`, `Valid`) |
-| `DeleteRecordByKey`, `DeleteRecordByDocumentID`, `DeleteAssociation` | `ApplyDelete` (`RemoveKey`, `RemoveVersion`, `RemoveAssociation`) |
-| `ListAssociationAuthors`, `ComputeAssociationCounts` | `ComputeAssociationSummary` (one scan, exact) |
-
-Behaviour of the usecases that changed with them:
-
-- Every read of a commit's plan precedes its write, and the redelivery
-  check is part of the write. A redelivered commit whose plan reads now
-  fail therefore returns that error instead of the silent success v1 gave
-  it: an association whose target has been removed since and is not inlined
-  in the commit, or a delete of an association by ccfs whose associated
-  record is gone.
-- The delete policy of a record is evaluated on the stack of the record's
-  key however the delete addressed it (`evalDeletePolicy`), which makes
-  deleting a retained, superseded version by its ccfs URI work.
-- An unack arriving as the first state of a relationship is stored invalid
-  on every backend (the v1 Postgres backend stored it as valid).
-
 ### Aggregate store (`internal/usecase/aggregate/store.go`)
 
 The cache behind C2. It is not a repository of primary data, but the
@@ -401,10 +366,8 @@ have to think about. None of it changes the contract's meaning.
   loop inside (up to 8 attempts with backoff; Postgres on
   serialization_failure / deadlock_detected, SQLite on BUSY / LOCKED of its
   `IMMEDIATE` transaction). The usecase's reads happen before it, so a
-  commit never holds a connection while waiting for another. The v1 rule
-  that a transaction needs a second connection for its reads is gone, and
-  with it `backends.postgres.maxConcurrentTx`; a config that still sets
-  `maxConcurrentTx` loads and the key is ignored.
+  commit never holds a connection while waiting for another. The shared
+  loop is `repoutil.RetryTx`.
 - Transactions do not take the whole pool. A transaction keeps its
   connection for several round trips, a read for one, and `database/sql`
   gives a freed connection to any waiter, so a burst of commits would take
@@ -492,7 +455,7 @@ have to think about. None of it changes the contract's meaning.
   The repository puts the count of every write on its span as
   `spanner.mutation_count`, and `mutation_limit_test.go` holds it against
   the limit: removing a key with 20,000 associations is 18 mutations (the
-  test asserts under 20; the v1 cascade would have been 100,000), a
+  test asserts under 20; a synchronous cascade would be 100,000), a
   `Cleanup` step exactly 10,000 (2,000 rows with four index entries each),
   a 500-key `ApplyDelete` page 6,010 (asserted under 10,000). What is
   left of the limit: one removal costs about a dozen mutations whatever
@@ -572,7 +535,7 @@ have to think about. None of it changes the contract's meaning.
   - `acks` / `ackeds/{hash(from, to, schema)}` (the document and proof
     while the state is valid) and `entities/{ccid}` embed the signed
     document they are anchored to.
-  - There is no `records` collection any more.
+  - There is no `records` collection.
 - Every `Apply*` is one transaction that reads once, a single batch get of
   documents whose ids follow from the arguments (the commit, the key and
   its ancestor chain, the target key, the uniqueness marker, the state, per
@@ -631,8 +594,8 @@ have to think about. None of it changes the contract's meaning.
   `ArrayUnion`) under the exists precondition, without a transaction. Only
   `PutIfAbsent` runs one. Expired documents are ignored on read and removed
   by the TTL policy on `expiresAt`.
-- Data written by the v1 backend cannot be read by this one (no embedded
-  documents, no `gen`, no `anchor`); see `MIGRATION.md`.
+- Data in an older stored shape (no embedded documents, no `gen`, no
+  `anchor`) cannot be read; see `MIGRATION.md`.
 - Time-ordered document ids (CDIDs) cap sustained writes to `commits` /
   `associations` around 500 per second.
 
