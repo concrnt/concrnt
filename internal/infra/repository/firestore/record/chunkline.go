@@ -14,11 +14,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 )
 
-const (
-	defaultChunkSize = 32
-	// lookupConcurrency bounds the parallel top-1 queries of LookupLocalItrs.
-	lookupConcurrency = 16
-)
+// lookupConcurrency bounds the parallel top-1 queries of LookupLocalItrs.
+const lookupConcurrency = 16
 
 // children is the item query of a timeline: the keys whose parentURI is
 // the timeline, newest first when desc. Placeholders have no
@@ -79,7 +76,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 
 	keys := newReadSet()
 	for _, uri := range uris {
-		keys.add(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
+		keys.add(r.keyRef(uri))
 	}
 
 	var mu sync.Mutex
@@ -116,7 +113,7 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 
 	lookup := make(map[string]int64, len(found))
 	for uri, chunk := range found {
-		if _, exists := keys.data(r.col(fs.ColRecordKeys).Doc(keyID(uri))); exists {
+		if _, exists := keys.data(r.keyRef(uri)); exists {
 			lookup[uri] = chunk
 		}
 	}
@@ -142,7 +139,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 	var snaps []*firestore.DocumentSnapshot
 	key, err := r.withKey(ctx, uri, func(ctx context.Context) error {
 		var err error
-		snaps, err = base.Limit(defaultChunkSize).Documents(ctx).GetAll()
+		snaps, err = base.Limit(repoutil.BodyPageSize).Documents(ctx).GetAll()
 		return fs.QueryErr(err)
 	})
 	if err != nil {
@@ -157,7 +154,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 
 	// a full page whose oldest item is still inside the window: the window
 	// goes on past it
-	if len(snaps) == defaultChunkSize {
+	if len(snaps) == repoutil.BodyPageSize {
 		last := snaps[len(snaps)-1]
 		if ts, ok := timeAt(last.Data(), "recordCreatedAt"); ok && !ts.Before(prevChunkDate) {
 			rest, err := base.Where("recordCreatedAt", ">=", prevChunkDate).StartAfter(last).Documents(ctx).GetAll()
@@ -178,15 +175,8 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		if !ok {
 			continue
 		}
-		href := str(m, "uri")
-		if redirect := str(m, "redirect"); redirect != "" {
-			href = redirect
-		}
-		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   ts.UTC(),
-			Href:        href,
-			ContentType: "application/concrnt.document+json",
-		})
+		redirect := str(m, "redirect")
+		bodyItems = append(bodyItems, repoutil.BodyItem(str(m, "uri"), &redirect, ts.UTC()))
 	}
 	return bodyItems, nil
 }

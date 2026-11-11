@@ -3,7 +3,7 @@
 // store in the record subpackage, and the composite indexes every query
 // needs are declared in indexes.go (the Firestore counterpart of a schema).
 //
-// Data model (repository contract v2). What a read returns is stored on the
+// Data model. What a read returns is stored on the
 // document its access path lands on, so no read follows a pointer:
 //
 //   - commits/{cdid}: the commit log (document + proof), written once. A

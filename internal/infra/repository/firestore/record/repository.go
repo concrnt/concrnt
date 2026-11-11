@@ -20,7 +20,7 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -46,12 +46,19 @@ func (r *Repository) col(name string) *firestore.CollectionRef {
 	return r.client.Collection(name)
 }
 
+// keyRef is the document of the key at uri.
+func (r *Repository) keyRef(uri string) *firestore.DocumentRef {
+	return r.col(fs.ColRecordKeys).Doc(keyID(uri))
+}
+
+// uniqueRef is the uniqueness marker of unique on the key at targetURI.
+func (r *Repository) uniqueRef(targetURI, unique string) *firestore.DocumentRef {
+	return r.col(fs.ColAssocUniques).Doc(uniqueID(targetURI, unique))
+}
+
 // txMaxAttempts bounds the closure re-runs on contention (Firestore aborts
 // the loser of two overlapping transactions; the SDK retries with backoff).
 const txMaxAttempts = 8
-
-// errTxContention marks a transaction that still aborted after every retry.
-var errTxContention = errors.New("firestore transaction aborted after retries")
 
 // apply runs fn as one transaction and returns its status. fn is re-run
 // from scratch when the transaction aborts on contention, so it must reset
@@ -71,7 +78,7 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *firestore.Transactio
 
 	fs.ObserveTx(start, attempts, err)
 	if err != nil && status.Code(err) == codes.Aborted {
-		err = errors.Join(errTxContention, err)
+		err = fmt.Errorf("firestore transaction aborted after %d attempts: %w", attempts, err)
 	}
 	return result, err
 }

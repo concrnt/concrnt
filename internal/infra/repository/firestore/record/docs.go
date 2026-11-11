@@ -70,7 +70,7 @@ func strs(m map[string]any, k string) []string {
 // ancestorsOf lists every strict path ancestor of a key URI from the owner
 // root down to its parent, e.g. cckv://o/a/b -> [cckv://o, cckv://o/a]; it
 // is empty for the owner root itself. It is the array QueryByPrefix matches
-// on (SQL: uri LIKE 'cckv://o/a/%') and its last element is the parentURI.
+// on (everything under cckv://o/a/) and its last element is the parentURI.
 func ancestorsOf(uri string) []string {
 	idx := strings.Index(uri, "://")
 	if idx < 0 {

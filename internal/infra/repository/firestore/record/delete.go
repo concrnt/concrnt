@@ -26,7 +26,6 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyDelete")
 	defer span.End()
 
-	keyRef := func(uri string) *firestore.DocumentRef { return r.col(fs.ColRecordKeys).Doc(keyID(uri)) }
 	commitRef := func(id string) *firestore.DocumentRef { return r.col(fs.ColCommits).Doc(id) }
 	retainedRef := func(id string) *firestore.DocumentRef { return r.col(fs.ColRetainedVersions).Doc(id) }
 	associationRef := func(id string) *firestore.DocumentRef { return r.col(fs.ColAssociations).Doc(id) }
@@ -49,7 +48,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 	}
 	for _, removal := range commit.Removals {
 		if removal.URI != "" {
-			refs = append(refs, keyRef(removal.URI))
+			refs = append(refs, r.keyRef(removal.URI))
 		}
 		switch removal.Kind {
 		case ucrecord.RemoveKey:
@@ -98,7 +97,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 			var key recordKeyDoc
 			keyExists := false
 			if removal.URI != "" {
-				if m, exists := live(keyRef(removal.URI)); exists {
+				if m, exists := live(r.keyRef(removal.URI)); exists {
 					key, keyExists = recordKeyFromMap(m), true
 				}
 			}
@@ -108,7 +107,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 				// the version a key points at goes with the key; a
 				// placeholder holds no record and stays
 				if keyExists && !key.isPlaceholder() && (removal.Kind == ucrecord.RemoveKey || key.RecordID == removal.DocumentID) {
-					if err := remove(keyRef(removal.URI)); err != nil {
+					if err := remove(r.keyRef(removal.URI)); err != nil {
 						return ucrecord.Applied, err
 					}
 					gens = append(gens, key.Gen)
@@ -141,7 +140,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 				}
 				// within one incarnation the marker of a unique is that of
 				// the one association holding it
-				if err := tx.Delete(r.col(fs.ColAssocUniques).Doc(uniqueID(association.TargetURI, association.Unique))); err != nil {
+				if err := tx.Delete(r.uniqueRef(association.TargetURI, association.Unique)); err != nil {
 					return ucrecord.Applied, err
 				}
 				removed[i] = true
@@ -243,7 +242,7 @@ func (r *Repository) Cleanup(ctx context.Context, token string) (string, error) 
 	markers := newReadSet()
 	for _, snap := range snaps {
 		m := snap.Data()
-		markers.add(r.col(fs.ColAssocUniques).Doc(uniqueID(str(m, "targetURI"), str(m, "unique"))))
+		markers.add(r.uniqueRef(str(m, "targetURI"), str(m, "unique")))
 	}
 	if err := markers.load(ctx, r.client); err != nil {
 		span.RecordError(err)

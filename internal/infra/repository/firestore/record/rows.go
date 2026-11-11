@@ -40,7 +40,7 @@ func applyWindow(q firestore.Query, tsField string, idField string, since, until
 
 // getKey reads one key outside a transaction; nil when it does not exist.
 func (r *Repository) getKey(ctx context.Context, uri string) (*recordKeyDoc, error) {
-	snap, err := r.col(fs.ColRecordKeys).Doc(keyID(uri)).Get(ctx)
+	snap, err := r.keyRef(uri).Get(ctx)
 	if err != nil {
 		if fs.IsNotFound(err) {
 			return nil, nil
@@ -51,16 +51,13 @@ func (r *Repository) getKey(ctx context.Context, uri string) (*recordKeyDoc, err
 	return &key, nil
 }
 
-// decodeKeys decodes key snapshots, leaving placeholders out when
-// recordsOnly is set.
-func decodeKeys(snaps []*firestore.DocumentSnapshot, recordsOnly bool) []recordKeyDoc {
+// decodeKeys decodes key snapshots. A query ordered by recordCreatedAt
+// returns no placeholder (it lacks the field), so only a listing by key
+// meets one.
+func decodeKeys(snaps []*firestore.DocumentSnapshot) []recordKeyDoc {
 	keys := make([]recordKeyDoc, 0, len(snaps))
 	for _, snap := range snaps {
-		k := recordKeyFromMap(snap.Data())
-		if recordsOnly && k.isPlaceholder() {
-			continue
-		}
-		keys = append(keys, k)
+		keys = append(keys, recordKeyFromMap(snap.Data()))
 	}
 	return keys
 }

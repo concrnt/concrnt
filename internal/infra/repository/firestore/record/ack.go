@@ -9,6 +9,7 @@ import (
 	"google.golang.org/api/iterator"
 
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -91,32 +92,23 @@ func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (u
 		span.RecordError(err)
 		return ucrecord.AckOutcome{}, err
 	}
-	if status == ucrecord.Duplicate {
-		return ucrecord.AckOutcome{Status: status}, nil
-	}
 	outcome.Status = status
 	return outcome, nil
 }
 
-// ackQuery is the shared filter of the list and count queries of one side.
-func (r *Repository) ackQuery(side ackSide, ccid, schema string) firestore.Query {
+// sideQuery is the shared filter of the list and count queries: the valid
+// states of the side a from / to pair asks for.
+func (r *Repository) sideQuery(from, to, schema string) (ackSide, firestore.Query, error) {
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
+		return ackSide{}, firestore.Query{}, err
+	}
+	side := sideOf(held)
 	q := r.col(side.collection).Where(side.field, "==", ccid).Where("valid", "==", true)
 	if schema != "" {
 		q = q.Where("schema", "==", schema)
 	}
-	return q
-}
-
-// sideQuery picks the side a from / to pair asks for: exactly one is set.
-func (r *Repository) sideQuery(from, to, schema string) (ackSide, firestore.Query, error) {
-	switch {
-	case from != "":
-		return ackerSide, r.ackQuery(ackerSide, from, schema), nil
-	case to != "":
-		return targetSide, r.ackQuery(targetSide, to, schema), nil
-	default:
-		return ackSide{}, firestore.Query{}, errors.New("either 'from' or 'to' must be specified")
-	}
+	return side, q, nil
 }
 
 // GetAcknowledgeRecords lists the valid states of one side, each carrying

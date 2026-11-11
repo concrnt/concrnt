@@ -160,7 +160,7 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 		var anchorRef *firestore.DocumentRef
 		switch commit.Anchor {
 		case fs.ColRecordKeys:
-			anchorRef = r.col(fs.ColRecordKeys).Doc(keyID(commit.AnchorID))
+			anchorRef = r.keyRef(commit.AnchorID)
 		case fs.ColAssociations:
 			anchorRef = r.col(fs.ColAssociations).Doc(ref.ID)
 		case fs.ColAcks, fs.ColAckeds, fs.ColEntities:
@@ -182,7 +182,7 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 	markers := newReadSet()
 	for _, d := range dependents {
 		if m, exists := anchored.data(d.ref); exists && d.anchor == fs.ColAssociations {
-			ref := r.col(fs.ColAssocUniques).Doc(uniqueID(str(m, "targetURI"), str(m, "unique")))
+			ref := r.uniqueRef(str(m, "targetURI"), str(m, "unique"))
 			markerOf[d.commitID] = ref
 			markers.add(ref)
 		}

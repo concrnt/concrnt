@@ -61,7 +61,7 @@ func (r *Repository) QueryByParent(
 		span.RecordError(err)
 		return nil, fs.QueryErr(err)
 	}
-	return keyRows(decodeKeys(snaps, true))
+	return keyRows(decodeKeys(snaps))
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
@@ -102,21 +102,22 @@ func (r *Repository) QueryByParentOrderByKey(
 		span.RecordError(err)
 		return nil, fs.QueryErr(err)
 	}
-	return keyRows(decodeKeys(snaps, false))
+	return keyRows(decodeKeys(snaps))
 }
 
 // prefixOverfetch is the page size used while post-filtering a non-directory
-// prefix (SQL "LIKE 'cckv://o/tl/e%'" also matches sibling "e2" keys).
+// prefix ("cckv://o/tl/e" also matches the sibling keys "e2...").
 const prefixOverfetch = 64
 
-// QueryByPrefix serves "uri LIKE prefix%". The prefix is split at its last
-// '/' into the directory that every match lives under, matched with
+// QueryByPrefix lists the keys starting with the literal prefix. The prefix
+// is split at its last '/' into the directory every match lives under,
+// matched with
 // array-contains on the key's ancestors, and an optional last-segment prefix
 // that Firestore cannot combine with the createdAt ordering and is checked
 // here. A directory prefix (ending in '/') is therefore one query. One
 // ending inside a segment is one query too when it is unbounded or its
 // first page (overfetched) holds enough matches, and reads on otherwise. A
-// prefix without an owner and path (the all-owners LIKE) is rejected: it
+// prefix without an owner and path (every owner's keys) is rejected: it
 // has no indexed form.
 func (r *Repository) QueryByPrefix(
 	ctx context.Context,
@@ -165,7 +166,7 @@ func (r *Repository) QueryByPrefix(
 			span.RecordError(err)
 			return nil, fs.QueryErr(err)
 		}
-		for _, k := range decodeKeys(snaps, true) {
+		for _, k := range decodeKeys(snaps) {
 			if exact || strings.HasPrefix(k.URI, prefix) {
 				keys = append(keys, k)
 			}
@@ -229,7 +230,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 		span.RecordError(err)
 		return nil, err
 	}
-	keys = append(keys, decodeKeys(snaps, true)...)
+	keys = append(keys, decodeKeys(snaps)...)
 	if limit > 0 && len(keys) > limit {
 		keys = keys[:limit]
 	}

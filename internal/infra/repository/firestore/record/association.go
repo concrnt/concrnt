@@ -28,8 +28,8 @@ func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.Assoc
 	}
 
 	commitRef := r.col(fs.ColCommits).Doc(commit.ID)
-	targetRef := r.col(fs.ColRecordKeys).Doc(keyID(commit.Target))
-	uniqueRef := r.col(fs.ColAssocUniques).Doc(uniqueID(commit.Target, commit.Unique))
+	targetRef := r.keyRef(commit.Target)
+	uniqueRef := r.uniqueRef(commit.Target, commit.Unique)
 
 	status, err := r.apply(ctx, func(tx *firestore.Transaction) (ucrecord.ApplyStatus, error) {
 		reads := newReadSet(commitRef, targetRef, uniqueRef)

@@ -36,7 +36,7 @@ func subscriptionToDomain(m subscriptionDoc) domain.NotificationSubscription {
 }
 
 // Subscribe upserts the subscription keyed by (vendorID, owner); a zero
-// CDate is stamped by the store, like the gorm hooks of the other backends.
+// CDate is stamped by the store.
 func (r *NotificationRepository) Subscribe(ctx context.Context, subscription domain.NotificationSubscription) (domain.NotificationSubscription, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()

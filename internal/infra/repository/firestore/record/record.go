@@ -38,7 +38,7 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 	commitRef := r.col(fs.ColCommits).Doc(commit.ID)
 	chainRefs := make([]*firestore.DocumentRef, len(chain))
 	for i, uri := range chain {
-		chainRefs[i] = r.col(fs.ColRecordKeys).Doc(keyID(uri))
+		chainRefs[i] = r.keyRef(uri)
 	}
 	keyRef := chainRefs[len(chainRefs)-1]
 
@@ -133,9 +133,6 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 		span.RecordError(err)
 		return ucrecord.RecordOutcome{}, err
 	}
-	if status != ucrecord.Applied {
-		return ucrecord.RecordOutcome{Status: status}, nil
-	}
 	outcome.Status = status
 	return outcome, nil
 }
@@ -211,14 +208,14 @@ func (r *Repository) policiesFor(ctx context.Context, cckvs []string) (map[strin
 	stacks, err := repoutil.PolicyStacks(cckvs, hierarchyOf, func(uris []string) (map[string]repoutil.PolicyLayer, error) {
 		reads := newReadSet()
 		for _, uri := range uris {
-			reads.add(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
+			reads.add(r.keyRef(uri))
 		}
 		if err := reads.load(ctx, r.client); err != nil {
 			return nil, err
 		}
 		layers := make(map[string]repoutil.PolicyLayer, len(uris))
 		for _, uri := range uris {
-			m, exists := reads.data(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
+			m, exists := reads.data(r.keyRef(uri))
 			if !exists {
 				continue
 			}
@@ -271,7 +268,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 
 	reads := newReadSet()
 	for _, uri := range cckvs {
-		reads.add(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
+		reads.add(r.keyRef(uri))
 	}
 	for _, id := range ids {
 		reads.add(r.col(fs.ColCommits).Doc(id))
@@ -283,7 +280,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 
 	out := make(map[string]*concrnt.SignedDocument, len(uris))
 	for _, uri := range cckvs {
-		m, exists := reads.data(r.col(fs.ColRecordKeys).Doc(keyID(uri)))
+		m, exists := reads.data(r.keyRef(uri))
 		if !exists {
 			continue
 		}
@@ -309,7 +306,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 		commit := commitFromMap(m)
 		commits[id] = commit
 		if commit.Anchor == fs.ColRecordKeys {
-			anchors.add(r.col(fs.ColRecordKeys).Doc(keyID(commit.AnchorID)))
+			anchors.add(r.keyRef(commit.AnchorID))
 		}
 	}
 	if err := anchors.load(ctx, r.client); err != nil {
@@ -329,7 +326,7 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 		ccfs := uri
 		sd := &concrnt.SignedDocument{CCFS: &ccfs, Document: commit.Document, Proof: proof}
 		if commit.Anchor == fs.ColRecordKeys {
-			if m, exists := anchors.data(r.col(fs.ColRecordKeys).Doc(keyID(commit.AnchorID))); exists && str(m, "recordID") == id {
+			if m, exists := anchors.data(r.keyRef(commit.AnchorID)); exists && str(m, "recordID") == id {
 				cckv := commit.AnchorID
 				sd.CCKV = &cckv
 			}
@@ -358,12 +355,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
-	itemID := keyURI
-	if key.Redirect != "" {
-		itemID = key.Redirect
-	}
-	return key.ParentURI, itemID, nil
+	return key.ParentURI, repoutil.ItemID(keyURI, &key.Redirect), nil
 }
 
 // withKey runs fn in parallel with the read of the key at uri, so a read
