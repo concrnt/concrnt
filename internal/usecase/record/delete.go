@@ -60,7 +60,7 @@ func (uc *Usecase) planDelete(ctx context.Context, ip string, requester domain.E
 	if authoritative {
 		if isRange {
 			// without a job queue (offline tooling) the whole subtree is
-			// removed here, as before
+			// removed here
 			limit := 0
 			if uc.jobs != nil {
 				limit = rangeDeleteSyncLimit + 1

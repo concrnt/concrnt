@@ -16,8 +16,7 @@ import (
 // the peeked row past the window becomes next, the window head becomes prev.
 // Cursors are computed before any read-access filtering so that clients can
 // page past rows that get filtered out. The cursor is the row's sort key:
-// its cckv for orderBy "key", otherwise its CreatedAt as RFC3339Nano (the
-// same text encoding/json gave the former *time.Time cursors).
+// its cckv for orderBy "key", otherwise its CreatedAt as RFC3339Nano.
 func paginateWindow(rows []QueryRow, limit int, orderBy string) ([]concrnt.SignedDocument, *string, *string) {
 	cursor := func(row QueryRow) *string {
 		var value string

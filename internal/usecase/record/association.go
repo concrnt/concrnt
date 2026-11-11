@@ -99,7 +99,7 @@ func (uc *Usecase) planAssociation(ctx context.Context, ip string, requester dom
 		if parsed.AssociationVariant != nil {
 			uniqueKey += *parsed.AssociationVariant
 		}
-		// bodyも一意性判定に含める(v1と同じ意味論)。bodyが異なるassociation
+		// bodyも一意性判定に含める。bodyが異なるassociation
 		// (同一ユーザーからの複数リプライ等)は共存できる
 		bodyBytes, err := json.Marshal(parsed.Value)
 		if err != nil {

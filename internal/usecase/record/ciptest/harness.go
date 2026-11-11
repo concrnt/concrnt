@@ -17,6 +17,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/aggregate/storetest"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
@@ -92,7 +93,10 @@ func newWorld(t *testing.T, backend Backend, offline bool) *world {
 	}
 
 	w.records = record.New(backend.Record, backend.EntityMeta, servers, cfg, cl, w.signal, w.policy, jobs, w.kvs)
-	w.records.SetAggregates(aggregate.New(newMemoryAggregates(), 0, 0))
+	// the count cache sits in front of every count read, so the suite runs
+	// the usecase with a real one: a backend whose Apply* outcomes are wrong
+	// shows up as a cached count that disagrees with the primary data
+	w.records.SetAggregates(aggregate.New(storetest.NewInMemory(), 0, 0))
 	w.timelines = chunkline.New(backend.Record, nil, w.kvs, w.records)
 
 	// as in the server's own wiring: the client answers documents of local

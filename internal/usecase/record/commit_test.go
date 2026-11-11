@@ -21,8 +21,6 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-type stubRecordRepo struct{ Repository }
-
 // entityLookups is the entity slice of Repository the residence fakes serve.
 type entityLookups interface {
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)

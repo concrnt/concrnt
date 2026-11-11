@@ -4,15 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"maps"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/policy"
 )
 
@@ -243,95 +240,4 @@ func (p peerServers) Resolve(_ context.Context, identifier string, _ *string) (*
 
 func (p peerServers) List(context.Context) ([]*concrnt.WellKnownConcrnt, error) {
 	return nil, nil
-}
-
-// memoryAggregates is an aggregate.Store held in a map. The count cache
-// sits in front of every count read, so the suite runs the usecase with a
-// real one: a backend whose Apply* outcomes are wrong shows up as a cached
-// count that disagrees with the primary data.
-type memoryAggregates struct {
-	mu      sync.Mutex
-	entries map[string]memoryAggregate
-}
-
-type memoryAggregate struct {
-	counters  aggregate.Counters
-	expiresAt time.Time
-}
-
-func newMemoryAggregates() *memoryAggregates {
-	return &memoryAggregates{entries: map[string]memoryAggregate{}}
-}
-
-func cloneCounters(c aggregate.Counters) aggregate.Counters {
-	c.Counts, c.Minima, c.Members = maps.Clone(c.Counts), maps.Clone(c.Minima), slices.Clone(c.Members)
-	return c
-}
-
-// live returns the unexpired entry under key; the caller holds the lock.
-func (s *memoryAggregates) live(key string) (memoryAggregate, bool) {
-	entry, ok := s.entries[key]
-	if ok && !time.Now().Before(entry.expiresAt) {
-		delete(s.entries, key)
-		return memoryAggregate{}, false
-	}
-	return entry, ok
-}
-
-func (s *memoryAggregates) Get(_ context.Context, key string) (*aggregate.Counters, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.live(key)
-	if !ok {
-		return nil, false, nil
-	}
-	counters := cloneCounters(entry.counters)
-	return &counters, true, nil
-}
-
-func (s *memoryAggregates) PutIfAbsent(_ context.Context, key string, entry aggregate.Counters, ttl time.Duration) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.live(key); ok {
-		return false, nil
-	}
-	entry = cloneCounters(entry)
-	entry.Deltas = 0
-	s.entries[key] = memoryAggregate{counters: entry, expiresAt: time.Now().Add(ttl)}
-	return true, nil
-}
-
-func (s *memoryAggregates) Add(_ context.Context, key string, delta aggregate.Delta) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	entry, ok := s.live(key)
-	if !ok {
-		return false, nil
-	}
-	entry.counters.Add(delta)
-	s.entries[key] = entry
-	return true, nil
-}
-
-func (s *memoryAggregates) Invalidate(_ context.Context, key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.entries, key)
-	return nil
-}
-
-func (s *memoryAggregates) InvalidateDefinition(_ context.Context, name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	maps.DeleteFunc(s.entries, func(key string, _ memoryAggregate) bool {
-		return strings.HasPrefix(key, aggregate.Key(name, ""))
-	})
-	return nil
-}
-
-func (s *memoryAggregates) InvalidateAll(context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	clear(s.entries)
-	return nil
 }

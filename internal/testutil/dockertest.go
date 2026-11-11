@@ -28,7 +28,6 @@ var (
 	user        = "postgres"
 	password    = "secret"
 	dbName      = "unittest"
-	dialect     = "postgres"
 	dsnTemplate = "postgres://%s:%s@localhost:%s/%s?sslmode=disable"
 )
 
