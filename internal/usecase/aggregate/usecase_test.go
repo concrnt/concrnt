@@ -2,6 +2,7 @@ package aggregate_test
 
 import (
 	"context"
+	"maps"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,15 +13,10 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 )
 
-type delta struct {
-	Key string
-	N   int64
-}
-
-// countingDef is a map[string]int64 aggregate whose Compute reads a
-// controllable "primary data" map and counts how often it ran.
+// countingDef is an aggregate whose Compute reads a controllable "primary
+// data" map and counts how often it ran.
 type countingDef struct {
-	def      *aggregate.Definition[map[string]int64, delta]
+	def      *aggregate.Definition
 	primary  map[string]int64
 	computes atomic.Int64
 	// before runs inside Compute, after the counter moved (to race a store)
@@ -29,59 +25,68 @@ type countingDef struct {
 
 func newCountingDef() *countingDef {
 	d := &countingDef{primary: map[string]int64{}}
-	d.def = &aggregate.Definition[map[string]int64, delta]{
+	d.def = &aggregate.Definition{
 		Name: "counts",
-		Compute: func(ctx context.Context, target string) (map[string]int64, error) {
+		Compute: func(ctx context.Context, target string) (aggregate.Counters, error) {
 			d.computes.Add(1)
 			if d.before != nil {
 				d.before()
 			}
-			out := map[string]int64{}
-			for k, v := range d.primary {
-				out[k] = v
-			}
-			return out, nil
-		},
-		Apply: func(cur map[string]int64, dl delta) map[string]int64 {
-			if cur == nil {
-				cur = map[string]int64{}
-			}
-			cur[dl.Key] += dl.N
-			if cur[dl.Key] <= 0 {
-				delete(cur, dl.Key)
-			}
-			return cur
+			return aggregate.Counters{Counts: maps.Clone(d.primary)}, nil
 		},
 	}
 	return d
 }
 
+func inc(name string, n int64) aggregate.Delta {
+	return aggregate.Delta{Inc: map[string]int64{name: n}}
+}
+
+func getCounts(t *testing.T, uc *aggregate.Usecase, d *countingDef, target string) map[string]int64 {
+	t.Helper()
+	got, err := uc.Get(context.Background(), d.def, target)
+	require.NoError(t, err)
+	return got.Counts
+}
+
 func TestGetReadsThroughOnce(t *testing.T) {
-	ctx := context.Background()
 	store := storetest.NewInMemory()
 	uc := aggregate.New(store, 0, 0)
 	d := newCountingDef()
 	d.primary["like"] = 2
 
-	got, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 2}, got)
+	require.Equal(t, map[string]int64{"like": 2}, getCounts(t, uc, d, "t1"))
 	require.EqualValues(t, 1, d.computes.Load())
 
 	// a hit never computes, even when the primary data moved
 	d.primary["like"] = 5
-	got, err = aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 2}, got)
+	require.Equal(t, map[string]int64{"like": 2}, getCounts(t, uc, d, "t1"))
 	require.EqualValues(t, 1, d.computes.Load())
 
 	// another target is its own entry
-	_, err = aggregate.Get(ctx, uc, d.def, "t2")
-	require.NoError(t, err)
+	getCounts(t, uc, d, "t2")
 	require.EqualValues(t, 2, d.computes.Load())
 }
 
-func TestTouchComputesWhenAbsentAndAppliesWhenPresent(t *testing.T) {
+// An entry without counters reads as empty maps, computed or cached, so a
+// caller can index and serialise it either way.
+func TestGetEmptyEntryHasMaps(t *testing.T) {
+	ctx := context.Background()
+	uc := aggregate.New(storetest.NewInMemory(), 0, 0)
+	d := newCountingDef()
+	d.primary = nil
+
+	for range 2 {
+		got, err := uc.Get(ctx, d.def, "t1")
+		require.NoError(t, err)
+		require.NotNil(t, got.Counts)
+		require.NotNil(t, got.Minima)
+		require.Empty(t, got.Counts)
+	}
+	require.EqualValues(t, 1, d.computes.Load())
+}
+
+func TestTouchComputesWhenAbsentAndAddsWhenPresent(t *testing.T) {
 	ctx := context.Background()
 	store := storetest.NewInMemory()
 	uc := aggregate.New(store, 0, 0)
@@ -90,28 +95,27 @@ func TestTouchComputesWhenAbsentAndAppliesWhenPresent(t *testing.T) {
 	// the write is already committed when Touch runs, so the primary data
 	// already holds it and the computed value must not be double-counted
 	d.primary["like"] = 1
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, time.Now()))
+	require.NoError(t, uc.Touch(ctx, d.def, "t1", inc("like", 1), time.Now()))
 	require.EqualValues(t, 1, d.computes.Load())
-	got, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 1}, got)
+	require.Equal(t, map[string]int64{"like": 1}, getCounts(t, uc, d, "t1"))
 
-	// with an entry present only the delta is applied
+	// with an entry present only the delta is added
 	d.primary["like"] = 2
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, time.Now()))
+	require.NoError(t, uc.Touch(ctx, d.def, "t1", aggregate.Delta{
+		Inc:        map[string]int64{"like": 1},
+		Min:        map[string]int64{"like": 7},
+		AddMembers: []string{"con1a"},
+	}, time.Now()))
 	require.EqualValues(t, 1, d.computes.Load())
-	got, err = aggregate.Get(ctx, uc, d.def, "t1")
+	got, err := uc.Get(ctx, d.def, "t1")
 	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 2}, got)
-
-	// a negative delta that empties a key removes it
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", -2}, time.Now()))
-	got, err = aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Empty(t, got)
+	require.Equal(t, map[string]int64{"like": 2}, got.Counts)
+	require.Equal(t, map[string]int64{"like": 7}, got.Minima)
+	require.Equal(t, []string{"con1a"}, got.Members)
+	require.EqualValues(t, 1, got.Deltas)
 }
 
-func TestTouchLostRaceAppliesOnlyToOlderComputation(t *testing.T) {
+func TestTouchLostRaceAddsOnlyToOlderComputation(t *testing.T) {
 	ctx := context.Background()
 
 	for _, tc := range []struct {
@@ -132,15 +136,13 @@ func TestTouchLostRaceAppliesOnlyToOlderComputation(t *testing.T) {
 			// the competing computation lands while ours is running, so our
 			// PutIfAbsent loses; the winner's value is what it saw (1)
 			d.before = func() {
-				_, err := store.PutIfAbsent(ctx, aggregate.Key("counts", "t1"), aggregate.Entry{Value: []byte(`{"like":1}`), AsOf: tc.winnerAsOf(receivedAt)}, time.Hour)
+				_, err := store.PutIfAbsent(ctx, aggregate.Key("counts", "t1"), aggregate.Counters{Counts: map[string]int64{"like": 1}, AsOf: tc.winnerAsOf(receivedAt)}, time.Hour)
 				require.NoError(t, err)
 			}
-			require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, receivedAt))
+			require.NoError(t, uc.Touch(ctx, d.def, "t1", inc("like", 1), receivedAt))
 			require.EqualValues(t, 1, d.computes.Load())
 
-			got, err := aggregate.Get(ctx, uc, d.def, "t1")
-			require.NoError(t, err)
-			require.Equal(t, map[string]int64{"like": tc.want}, got)
+			require.Equal(t, map[string]int64{"like": tc.want}, getCounts(t, uc, d, "t1"))
 		})
 	}
 }
@@ -152,41 +154,70 @@ func TestGetLostRaceReturnsWinner(t *testing.T) {
 	d := newCountingDef()
 	d.primary["like"] = 7
 	d.before = func() {
-		_, err := store.PutIfAbsent(ctx, aggregate.Key("counts", "t1"), aggregate.Entry{Value: []byte(`{"like":3}`), AsOf: time.Now()}, time.Hour)
+		_, err := store.PutIfAbsent(ctx, aggregate.Key("counts", "t1"), aggregate.Counters{Counts: map[string]int64{"like": 3}, AsOf: time.Now()}, time.Hour)
 		require.NoError(t, err)
 	}
-	got, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 3}, got, "the stored winner is what every reader sees")
+	require.Equal(t, map[string]int64{"like": 3}, getCounts(t, uc, d, "t1"), "the stored winner is what every reader sees")
 }
 
-func TestMaxDeltasInvalidates(t *testing.T) {
+// Writers add blind and never look at the entry: it is the reader that
+// drops one that absorbed more than MaxDeltas deltas and recomputes it.
+func TestMaxDeltasRecomputesOnRead(t *testing.T) {
 	ctx := context.Background()
 	store := storetest.NewInMemory()
 	uc := aggregate.New(store, 0, 3)
 	d := newCountingDef()
 
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, time.Now()))
+	require.NoError(t, uc.Touch(ctx, d.def, "t1", inc("like", 1), time.Now()))
 	require.EqualValues(t, 1, d.computes.Load())
-	for i := range 3 {
-		d.primary["like"] = int64(i + 1)
-		require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, time.Now()))
+	for range 3 {
+		require.NoError(t, uc.Touch(ctx, d.def, "t1", inc("like", 1), time.Now()))
 	}
+	// the cache drifted from the primary data, which a read within the
+	// limit does not notice
+	d.primary["like"] = 9
+	require.Equal(t, map[string]int64{"like": 3}, getCounts(t, uc, d, "t1"))
 	require.EqualValues(t, 1, d.computes.Load(), "deltas up to the limit do not recompute")
-	_, ok, err := store.Get(ctx, aggregate.Key("counts", "t1"))
+
+	// the delta past the limit is added like any other
+	require.NoError(t, uc.Touch(ctx, d.def, "t1", inc("like", 1), time.Now()))
+	require.EqualValues(t, 1, d.computes.Load(), "a writer never recomputes an entry it can add to")
+	stored, ok, err := store.Get(ctx, aggregate.Key("counts", "t1"))
 	require.NoError(t, err)
 	require.True(t, ok)
+	require.EqualValues(t, 4, stored.Deltas)
 
-	// the delta past the limit drops the entry; the next read recomputes
-	d.primary["like"] = 4
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{"like", 1}, time.Now()))
-	_, ok, err = store.Get(ctx, aggregate.Key("counts", "t1"))
-	require.NoError(t, err)
-	require.False(t, ok)
-	got, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 4}, got)
+	// and the next read replaces the entry
+	require.Equal(t, map[string]int64{"like": 9}, getCounts(t, uc, d, "t1"))
 	require.EqualValues(t, 2, d.computes.Load())
+	stored, ok, err = store.Get(ctx, aggregate.Key("counts", "t1"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.EqualValues(t, 0, stored.Deltas)
+	require.Equal(t, map[string]int64{"like": 9}, getCounts(t, uc, d, "t1"))
+	require.EqualValues(t, 2, d.computes.Load())
+}
+
+func TestSeedLosesToAnExistingEntry(t *testing.T) {
+	ctx := context.Background()
+	uc := aggregate.New(storetest.NewInMemory(), 0, 0)
+	d := newCountingDef()
+	d.primary["like"] = 1
+
+	// a seeded entry saves the first reader's computation
+	before := time.Now()
+	require.NoError(t, uc.Seed(ctx, d.def, "t1", aggregate.Counters{}))
+	require.Empty(t, getCounts(t, uc, d, "t1"))
+	require.EqualValues(t, 0, d.computes.Load())
+	seeded, ok, err := uc.Cached(ctx, d.def, "t1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, seeded.AsOf.Before(before), "a seed is as of now")
+
+	// and never replaces a computed one
+	getCounts(t, uc, d, "t2")
+	require.NoError(t, uc.Seed(ctx, d.def, "t2", aggregate.Counters{}))
+	require.Equal(t, map[string]int64{"like": 1}, getCounts(t, uc, d, "t2"))
 }
 
 func TestInvalidateAllRecomputesOnBothPaths(t *testing.T) {
@@ -196,46 +227,28 @@ func TestInvalidateAllRecomputesOnBothPaths(t *testing.T) {
 	d := newCountingDef()
 	d.primary["like"] = 1
 
-	_, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	_, err = aggregate.Get(ctx, uc, d.def, "t2")
-	require.NoError(t, err)
+	getCounts(t, uc, d, "t1")
+	getCounts(t, uc, d, "t2")
 	require.EqualValues(t, 2, d.computes.Load())
 
 	require.NoError(t, uc.InvalidateAll(ctx))
 	d.primary["like"] = 9
 
-	got, err := aggregate.Get(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 9}, got)
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t2", delta{"like", 1}, time.Now()))
-	got, err = aggregate.Get(ctx, uc, d.def, "t2")
-	require.NoError(t, err)
-	require.Equal(t, map[string]int64{"like": 9}, got, "a write on a dropped entry recomputes rather than applies")
+	require.Equal(t, map[string]int64{"like": 9}, getCounts(t, uc, d, "t1"))
+	require.NoError(t, uc.Touch(ctx, d.def, "t2", inc("like", 1), time.Now()))
+	require.Equal(t, map[string]int64{"like": 9}, getCounts(t, uc, d, "t2"), "a write on a dropped entry recomputes rather than adds")
 	require.EqualValues(t, 4, d.computes.Load())
 
 	require.NoError(t, uc.Invalidate(ctx, "counts", "t1"))
-	_, ok, err := aggregate.Cached(ctx, uc, d.def, "t1")
+	_, ok, err := uc.Cached(ctx, d.def, "t1")
 	require.NoError(t, err)
 	require.False(t, ok)
-	_, ok, err = aggregate.Cached(ctx, uc, d.def, "t2")
+	_, ok, err = uc.Cached(ctx, d.def, "t2")
 	require.NoError(t, err)
 	require.True(t, ok)
-}
 
-func TestTouchWithoutApplyInvalidates(t *testing.T) {
-	ctx := context.Background()
-	store := storetest.NewInMemory()
-	uc := aggregate.New(store, 0, 0)
-	d := newCountingDef()
-	d.def.Apply = nil
-	d.primary["like"] = 1
-
-	_, err := aggregate.Get(ctx, uc, d.def, "t1")
+	require.NoError(t, uc.InvalidateDefinition(ctx, "counts"))
+	_, ok, err = uc.Cached(ctx, d.def, "t2")
 	require.NoError(t, err)
-	require.NoError(t, aggregate.Touch(ctx, uc, d.def, "t1", delta{}, time.Now()))
-	_, ok, err := aggregate.Cached(ctx, uc, d.def, "t1")
-	require.NoError(t, err)
-	require.False(t, ok, "without a delta form a write drops the entry")
-	require.EqualValues(t, 1, d.computes.Load(), "and does not compute eagerly")
+	require.False(t, ok)
 }

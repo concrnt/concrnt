@@ -5,7 +5,9 @@
 package repoutil
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -15,6 +17,47 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
+
+// A transaction that lost to contention is run again, this many times at
+// most, waiting from the first backoff up to the last between attempts.
+const (
+	txMaxAttempts  = 8
+	txBackoffStart = 10 * time.Millisecond
+	txBackoffMax   = 500 * time.Millisecond
+)
+
+// RetryTx runs tx, one whole transaction, again from scratch while it fails
+// with an error retryable accepts (the store's contention errors). The SQL
+// backends use it; the Spanner and Firestore clients retry by themselves.
+func RetryTx(ctx context.Context, retryable func(error) bool, tx func() error) error {
+	backoff := txBackoffStart
+	for attempt := 1; ; attempt++ {
+		err := tx()
+		if err == nil || !retryable(err) || attempt >= txMaxAttempts {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), err)
+		case <-time.After(backoff):
+		}
+		backoff = min(backoff*2, txBackoffMax)
+	}
+}
+
+// AckSideOf picks the side a listing or count of ack states is about from
+// its from / to arguments, exactly one of which is set, and the ccid it is
+// held under.
+func AckSideOf(from, to string) (ucrecord.AckSide, string, error) {
+	switch {
+	case from != "":
+		return ucrecord.AckerSide, from, nil
+	case to != "":
+		return ucrecord.TargetSide, to, nil
+	default:
+		return 0, "", errors.New("either 'from' or 'to' must be specified")
+	}
+}
 
 // HierarchyOf lists the ancestor chain of a cckv URI, root first, the URI
 // itself last.
@@ -209,6 +252,28 @@ func CommitLogEntry(id, ip, document, proof, owner string, cDate time.Time) (ucr
 // ChunkSize is the length in seconds of a chunkline chunk; the chunk of an
 // item is its createdAt in unix seconds divided by it.
 const ChunkSize = 600
+
+// BodyPageSize is the least number of items LoadLocalBody returns for a
+// timeline that has that many at or before the chunk asked for.
+const BodyPageSize = 32
+
+// ItemID is the id of the chunkline item a key occupies: the redirect of a
+// reference record, the key itself otherwise.
+func ItemID(uri string, redirect *string) string {
+	if redirect != nil && *redirect != "" {
+		return *redirect
+	}
+	return uri
+}
+
+// BodyItem is the chunkline item of a key holding a record.
+func BodyItem(uri string, redirect *string, createdAt time.Time) chunkline.BodyItem {
+	return chunkline.BodyItem{
+		Timestamp:   createdAt,
+		Href:        ItemID(uri, redirect),
+		ContentType: "application/concrnt.document+json",
+	}
+}
 
 // ChunklineManifest is the manifest every backend serves for a local
 // timeline: the chunkline endpoints of this server's own API.

@@ -1,18 +1,26 @@
-// Package record is the Firestore implementation of record.Repository, file
-// for file and method for method the same as the Postgres, SQLite and
-// Spanner ones. A Firestore transaction must issue every read before its
-// first write and never sees its own writes, so the transaction handle
-// buffers the writes until the usecase closure returns and lays them over
-// the reads it serves meanwhile (tx.go); a method therefore sees what the
-// earlier methods of the same transaction wrote, as it does on the SQL
-// backends. Reads outside a transaction are plain strong reads. The client
-// re-runs the closure when the transaction aborts on contention, which is
-// RunInTx's retry.
+// Package record is the Firestore implementation of record.Repository
+// (CONTRACT.md; the data model is described in the parent package).
+//
+// Writes: every Apply* is one transaction that reads once, a single batch
+// get of documents whose ids follow from the arguments, and then writes. No
+// query runs inside a transaction, so a commit locks only the handful of
+// documents it names. The client re-runs the closure when the transaction
+// aborts on contention.
+//
+// Reads are plain strong reads outside any transaction, and whatever one
+// returns is on the documents its query or get lands on.
+//
+// Dependents (C11): an association carries the gen of the key incarnation
+// it was created on and is live only while the key document carries that
+// gen. Removing a key deletes its document alone, which ends the
+// incarnation for every read at once; the associations and uniqueness
+// markers left behind are removed by Cleanup, a page at a time.
 package record
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -38,44 +46,120 @@ func (r *Repository) col(name string) *firestore.CollectionRef {
 	return r.client.Collection(name)
 }
 
+// keyRef is the document of the key at uri.
+func (r *Repository) keyRef(uri string) *firestore.DocumentRef {
+	return r.col(fs.ColRecordKeys).Doc(keyID(uri))
+}
+
+// uniqueRef is the uniqueness marker of unique on the key at targetURI.
+func (r *Repository) uniqueRef(targetURI, unique string) *firestore.DocumentRef {
+	return r.col(fs.ColAssocUniques).Doc(uniqueID(targetURI, unique))
+}
+
 // txMaxAttempts bounds the closure re-runs on contention (Firestore aborts
 // the loser of two overlapping transactions; the SDK retries with backoff).
 const txMaxAttempts = 8
 
-// RunInTx runs fn inside a Firestore transaction. fn is re-run when the
-// transaction aborts on contention; a non-nil error from fn rolls back and
-// is returned unchanged.
-func (r *Repository) RunInTx(ctx context.Context, fn func(tx ucrecord.RepositoryTx) error) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.RunInTx")
-	defer span.End()
-
+// apply runs fn as one transaction and returns its status. fn is re-run
+// from scratch when the transaction aborts on contention, so it must reset
+// whatever it reports through captured variables at its start. A status
+// other than Applied must come with no write buffered: the transaction then
+// commits nothing, which is what Stale and Duplicate mean.
+func (r *Repository) apply(ctx context.Context, fn func(tx *firestore.Transaction) (ucrecord.ApplyStatus, error)) (ucrecord.ApplyStatus, error) {
 	start := time.Now()
 	attempts := 0
-	err := r.client.RunTransaction(ctx, func(_ context.Context, ftx *firestore.Transaction) error {
+	result := ucrecord.Applied
+	err := r.client.RunTransaction(ctx, func(_ context.Context, tx *firestore.Transaction) error {
 		attempts++
-		tx := &recordTx{ftx: ftx, ops: map[string]*pendingWrite{}}
-		if err := fn(tx); err != nil {
-			return err
-		}
-		return tx.flush()
+		var err error
+		result, err = fn(tx)
+		return err
 	}, firestore.MaxAttempts(txMaxAttempts))
 
 	fs.ObserveTx(start, attempts, err)
 	if err != nil && status.Code(err) == codes.Aborted {
-		err = errors.Join(errTxContention, err)
+		err = fmt.Errorf("firestore transaction aborted after %d attempts: %w", attempts, err)
 	}
+	return result, err
+}
+
+// readSet is the documents one operation reads, each once, in one batch
+// get: inside a transaction that is its whole read phase.
+type readSet struct {
+	refs  []*firestore.DocumentRef
+	index map[string]int
+	snaps []*firestore.DocumentSnapshot
+}
+
+func newReadSet(refs ...*firestore.DocumentRef) *readSet {
+	s := &readSet{index: map[string]int{}}
+	for _, ref := range refs {
+		s.add(ref)
+	}
+	return s
+}
+
+func (s *readSet) add(ref *firestore.DocumentRef) {
+	if _, ok := s.index[ref.Path]; ok {
+		return
+	}
+	s.index[ref.Path] = len(s.refs)
+	s.refs = append(s.refs, ref)
+}
+
+// loadTx reads the set inside tx (and locks it until the commit).
+func (s *readSet) loadTx(tx *firestore.Transaction) error {
+	if len(s.refs) == 0 {
+		return nil
+	}
+	snaps, err := tx.GetAll(s.refs)
+	s.snaps = snaps
 	return err
 }
 
-// errTxContention marks a transaction that still aborted after every retry.
-var errTxContention = errors.New("firestore transaction aborted after retries")
-
-var errInvalidTx = errors.New("invalid record repository transaction")
-
-func getRecordTx(tx ucrecord.RepositoryTx) (*recordTx, error) {
-	t, ok := tx.(*recordTx)
-	if !ok || t == nil || t.ftx == nil {
-		return nil, errInvalidTx
+// load reads the set outside a transaction.
+func (s *readSet) load(ctx context.Context, client *firestore.Client) error {
+	if len(s.refs) == 0 {
+		return nil
 	}
-	return t, nil
+	snaps, err := client.GetAll(ctx, s.refs)
+	s.snaps = snaps
+	return err
 }
+
+// snap returns the snapshot of ref, nil when the document does not exist
+// (or was not part of the set).
+func (s *readSet) snap(ref *firestore.DocumentRef) *firestore.DocumentSnapshot {
+	i, ok := s.index[ref.Path]
+	if !ok || i >= len(s.snaps) || s.snaps[i] == nil || !s.snaps[i].Exists() {
+		return nil
+	}
+	return s.snaps[i]
+}
+
+// data returns the fields of ref; false when the document does not exist.
+func (s *readSet) data(ref *firestore.DocumentRef) (map[string]any, bool) {
+	snap := s.snap(ref)
+	if snap == nil {
+		return nil, false
+	}
+	return snap.Data(), true
+}
+
+// newCommit is the commit log entry of commit, anchored to what it stores.
+func newCommit(commit ucrecord.Commit, anchor, anchorID string) (commitDoc, error) {
+	proof, err := json.Marshal(commit.Proof)
+	if err != nil {
+		return commitDoc{}, err
+	}
+	return commitDoc{
+		IP:       commit.IP,
+		Document: commit.Document,
+		Proof:    string(proof),
+		Owner:    commit.Owner,
+		Anchor:   anchor,
+		AnchorID: anchorID,
+	}, nil
+}
+
+var flagGc = []firestore.Update{{Path: "gcCandidate", Value: true}}

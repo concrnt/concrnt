@@ -13,46 +13,46 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// While one transaction holds the writer lock longer than the busy timeout,
-// a raw BEGIN IMMEDIATE fails with SQLITE_BUSY (the retryable error), and
-// RunInTx keeps retrying it until the lock is free and the write lands.
-func TestRunInTxRetriesOnBusy(t *testing.T) {
+// While a connection outside the repository (another process, in practice)
+// holds the writer lock longer than the busy timeout, a raw BEGIN IMMEDIATE
+// fails with SQLITE_BUSY (the retryable error), and an Apply* call keeps
+// retrying until the lock is free and the write lands. Apply* calls of one
+// process never meet this way: they take turns before they begin
+// (Repository.writer).
+func TestApplyRetriesOnBusy(t *testing.T) {
 	ctx := context.Background()
 	db, err := sqlitedb.Open(filepath.Join(t.TempDir(), "busy.db"), "busy_timeout(20)")
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 	require.NoError(t, sqlitedb.Migrate(ctx, db))
-	repo := New(db.DB)
+	repo := New(db.DB).(*Repository)
 
-	holding := make(chan struct{})
+	commit := func(id string) ucrecord.Commit {
+		return ucrecord.Commit{ID: id, IP: "127.0.0.1", Document: "{}", Proof: concrnt.Proof{Type: concrnt.ProofTypeNone}, Owner: "con1owner"}
+	}
+
+	holder, err := db.SQL().BeginTx(ctx, nil)
+	require.NoError(t, err)
 	released := make(chan struct{})
 	go func() {
 		defer close(released)
-		_ = repo.RunInTx(ctx, func(tx ucrecord.RepositoryTx) error {
-			if err := repo.CreateCommitLog(ctx, tx, "busy-holder", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner"); err != nil {
-				return err
-			}
-			close(holding)
-			time.Sleep(300 * time.Millisecond)
-			return nil
-		})
+		time.Sleep(300 * time.Millisecond)
+		_ = holder.Rollback()
 	}()
-	<-holding
 
 	_, err = db.SQL().BeginTx(ctx, nil)
 	require.Error(t, err, "a second writer cannot begin while the lock is held")
 	require.True(t, isRetryableTxError(err), "the busy error must be the retryable kind, got %v", err)
 
 	start := time.Now()
-	require.NoError(t, repo.RunInTx(ctx, func(tx ucrecord.RepositoryTx) error {
-		return repo.CreateCommitLog(ctx, tx, "busy-waiter", "127.0.0.1", "{}", concrnt.Proof{Type: concrnt.ProofTypeNone}, "con1owner")
-	}))
-	require.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond, "RunInTx must have waited through retries for the holder")
+	waiter := commit("busy-waiter")
+	outcome, err := repo.ApplyDelete(ctx, ucrecord.DeleteCommit{Commit: &waiter})
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.Applied, outcome.Status)
+	require.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond, "the write must have waited through retries for the holder")
 	<-released
 
-	for _, id := range []string{"busy-holder", "busy-waiter"} {
-		commit, err := newInspector(db.DB).Commit(ctx, id)
-		require.NoError(t, err)
-		require.NotNil(t, commit, "%s must be committed", id)
-	}
+	entries, err := repo.ListCommitLogs(ctx, ucrecord.CommitLogPage{Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the write must be committed")
 }

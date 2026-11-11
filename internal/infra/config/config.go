@@ -111,9 +111,6 @@ type Backends struct {
 type Postgres struct {
 	// MaxOpenConns is the pool size (default 64).
 	MaxOpenConns int `yaml:"maxOpenConns"`
-	// MaxConcurrentTx caps the transactions running at once (default and
-	// upper bound maxOpenConns/2).
-	MaxConcurrentTx int `yaml:"maxConcurrentTx"`
 }
 
 const (
@@ -121,27 +118,14 @@ const (
 	DefaultJobQueueConcurrency  = 16
 )
 
-// WithDefaults fills the unset values and caps MaxConcurrentTx at half the
-// pool: a transaction's reads take a second connection (CONTRACT.md C4), so
-// more transactions than that can leave every one waiting for a connection
-// another holds. clamped reports that a configured value was lowered.
-func (p Postgres) WithDefaults() (resolved Postgres, clamped bool) {
+// MaxOpenConnsOrDefault is MaxOpenConns, or its default when unset. A
+// commit is one transaction on one connection and reads never run inside
+// it, so the pool needs no headroom beyond the concurrency wanted.
+func (p Postgres) MaxOpenConnsOrDefault() int {
 	if p.MaxOpenConns <= 0 {
-		p.MaxOpenConns = DefaultPostgresMaxOpenConns
+		return DefaultPostgresMaxOpenConns
 	}
-	if p.MaxOpenConns < 2 {
-		p.MaxOpenConns = 2
-		clamped = true
-	}
-	limit := p.MaxOpenConns / 2
-	if p.MaxConcurrentTx <= 0 {
-		p.MaxConcurrentTx = limit
-	}
-	if p.MaxConcurrentTx > limit {
-		p.MaxConcurrentTx = limit
-		clamped = true
-	}
-	return p, clamped
+	return p.MaxOpenConns
 }
 
 // JobQueue configures the background job consumers of one process.

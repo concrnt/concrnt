@@ -16,8 +16,12 @@ import (
 // Liveness (/health) asks whether this process is worth keeping: it fails
 // only when one of the process's own loops has stalled, never because a
 // backend is down — restarting would not bring the backend back. Readiness
-// (/ready) asks whether this replica should receive traffic: it fails while
-// any backend the public API depends on is unreachable, and while draining.
+// (/ready) asks whether this replica should receive traffic: it fails
+// until every backend the public API depends on has answered once, while
+// one of them is down by the readiness watcher's verdict, and while
+// draining. The handler only reads that verdict — a replica that is busy
+// but serving must not take itself out of rotation because a check of its
+// own queued behind the load.
 type ProbeHandler struct {
 	watchdog  *health.Watchdog
 	readiness *health.Readiness
@@ -72,13 +76,11 @@ func (h *ProbeHandler) handleReady(c echo.Context) error {
 	}
 
 	report := probeReport{Status: "ok", Checks: map[string]string{}}
-	for name, err := range h.readiness.Run(c.Request().Context()) {
-		if err != nil {
+	for name, backend := range h.readiness.Status() {
+		if !backend.Up {
 			report.Status = "unavailable"
-			report.Checks[name] = err.Error()
-			continue
 		}
-		report.Checks[name] = "ok"
+		report.Checks[name] = backend.Detail
 	}
 
 	if report.Status != "ok" {

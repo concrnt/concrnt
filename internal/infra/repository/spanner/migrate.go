@@ -15,7 +15,9 @@ import (
 // schema_migrations is created when missing, the applied versions are
 // read, and every later batch goes through UpdateDatabaseDdl and is then
 // recorded. DDL is not transactional, so a batch interrupted half way is
-// re-run next start; the IF NOT EXISTS statements make that a no-op.
+// re-run next start; the IF NOT EXISTS statements make that a no-op, and a
+// batch that cannot be written that way says through Pending when it is
+// done.
 func Migrate(ctx context.Context, admin *database.DatabaseAdminClient, client *spanner.Client) error {
 	dbPath := client.DatabaseName()
 
@@ -55,10 +57,16 @@ func Migrate(ctx context.Context, admin *database.DatabaseAdminClient, client *s
 		if applied[m.Version] {
 			continue
 		}
-		if err := applyDDL(ctx, admin, dbPath, m.Statements); err != nil {
+		pending, err := isPending(ctx, client, m)
+		if err != nil {
 			return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
 		}
-		_, err := client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("schema_migrations",
+		if pending {
+			if err := applyDDL(ctx, admin, dbPath, m.Statements); err != nil {
+				return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
+			}
+		}
+		_, err = client.Apply(ctx, []*spanner.Mutation{spanner.InsertOrUpdate("schema_migrations",
 			[]string{"version", "name", "applied_at"},
 			[]any{int64(m.Version), m.Name, time.Now()})})
 		if err != nil {
@@ -66,6 +74,21 @@ func Migrate(ctx context.Context, admin *database.DatabaseAdminClient, client *s
 		}
 	}
 	return nil
+}
+
+// isPending reports whether m still has to be applied: always, unless its
+// Pending query says its effect is already in the schema.
+func isPending(ctx context.Context, client *spanner.Client, m migration) (bool, error) {
+	if m.Pending == "" {
+		return true, nil
+	}
+	it := client.Single().Query(ctx, spanner.Statement{SQL: m.Pending})
+	defer it.Stop()
+	_, err := it.Next()
+	if err == iterator.Done {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func applyDDL(ctx context.Context, admin *database.DatabaseAdminClient, dbPath string, statements []string) error {

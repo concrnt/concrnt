@@ -16,10 +16,6 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
-// errCommitNoop rolls the commit transaction back when the applied document
-// lost accept-if-newer; the stored document is reported instead.
-var errCommitNoop = errors.New("commit no-op")
-
 func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Commit")
 	defer span.End()
@@ -188,73 +184,59 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	var applyCommit func(tx RepositoryTx) (*commitApplyResult, error)
+	// plan: every read, check and policy evaluation of the commit happens
+	// here, against committed state
+	var plan *commitPlan
 
 	switch doc.Kind {
 	case "entity":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.saveEntity(ctx, tx, ip, sd)
-		}
+		plan, err = uc.planEntity(ctx, ip, sd)
 
 	case "record":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createRecord(ctx, tx, ip, *requester, doc, sd, mode)
-		}
+		plan, err = uc.planRecord(ctx, ip, *requester, doc, sd, mode)
 
 	case "association":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createAssociation(ctx, tx, ip, *requester, doc, sd, mode)
-		}
+		plan, err = uc.planAssociation(ctx, ip, *requester, doc, sd, mode)
 
 	case "ack", "acked", "unack", "unacked":
-		targetUser, err := uc.getEntityWithReference(ctx, ip, targetUserID, sd)
+		targetUser, targetErr := uc.getEntityWithReference(ctx, ip, targetUserID, sd)
+		if targetErr != nil {
+			span.RecordError(targetErr)
+			return nil, targetErr
+		}
+		plan, err = uc.planAck(ctx, ip, *requester, *targetUser, doc, sd, mode)
+
+	case "delete":
+		plan, err = uc.planDelete(ctx, ip, *requester, sd, mode)
+
+	default:
+		err = errors.New("unsupported document kind: " + doc.Kind)
+	}
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// apply: the one repository write. It is atomic and stores nothing when
+	// it ends Stale or Duplicate, so there is nothing to undo here
+	status := Applied
+	if !plan.noop && plan.apply != nil {
+		status, err = plan.apply(ctx)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.processAck(ctx, tx, ip, *requester, *targetUser, doc, sd, mode)
-		}
-
-	case "delete":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.deleteRecord(ctx, tx, ip, *requester, sd, mode)
-		}
-	default:
-		err := errors.New("unsupported document kind: " + doc.Kind)
-		span.RecordError(err)
-		return nil, err
 	}
 
-	// applyCommit may be re-run on contention, so external side effects stay
-	// in postProcesses, which run after the transaction.
-	var applyResult *commitApplyResult
-	err = uc.repo.RunInTx(ctx, func(tx RepositoryTx) error {
-		res, err := applyCommit(tx)
-		if err != nil {
-			return err
-		}
-		applyResult = res
-		if res.noop {
-			// the losing commit's log entry must not persist
-			return errCommitNoop
-		}
-		return nil
-	})
-	if errors.Is(err, ErrAlreadyCommitted) {
-		// a redelivery: the commit log's insert found the id, the
-		// transaction rolled back and nothing changed
+	if status == Duplicate {
+		// a redelivery: the commit is in the log already and nothing changed
 		return &sd, nil
 	}
-	if err != nil && !errors.Is(err, errCommitNoop) {
-		span.RecordError(err)
-		return nil, err
-	}
 
-	if applyResult.noop {
+	if plan.noop || status == Stale {
 		slog.Info("commit no-op (accept-if-newer loss)",
 			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
-		return applyResult.result, nil
+		return plan.unapplied, nil
 	}
 
 	// A same-key overwrite or delete must be visible to this server's own
@@ -277,7 +259,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	for _, task := range applyResult.postProcesses {
+	for _, task := range plan.postProcesses {
 		if err := task(ctx); err != nil {
 			slog.Error(
 				"failed to run post-commit action",
@@ -287,7 +269,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	return applyResult.result, nil
+	return plan.result, nil
 }
 
 // rejectAliasOwners rejects alias-form owners (@<FQDN>, CIP-0 §7.2) in the

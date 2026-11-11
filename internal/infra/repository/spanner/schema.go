@@ -9,10 +9,17 @@ package spanner
 // re-runnable (IF NOT EXISTS) because DDL is not transactional and two
 // replicas may start at once. A schema change is a new batch, never an edit
 // of an applied one.
+//
+// Pending is for the statements GoogleSQL gives no re-runnable form (DROP
+// CONSTRAINT has no IF EXISTS): a query that returns a row for as long as
+// the batch still has to run. When it returns none the batch is recorded
+// without being applied, which is what a start after a batch that ran but
+// was not recorded finds.
 type migration struct {
 	Version    int
 	Name       string
 	Statements []string
+	Pending    string
 }
 
 // The tables mirror the Postgres ones column for column
@@ -24,6 +31,12 @@ type migration struct {
 //     are interleaved in commit_logs with ON DELETE CASCADE, so deleting a
 //     commit log takes its state rows with it; entities and record_keys have
 //     other keys and cascade through foreign keys instead.
+//   - a key's associations do not cascade from it (one commit holds 80,000
+//     mutations at most): record_keys.gen names the incarnation of the key,
+//     written when the row is created, and an association carries the
+//     target_gen it was created on. Only associations whose target_gen is
+//     the gen of the key row now at target_uri are read; the rest wait for
+//     Repository.Cleanup.
 //   - commit_logs.c_date is a commit timestamp (monotonic within the
 //     database), written with PENDING_COMMIT_TIMESTAMP().
 //   - "from", "to" and "unique" are reserved words: from_ccid, to_ccid,
@@ -46,10 +59,17 @@ type migration struct {
 //     QueryByParent; idx_record_keys_record_id UNIQUE NULL_FILTERED reverse
 //     ccfs-to-cckv lookups; idx_record_keys_parent_uri_uri (parent_uri, uri)
 //     QueryByParentOrderByKey including placeholders.
-//   - associations: PK (id) interleaved; (target_uri) GetAssociatedRecords
-//     and ComputeAssociationCounts; (target_uri, schema, variant, author) and
-//     (target_uri, schema, variant, created_at) for the filtered variants;
-//     UNIQUE (unique_key) idempotent association writes.
+//   - associations: PK (id) interleaved; every index starts with the
+//     incarnation (target_uri, target_gen) and the listing ones end with
+//     (created_at DESC, id DESC), the order a listing asks for unless told
+//     otherwise (an index is only read forwards: the other order reads the
+//     whole range and sorts): (.., created_at DESC, id DESC)
+//     GetAssociatedRecords without a filter and the Cleanup pages;
+//     (.., schema, variant, created_at DESC, id DESC) the listings filtered
+//     by schema and the counts of ComputeAssociationSummary;
+//     (.., author, created_at DESC, id DESC) the listings filtered by
+//     author and the authors of ComputeAssociationSummary;
+//     UNIQUE (.., unique_key) one logical association per incarnation.
 //   - acks / ackeds: PK (id) interleaved; UNIQUE (from_ccid, to_ccid, schema)
 //     the accept-if-newer state key; acks (from_ccid, valid, created_at) and
 //     ackeds (to_ccid, valid, created_at) the list and count lookups (acks
@@ -57,7 +77,9 @@ type migration struct {
 //   - entities: PK (ccid); (alias) GetEntityByAlias.
 //   - entity_meta: PK (ccid). servers: PK (fqdn); (cs_id). subscriptions:
 //     PK (vendor_id, owner). abuse_reports: PK (id). aggregate_entries:
-//     PK (key), rows past expires_at are dropped by the row deletion policy.
+//     PK (key), rows past expires_at are dropped by the row deletion policy;
+//     aggregate_deltas: PK (key, id), interleaved in aggregate_entries and
+//     deleted with its row.
 var migrations = []migration{
 	{1, "baseline_tables", []string{
 		`CREATE TABLE IF NOT EXISTS commit_logs (
@@ -200,7 +222,7 @@ var migrations = []migration{
 			deltas INT64 NOT NULL,
 			expires_at TIMESTAMP NOT NULL
 		) PRIMARY KEY (key), ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`,
-	}},
+	}, ""},
 	// acks are read by from and ackeds by to: the other side's indexes and
 	// the schema ones were never scanned; IF EXISTS because the baseline
 	// does not create them
@@ -209,5 +231,73 @@ var migrations = []migration{
 		`DROP INDEX IF EXISTS idx_acks_schema_valid_created_at`,
 		`DROP INDEX IF EXISTS idx_acked_from_valid_created_at`,
 		`DROP INDEX IF EXISTS idx_acked_schema_valid_created_at`,
-	}},
+	}, ""},
+	// the count cache holds counters and takes its writes as delta rows
+	// (internal/infra/aggregate/spanner). It is a cache, so the old rows
+	// are dropped with the table rather than converted
+	{3, "aggregate_entries_counters", []string{
+		`DROP TABLE IF EXISTS aggregate_deltas`,
+		`DROP TABLE IF EXISTS aggregate_entries`,
+		`CREATE TABLE aggregate_entries (
+			key STRING(MAX) NOT NULL,
+			value BYTES(MAX) NOT NULL,
+			as_of TIMESTAMP NOT NULL,
+			deltas INT64 NOT NULL,
+			expires_at TIMESTAMP NOT NULL
+		) PRIMARY KEY (key), ROW DELETION POLICY (OLDER_THAN(expires_at, INTERVAL 0 DAY))`,
+		`CREATE TABLE aggregate_deltas (
+			key STRING(MAX) NOT NULL,
+			id STRING(36) NOT NULL,
+			delta BYTES(MAX) NOT NULL
+		) PRIMARY KEY (key, id), INTERLEAVE IN PARENT aggregate_entries ON DELETE CASCADE`,
+	}, ""},
+	// an association is bound to the incarnation of its target key
+	// (record_keys.gen) instead of cascading from the key row, so removing
+	// a key no longer deletes its associations in the same commit. The
+	// columns default to '' on the rows already there: those associations
+	// are all on live keys (the foreign key saw to it), and every key row
+	// written from now on gets a generation of its own
+	{4, "association_incarnations", []string{
+		`ALTER TABLE record_keys ADD COLUMN IF NOT EXISTS gen STRING(36) NOT NULL DEFAULT ('')`,
+		`ALTER TABLE associations ADD COLUMN IF NOT EXISTS target_gen STRING(36) NOT NULL DEFAULT ('')`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_created_at ON associations (target_uri, target_gen, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_schema_variant_author ON associations (target_uri, target_gen, schema, variant, author)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_schema_variant_created_at ON associations (target_uri, target_gen, schema, variant, created_at)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS uni_associations_target_gen_unique ON associations (target_uri, target_gen, unique_key)`,
+		`DROP INDEX IF EXISTS idx_associations_target_uri`,
+		`DROP INDEX IF EXISTS idx_associations_target_schema_variant_author`,
+		`DROP INDEX IF EXISTS idx_associations_target_schema_variant_created_at`,
+		`DROP INDEX IF EXISTS uni_associations_unique`,
+	}, ""},
+	// the cascade from a key row to its associations is what put a whole
+	// key's associations into one commit (80,000 mutations at most); the
+	// generation columns of batch 4 replace it
+	{5, "drop_association_target_cascade", []string{
+		`ALTER TABLE associations DROP CONSTRAINT fk_associations_target`,
+	}, `SELECT 1 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS
+		WHERE TABLE_SCHEMA = '' AND TABLE_NAME = 'associations' AND CONSTRAINT_NAME = 'fk_associations_target'`},
+	// an entry row is written once and never updated: the delta rows are
+	// folded into one of their own instead of into the entry (a fold that
+	// rewrites the entry row reads it under a lock every other fold and
+	// every replacement of the entry waits on), so the count of folded
+	// deltas lives in that row. DROP COLUMN has no IF EXISTS
+	{6, "aggregate_entries_drop_deltas", []string{
+		`ALTER TABLE aggregate_entries DROP COLUMN deltas`,
+	}, `SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = '' AND TABLE_NAME = 'aggregate_entries' AND COLUMN_NAME = 'deltas'`},
+	// the listings read newest first by default and a client asks for its
+	// own associations on every message it shows: on the ascending indexes
+	// the first read every association of the target to sort them, the
+	// second read them all to find one author's. The descending indexes
+	// serve both with a seek; (schema, variant, author) has no reader left
+	// (the authors come from the author index), so an association still has
+	// four index entries
+	{7, "association_listing_indexes", []string{
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_created_at_desc ON associations (target_uri, target_gen, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_schema_variant_created_at_desc ON associations (target_uri, target_gen, schema, variant, created_at DESC, id DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_associations_target_gen_author_created_at_desc ON associations (target_uri, target_gen, author, created_at DESC, id DESC)`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_created_at`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_schema_variant_created_at`,
+		`DROP INDEX IF EXISTS idx_associations_target_gen_schema_variant_author`,
+	}, ""},
 }

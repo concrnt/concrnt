@@ -1,16 +1,15 @@
-// Package redis keeps aggregate entries as volatile Redis strings; Apply is
-// an optimistic WATCH / MULTI loop (serialised per key inside one process),
-// InvalidateDefinition / InvalidateAll a SCAN over the key pattern.
+// Package redis keeps an aggregate entry as one volatile Redis hash: the
+// counters, minima and members are fields of it, so Add is a single Lua
+// script of HINCRBY / HSET calls that never reads the entry back to the
+// client and needs no retry. InvalidateDefinition / InvalidateAll are a
+// SCAN over the key pattern.
 package redis
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"hash/maphash"
-	"math/rand/v2"
+	"fmt"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -19,114 +18,149 @@ import (
 )
 
 const (
-	keyPrefix      = "aggregate:"
-	applyAttempts  = 32
-	applyStripes   = 64
+	// the prefix is not the one of the string-valued entries this store
+	// kept before: those expire on their own and must not be read as hashes
+	keyPrefix      = "aggregate:v2:"
 	scanBatchCount = 1000
 )
 
+// Hash fields. The first byte tells what the rest names, so arbitrary
+// counter names and members cannot collide with one another or with the
+// two fields of the entry itself.
+const (
+	fieldAsOf     = "a" // unix nanoseconds
+	fieldDeltas   = "d"
+	prefixCount   = "c:"
+	prefixMinimum = "m:"
+	prefixMember  = "s:"
+)
+
+// putScript stores a new hash unless the key exists.
+// KEYS[1] the entry; ARGV[1] ttl in milliseconds, then field, value pairs.
+var putScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 1 then
+	return 0
+end
+redis.call('HSET', KEYS[1], unpack(ARGV, 2))
+redis.call('PEXPIRE', KEYS[1], ARGV[1])
+return 1
+`)
+
+// addScript folds a delta into an existing hash.
+// KEYS[1] the entry; ARGV: the number of increments, then field, n pairs;
+// the number of minima, then field, value pairs; the member fields.
+// Minima are unix nanoseconds, beyond what a Lua number holds exactly, so
+// they are compared as decimal strings (canonical: strconv.FormatInt).
+var addScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[1]) == 0 then
+	return 0
+end
+local function less(a, b)
+	local an, bn = string.sub(a, 1, 1) == '-', string.sub(b, 1, 1) == '-'
+	if an ~= bn then
+		return an
+	end
+	if an then
+		a, b = string.sub(b, 2), string.sub(a, 2)
+	end
+	if #a ~= #b then
+		return #a < #b
+	end
+	return a < b
+end
+local i = 1
+local incs = tonumber(ARGV[i])
+i = i + 1
+for _ = 1, incs do
+	redis.call('HINCRBY', KEYS[1], ARGV[i], ARGV[i + 1])
+	i = i + 2
+end
+local mins = tonumber(ARGV[i])
+i = i + 1
+for _ = 1, mins do
+	local cur = redis.call('HGET', KEYS[1], ARGV[i])
+	if not cur or less(ARGV[i + 1], cur) then
+		redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+	end
+	i = i + 2
+end
+while i <= #ARGV do
+	redis.call('HSETNX', KEYS[1], ARGV[i], '1')
+	i = i + 1
+end
+redis.call('HINCRBY', KEYS[1], 'd', 1)
+return 1
+`)
+
 type Store struct {
 	rdb *redis.Client
-	// applyLocks serialise the Apply calls of this process on one key: WATCH
-	// lets only one of the concurrent writers of a key win each round, so a
-	// burst of same-key Applies from one process would otherwise burn the
-	// retries of all but one of them. Writers in other processes still meet
-	// at the WATCH.
-	applyLocks [applyStripes]sync.Mutex
-	applySeed  maphash.Seed
 }
 
 func New(rdb *redis.Client) *Store {
-	return &Store{rdb: rdb, applySeed: maphash.MakeSeed()}
+	return &Store{rdb: rdb}
 }
 
-type envelope struct {
-	Value  []byte    `json:"v"`
-	AsOf   time.Time `json:"asOf"`
-	Deltas int       `json:"d"`
-}
-
-func (e envelope) entry() *aggregate.Entry {
-	return &aggregate.Entry{Value: e.Value, AsOf: e.AsOf, Deltas: e.Deltas}
-}
-
-func decode(raw []byte) (envelope, error) {
-	var e envelope
-	err := json.Unmarshal(raw, &e)
-	return e, err
-}
-
-func (s *Store) Get(ctx context.Context, key string) (*aggregate.Entry, bool, error) {
-	raw, err := s.rdb.Get(ctx, keyPrefix+key).Bytes()
-	if errors.Is(err, redis.Nil) {
+func (s *Store) Get(ctx context.Context, key string) (*aggregate.Counters, bool, error) {
+	fields, err := s.rdb.HGetAll(ctx, keyPrefix+key).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	if len(fields) == 0 {
 		return nil, false, nil
 	}
-	if err != nil {
-		return nil, false, err
-	}
-	e, err := decode(raw)
-	if err != nil {
-		return nil, false, err
-	}
-	return e.entry(), true, nil
-}
-
-func (s *Store) PutIfAbsent(ctx context.Context, key string, entry aggregate.Entry, ttl time.Duration) (bool, error) {
-	raw, err := json.Marshal(envelope{Value: entry.Value, AsOf: entry.AsOf, Deltas: 0})
-	if err != nil {
-		return false, err
-	}
-	return s.rdb.SetNX(ctx, keyPrefix+key, raw, ttl).Result()
-}
-
-func (s *Store) Apply(ctx context.Context, key string, fn func(old []byte) ([]byte, error)) (*aggregate.Entry, bool, error) {
-	k := keyPrefix + key
-	mu := &s.applyLocks[maphash.String(s.applySeed, key)%applyStripes]
-	mu.Lock()
-	defer mu.Unlock()
-	for attempt := range applyAttempts {
-		if attempt > 0 {
-			// WATCH loses to every concurrent writer of the key; a jittered
-			// pause spreads a burst of writers out
-			time.Sleep(time.Duration(rand.IntN(attempt*500)+100) * time.Microsecond)
-		}
-		var out *aggregate.Entry
-		err := s.rdb.Watch(ctx, func(tx *redis.Tx) error {
-			raw, err := tx.Get(ctx, k).Bytes()
-			if errors.Is(err, redis.Nil) {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			e, err := decode(raw)
-			if err != nil {
-				return err
-			}
-			e.Value, err = fn(e.Value)
-			if err != nil {
-				return err
-			}
-			e.Deltas++
-			next, err := json.Marshal(e)
-			if err != nil {
-				return err
-			}
-			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.Set(ctx, k, next, redis.KeepTTL)
-				return nil
-			})
-			if err == nil {
-				out = e.entry()
-			}
-			return err
-		}, k)
-		if errors.Is(err, redis.TxFailedErr) {
+	out := &aggregate.Counters{Counts: map[string]int64{}, Minima: map[string]int64{}}
+	for field, value := range fields {
+		if name, ok := strings.CutPrefix(field, prefixMember); ok {
+			out.Members = append(out.Members, name)
 			continue
 		}
-		return out, out != nil, err
+		n, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return nil, false, fmt.Errorf("aggregate redis: field %q of %q: %w", field, key, err)
+		}
+		switch {
+		case field == fieldAsOf:
+			out.AsOf = time.Unix(0, n).UTC()
+		case field == fieldDeltas:
+			out.Deltas = n
+		case strings.HasPrefix(field, prefixCount):
+			out.Counts[field[len(prefixCount):]] = n
+		case strings.HasPrefix(field, prefixMinimum):
+			out.Minima[field[len(prefixMinimum):]] = n
+		}
 	}
-	return nil, false, errors.New("aggregate redis: apply lost the race too many times")
+	return out, true, nil
+}
+
+func (s *Store) PutIfAbsent(ctx context.Context, key string, entry aggregate.Counters, ttl time.Duration) (bool, error) {
+	args := make([]any, 0, 5+2*(len(entry.Counts)+len(entry.Minima)+len(entry.Members)))
+	args = append(args, ttl.Milliseconds(), fieldAsOf, entry.AsOf.UnixNano(), fieldDeltas, 0)
+	for name, n := range entry.Counts {
+		args = append(args, prefixCount+name, n)
+	}
+	for name, n := range entry.Minima {
+		args = append(args, prefixMinimum+name, n)
+	}
+	for _, member := range entry.Members {
+		args = append(args, prefixMember+member, 1)
+	}
+	return putScript.Run(ctx, s.rdb, []string{keyPrefix + key}, args...).Bool()
+}
+
+func (s *Store) Add(ctx context.Context, key string, delta aggregate.Delta) (bool, error) {
+	args := make([]any, 0, 2+2*(len(delta.Inc)+len(delta.Min))+len(delta.AddMembers))
+	args = append(args, len(delta.Inc))
+	for name, n := range delta.Inc {
+		args = append(args, prefixCount+name, n)
+	}
+	args = append(args, len(delta.Min))
+	for name, n := range delta.Min {
+		args = append(args, prefixMinimum+name, n)
+	}
+	for _, member := range delta.AddMembers {
+		args = append(args, prefixMember+member)
+	}
+	return addScript.Run(ctx, s.rdb, []string{keyPrefix + key}, args...).Bool()
 }
 
 func (s *Store) Invalidate(ctx context.Context, key string) error {

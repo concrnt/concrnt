@@ -741,8 +741,33 @@
       "indexes": []
     },
     {
+      "collectionGroup": "ackeds",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "ackeds",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "acks",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "acks",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
       "collectionGroup": "aggregate_entries",
-      "fieldPath": "value",
+      "fieldPath": "counters",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "aggregate_entries",
+      "fieldPath": "members",
       "indexes": []
     },
     {
@@ -756,8 +781,38 @@
       "indexes": []
     },
     {
+      "collectionGroup": "association_uniques",
+      "fieldPath": "targetURI",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "association_uniques",
+      "fieldPath": "targetGen",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "association_uniques",
+      "fieldPath": "associationID",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "associations",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "associations",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
       "collectionGroup": "associations",
       "fieldPath": "owner",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "associations",
+      "fieldPath": "unique",
       "indexes": []
     },
     {
@@ -776,6 +831,36 @@
       "indexes": []
     },
     {
+      "collectionGroup": "commits",
+      "fieldPath": "anchor",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "commits",
+      "fieldPath": "anchorID",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entities",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entities",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entities",
+      "fieldPath": "domain",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "entities",
+      "fieldPath": "tag",
+      "indexes": []
+    },
+    {
       "collectionGroup": "entity_metas",
       "fieldPath": "info",
       "indexes": []
@@ -783,6 +868,21 @@
     {
       "collectionGroup": "entity_metas",
       "fieldPath": "inviter",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "document",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "proof",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "record_keys",
+      "fieldPath": "gen",
       "indexes": []
     },
     {
@@ -811,33 +911,8 @@
       "indexes": []
     },
     {
-      "collectionGroup": "records",
-      "fieldPath": "policies",
-      "indexes": []
-    },
-    {
-      "collectionGroup": "records",
-      "fieldPath": "distributions",
-      "indexes": []
-    },
-    {
-      "collectionGroup": "records",
-      "fieldPath": "redirect",
-      "indexes": []
-    },
-    {
-      "collectionGroup": "records",
-      "fieldPath": "owner",
-      "indexes": []
-    },
-    {
-      "collectionGroup": "records",
-      "fieldPath": "author",
-      "indexes": []
-    },
-    {
-      "collectionGroup": "records",
-      "fieldPath": "schema",
+      "collectionGroup": "retained_versions",
+      "fieldPath": "uri",
       "indexes": []
     },
     {

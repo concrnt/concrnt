@@ -1,5 +1,49 @@
 # Postgres backend notes
 
+## Writes and connections
+
+Every `Apply*` method of the record repository is one transaction on one
+pooled connection (`record/repository.go`, `apply`): it is re-run from
+scratch on `serialization_failure` (40001), `deadlock_detected` (40P01) and
+when a concurrent writer overtook a row before it could be locked, up to 8
+attempts with a 10 ms to 500 ms backoff, and it is rolled back when the
+outcome is `Stale` or `Duplicate`, which is how those leave no trace. The
+usecase issues its reads before the call, never inside the transaction.
+
+Size the pool with `backends.postgres.maxOpenConns` alone.
+
+What stays bounded: at most `maxOpenConns / 2` `Apply*` transactions are
+open at once (`Repository.txSlots`, derived from the pool; none when the
+pool is unbounded). A transaction holds its connection for five or more
+round trips and a read for one, and `database/sql` gives a freed
+connection to any waiter, so without the bound a burst of commits (a seed,
+an import, a delivery backlog) takes every connection and each read waits
+among them: with 128 writers on a pool of 64 and a 2 ms round trip, the
+reads beside them took p95 95 ms without the bound and p95 4 ms with it
+(`record/loadshape_test.go`, scenario `writers`). A transaction waiting
+for a slot holds no connection; the wait is the histogram
+`concrnt_record_tx_slot_wait_seconds`.
+
+Dependents go by `ON DELETE CASCADE` inside the same transaction
+(`record_keys.record_id` → `records`, `associations.target_id` →
+`record_keys`, everything anchored to a commit → `commit_logs`), so
+`ApplyDelete` issues no cleanup tokens and `Cleanup` is a no-op.
+
+Two things this schema does that the contract does not ask for
+(`CONTRACT.md`, backend notes):
+
+- `associations."unique"` is unique table-wide, not per target. The usecase
+  derives the value from the target, so the difference is not reachable
+  through it.
+- `record_keys.parent_id` is the parent row's serial id, without a foreign
+  key. Removing a key that has children deletes the parent row; the
+  children keep the dangling id and are missing from `QueryByParent*` and
+  the chunkline views of that parent until they are written again (an
+  overwrite sets `parent_id` anew).
+
+Migration step 6 (`aggregate_entries_counters`) drops and recreates the
+count cache table in its counter shape (`internal/infra/aggregate/postgres`).
+
 ## Prefix scans on record_keys.uri
 
 `record_keys.uri` has the database's default collation (en_US.utf8 on the

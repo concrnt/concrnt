@@ -2,12 +2,11 @@ package record
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -17,70 +16,107 @@ import (
 type ackSide struct {
 	table string
 	owner string // the column the ccfs namespace is composed from (CIP-3 §3.4)
-	model any
-	row   func(documentID, from, to, schema string, createdAt time.Time, valid bool) any
+	row   func(commit ucrecord.AckCommit) any
 }
 
 var (
-	ackerSide = ackSide{"acks", "from", &sqlitedb.Ack{}, func(documentID, from, to, schema string, createdAt time.Time, valid bool) any {
-		return &sqlitedb.Ack{From: from, To: to, Schema: schema, DocumentID: documentID, Valid: valid, CreatedAt: sqlitedb.Micros(createdAt)}
+	ackerSide = ackSide{"acks", "from", func(commit ucrecord.AckCommit) any {
+		return &sqlitedb.Ack{From: commit.From, To: commit.To, Schema: commit.Schema, DocumentID: commit.ID, Valid: commit.Valid, CreatedAt: sqlitedb.Micros(commit.CreatedAt)}
 	}}
-	targetSide = ackSide{"ackeds", "to", &sqlitedb.Acked{}, func(documentID, from, to, schema string, createdAt time.Time, valid bool) any {
-		return &sqlitedb.Acked{From: from, To: to, Schema: schema, DocumentID: documentID, Valid: valid, CreatedAt: sqlitedb.Micros(createdAt)}
+	targetSide = ackSide{"ackeds", "to", func(commit ucrecord.AckCommit) any {
+		return &sqlitedb.Acked{From: commit.From, To: commit.To, Schema: commit.Schema, DocumentID: commit.ID, Valid: commit.Valid, CreatedAt: sqlitedb.Micros(commit.CreatedAt)}
 	}}
 )
 
-// upsertAck is the CIP-10 §4 state move: only a document with a strictly
+func sideOf(side ucrecord.AckSide) ackSide {
+	if side == ucrecord.TargetSide {
+		return targetSide
+	}
+	return ackerSide
+}
+
+// ApplyAck is the CIP-10 §4 state move: only a document with a strictly
 // newer createdAt may move the (from, to, schema) state; an equal or older
-// one is a no-op (RowsAffected 0). The key is createdAt alone — never the
-// document id — so the acker's and the associate owner's servers, which
-// hold different documents with the same createdAt, reach the same
-// decision.
-func (r *Repository) upsertAck(ctx context.Context, tx ucrecord.RepositoryTx, side ackSide, documentID, from, to, schema string, createdAt time.Time, valid bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.upsertAck")
+// one is Stale. The key is createdAt alone — never the document id — so
+// the acker's and the associate owner's servers, which hold different
+// documents with the same createdAt, reach the same decision. The writer
+// lock makes the state read here the one this write replaces.
+func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAck")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	side := sideOf(commit.Side)
+	var outcome ucrecord.AckOutcome
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.AckOutcome{}
+
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+
+		var state struct {
+			Valid     bool
+			CreatedAt int64
+		}
+		result := tx.Table(side.table).
+			Select("valid, created_at").
+			Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+			Limit(1).
+			Scan(&state)
+		if result.Error != nil {
+			return ucrecord.Applied, result.Error
+		}
+		if result.RowsAffected == 0 {
+			if err := tx.Create(side.row(commit)).Error; err != nil {
+				return ucrecord.Applied, err
+			}
+			outcome.IsValid = commit.Valid
+			return ucrecord.Applied, nil
+		}
+
+		outcome.WasValid = state.Valid
+		if sqlitedb.Micros(commit.CreatedAt) <= state.CreatedAt {
+			outcome.IsValid = state.Valid
+			return ucrecord.Stale, nil
+		}
+		err = tx.Table(side.table).
+			Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+			Updates(map[string]any{"valid": commit.Valid, "document_id": commit.ID, "created_at": sqlitedb.Micros(commit.CreatedAt)}).Error
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		outcome.IsValid = commit.Valid
+		return ucrecord.Applied, nil
+	})
 	if err != nil {
-		return false, err
+		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
 	}
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
-		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": sqlitedb.Micros(createdAt)}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr(side.table + ".created_at < excluded.created_at")}},
-	}).Create(side.row(documentID, from, to, schema, createdAt, valid))
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
-	}
-	return result.RowsAffected > 0, nil
+	outcome.Status = status
+	return outcome, nil
 }
 
-func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.upsertAck(ctx, tx, ackerSide, documentID, from, to, schema, createdAt, true)
-}
-
-func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.upsertAck(ctx, tx, ackerSide, documentID, from, to, schema, createdAt, false)
-}
-
-func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.upsertAck(ctx, tx, targetSide, documentID, from, to, schema, createdAt, true)
-}
-
-func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.upsertAck(ctx, tx, targetSide, documentID, from, to, schema, createdAt, false)
-}
-
-// ackRecords lists the valid acks of one side owned by ccid, each with its
-// commit (the side's ccfs identity is held by its owner's server).
-func (r *Repository) ackRecords(ctx context.Context, side ackSide, ccid, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ackRecords")
+// GetAcknowledgeRecords lists the valid states of one side, each with the
+// commit it is anchored to (the side's ccfs identity is held by its owner's
+// server).
+func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
 	defer span.End()
+
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	side := sideOf(held)
 
 	t := side.table
 	query := r.db.WithContext(ctx).
-		Model(side.model).
+		Table(t).
 		Joins("JOIN commit_logs c ON c.id = "+t+".document_id").
 		Where(t+`."`+side.owner+`" = ?`, ccid).
 		Where(t+".valid = ?", true)
@@ -110,34 +146,24 @@ func (r *Repository) ackRecords(ctx context.Context, side ackSide, ccid, schema 
 	return commitRows(rows)
 }
 
-func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
+func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
-	switch {
-	case from != "":
-		return r.ackRecords(ctx, ackerSide, from, schema, since, until, limit, order)
-	case to != "":
-		return r.ackRecords(ctx, targetSide, to, schema, since, until, limit, order)
-	default:
-		err := errors.New("either 'from' or 'to' must be specified")
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-}
+	side := sideOf(held)
 
-func (r *Repository) ackCounts(ctx context.Context, side ackSide, ccid, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ackCounts")
-	defer span.End()
-
-	t := side.table
 	query := r.db.WithContext(ctx).
-		Model(side.model).
+		Table(side.table).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
-		Where(t+`."`+side.owner+`" = ?`, ccid)
+		Where(`"`+side.owner+`" = ?`, ccid)
 	if schema != "" {
-		query = query.Where(t+".schema = ?", schema)
+		query = query.Where("schema = ?", schema)
 	}
 	var results []struct {
 		Schema string
@@ -152,20 +178,4 @@ func (r *Repository) ackCounts(ctx context.Context, side ackSide, ccid, schema s
 		counts[r.Schema] = r.Count
 	}
 	return counts, nil
-}
-
-func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
-	defer span.End()
-
-	switch {
-	case from != "":
-		return r.ackCounts(ctx, ackerSide, from, schema)
-	case to != "":
-		return r.ackCounts(ctx, targetSide, to, schema)
-	default:
-		err := errors.New("either 'from' or 'to' must be specified")
-		span.RecordError(err)
-		return nil, err
-	}
 }

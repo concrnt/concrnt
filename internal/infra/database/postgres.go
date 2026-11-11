@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"log"
 	"log/slog"
 	"os"
@@ -14,19 +15,17 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-// NewPostgres opens a pool of maxOpenConns connections. Transactions hold
-// one connection while their reads take another (CONTRACT.md C4), so the
-// record repository must run at most maxOpenConns/2 of them at once
-// (config.Postgres.WithDefaults).
+// NewPostgres opens a pool of maxOpenConns connections
+// (config.Postgres.MaxOpenConnsOrDefault).
 func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
 		logger.Config{
-			SlowThreshold:             300 * time.Millisecond, // Slow SQL threshold
-			LogLevel:                  logger.Warn,            // Log level
-			IgnoreRecordNotFoundError: true,                   // Ignore ErrRecordNotFound error for logger
-			Colorful:                  true,                   // Enable color
+			SlowThreshold:             300 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  true,
 		},
 	)
 
@@ -73,5 +72,21 @@ func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 		slog.Error("failed to enable tracing plugin for postgres", slog.String("error", err.Error()))
 	}
 
+	return db, nil
+}
+
+// NewPostgresProbe opens a single connection for the readiness check alone.
+// A ping through the serving pool queues behind the requests when every
+// connection is in use (database/sql serves its waiters in random order),
+// so under a burst it times out although the database is answering; this
+// connection is never handed to a request. It is untraced: a ping every
+// few seconds is noise in the spans.
+func NewPostgresProbe(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	return db, nil
 }

@@ -32,7 +32,7 @@ func TestMemcachedStore(t *testing.T) {
 	t.Run("InvalidateAllReachesOtherProcesses", func(t *testing.T) {
 		ctx := context.Background()
 		a := memcached.New(mc, "shared:")
-		won, err := a.PutIfAbsent(ctx, "counts:x", aggregate.Entry{Value: []byte(`1`)}, time.Hour)
+		won, err := a.PutIfAbsent(ctx, "counts:x", aggregate.Counters{Counts: map[string]int64{"x": 1}}, time.Hour)
 		require.NoError(t, err)
 		require.True(t, won)
 

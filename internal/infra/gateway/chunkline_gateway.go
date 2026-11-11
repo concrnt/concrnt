@@ -18,6 +18,7 @@ import (
 	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/patrickmn/go-cache"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/chunkline"
@@ -38,6 +39,13 @@ const (
 	// memcached; a manifest only ever gains a FirstChunk, so a stale copy
 	// costs nothing but an extra "before first chunk" miss
 	manifestLocalTTL = 5 * time.Second
+
+	// originConcurrency bounds the per-timeline origin reads of one request
+	// that run at once (manifests, local chunk bodies). It matches the
+	// widest fan-out a repository read already has (Firestore's
+	// LookupLocalItrs), so a home timeline of 16 followed timelines costs
+	// one round trip per phase instead of one per timeline.
+	originConcurrency = 16
 )
 
 // purgeReplayDelay must exceed the workers' aggregate-subscription cache TTL
@@ -248,6 +256,21 @@ func (r *resolver) fetchFromOrigins(ctx context.Context, kind string, requestsBy
 	return bodies
 }
 
+// fanOut runs fn(0) … fn(n-1) on at most originConcurrency goroutines and
+// returns when all are done. Each fn reports through its own index, so the
+// caller sees the results in the order it asked for them.
+func fanOut(n int, fn func(i int)) {
+	var g errgroup.Group
+	g.SetLimit(originConcurrency)
+	for i := range n {
+		g.Go(func() error {
+			fn(i)
+			return nil
+		})
+	}
+	_ = g.Wait() // fn has no error to return
+}
+
 func manifestCacheKey(timeline string) string {
 	return "chunkline_manifest:" + timeline
 }
@@ -360,21 +383,31 @@ func (r *resolver) ResolveTimelines(ctx context.Context, timelines []string) (ma
 		}
 	}
 
-	for _, tl := range remaining {
+	// one origin read per uncached timeline: side by side, or a home
+	// timeline of N followed timelines waits N round trips here whenever
+	// the cache does not answer
+	fetched := make([]*chunkline.Manifest, len(remaining))
+	fanOut(len(remaining), func(i int) {
+		tl := remaining[i]
 		manifest, err := r.fetchManifest(ctx, tl)
 		if err != nil {
 			span.RecordError(fmt.Errorf("failed to fetch chunkline manifest for %s: %w", tl, err))
-			continue
+			return
 		}
 		// a non-timeline resource or broken origin decodes into a zero
 		// manifest whose ChunkSize would divide by zero in Time2Chunk;
 		// never return or cache one (see resolveTimeline)
 		if manifest.ChunkSize <= 0 {
 			span.RecordError(fmt.Errorf("resource %s is not a chunkline timeline", tl))
-			continue
+			return
 		}
-		result[tl] = manifest
+		fetched[i] = &manifest
 		r.storeManifest(span, tl, manifest)
+	})
+	for i, tl := range remaining {
+		if fetched[i] != nil {
+			result[tl] = *fetched[i]
+		}
 	}
 
 	return result, nil
@@ -725,6 +758,12 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 	requestsByDomain := make(map[string]map[string]string) // domain -> timeline -> query path
 	fetched := make(map[string][]chunkline.BodyItem)
 
+	type localLoad struct {
+		timeline, uri string
+		chunk         int64
+	}
+	var localLoads []localLoad // bodies of this server's own timelines
+
 	remaining := make(map[string]string)
 
 	for tl, itr := range query {
@@ -785,13 +824,7 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 
 		remaining[tl] = itr
 		if localChunk, uri, ok := r.localCall(endpoint, "body"); ok {
-			originFetches.WithLabelValues("body", "local").Inc()
-			items, err := r.local.LoadLocalBody(ctx, uri, localChunk)
-			if err != nil {
-				span.RecordError(fmt.Errorf("failed to load local chunk body for timeline %s: %w", tl, err))
-				continue
-			}
-			fetched[tl] = items
+			localLoads = append(localLoads, localLoad{timeline: tl, uri: uri, chunk: localChunk})
 			continue
 		}
 
@@ -800,6 +833,23 @@ func (r *resolver) LoadChunkBodies(ctx context.Context, query map[string]string)
 
 	if len(remaining) == 0 {
 		return results, nil // all results were cached
+	}
+
+	// the store reads one body per call; the bodies of this server's own
+	// timelines are read side by side, as a batch request does for the
+	// timelines of another server
+	originFetches.WithLabelValues("body", "local").Add(float64(len(localLoads)))
+	localBodies := make([][]chunkline.BodyItem, len(localLoads))
+	localErrs := make([]error, len(localLoads))
+	fanOut(len(localLoads), func(i int) {
+		localBodies[i], localErrs[i] = r.local.LoadLocalBody(ctx, localLoads[i].uri, localLoads[i].chunk)
+	})
+	for i, load := range localLoads {
+		if err := localErrs[i]; err != nil {
+			span.RecordError(fmt.Errorf("failed to load local chunk body for timeline %s: %w", load.timeline, err))
+			continue
+		}
+		fetched[load.timeline] = localBodies[i]
 	}
 
 	for tl, body := range r.fetchFromOrigins(ctx, "body", requestsByDomain, func(err error) { span.RecordError(err) }) {

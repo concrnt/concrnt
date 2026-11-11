@@ -88,7 +88,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 
 // parentPredicate selects parent's direct children. The owner root
 // (cckv://<owner>) has no record_keys row and its top-level keys carry
-// parent_uri NULL (ensureParentRecordKeys), so the root is matched by URI
+// parent_uri NULL (ApplyRecord), so the root is matched by URI
 // prefix instead (CIP-5 §3.1).
 func parentPredicate(parent string, params map[string]any) (string, error) {
 	parsedParent, err := concrnt.ParseCCURI(parent)

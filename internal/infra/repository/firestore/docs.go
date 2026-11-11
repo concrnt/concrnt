@@ -3,21 +3,34 @@
 // store in the record subpackage, and the composite indexes every query
 // needs are declared in indexes.go (the Firestore counterpart of a schema).
 //
-// Data model, one top-level collection per table of the SQL backends:
+// Data model. What a read returns is stored on the
+// document its access path lands on, so no read follows a pointer:
 //
-//   - commits/{cdid}: the immutable commit log (document + proof).
-//   - records/{cdid}: per-version record metadata (policies, distributions).
-//   - record_keys/{hash(uri)}: the mutable key index. A key doc carries the
-//     denormalised fields of the record it points at, so listing and
-//     chunkline queries never join; placeholder (directory) keys omit the
-//     record fields entirely, which is how orderBy(recordCreatedAt) leaves
-//     them out the way "record_created_at IS NOT NULL" does in SQL. Keys
-//     link to their parent by URI (parentURI, the owner root for top-level
-//     keys) and carry every strict ancestor URI for prefix queries.
-//   - associations/{cdid} + association_uniques/{hash(unique)}: the second
-//     collection stands in for the unique constraint.
-//   - acks/{hash(from,to,schema)}, ackeds/{...}: one state doc per triple.
-//   - entities, entity_metas, servers, subscriptions, abuse_reports,
+//   - commits/{cdid}: the commit log (document + proof), written once. A
+//     commit names what it anchors (anchor = the collection, anchorID = the
+//     cckv key / state id / ccid), so a ccfs lookup and the offline gc find
+//     the dependent by id instead of by query.
+//   - record_keys/{hash(uri)}: one document per key. A key holding a record
+//     carries the record's signed document and proof next to the fields the
+//     listings filter and order by; a placeholder (directory) key omits
+//     every record field, which is how orderBy(recordCreatedAt) leaves it
+//     out the way "record_created_at IS NOT NULL" does in SQL. Keys link to
+//     their parent by URI (parentURI, the owner root for top-level keys)
+//     and carry every strict ancestor URI for prefix queries. gen is the
+//     random id of the key's incarnation: set when the key document is
+//     created (placeholder included), kept by overwrites, gone with the
+//     document.
+//   - retained_versions/{cdid}: a marker for a record version that asked to
+//     be retained and has been replaced since; the version itself is served
+//     from commits by its ccfs URI.
+//   - associations/{cdid}: the association with its signed document, bound
+//     to its target's incarnation by targetGen. association_uniques/
+//     {hash(targetURI, unique)} stands in for the unique constraint; a
+//     marker counts only while its targetGen is the target's current one.
+//   - acks/{hash(from,to,schema)}, ackeds/{...}: one state document per
+//     triple, carrying the signed document it is anchored to while valid.
+//   - entities/{ccid}: the entity with the signed document registering it.
+//   - entity_metas, servers, subscriptions, abuse_reports,
 //     aggregate_entries.
 package firestore
 
@@ -35,8 +48,8 @@ import (
 
 const (
 	ColCommits          = "commits"
-	ColRecords          = "records"
 	ColRecordKeys       = "record_keys"
+	ColRetainedVersions = "retained_versions"
 	ColAcks             = "acks"
 	ColAckeds           = "ackeds"
 	ColAssociations     = "associations"

@@ -110,15 +110,19 @@ type index struct {
 // exemptFields are large or never-queried fields whose automatic single-field
 // indexes are disabled: they would only add index writes and storage.
 var exemptFields = map[string][]string{
-	ColCommits:          {"document", "proof", "ip"},
-	ColRecords:          {"policies", "distributions", "redirect", "owner", "author", "schema"},
-	ColRecordKeys:       {"policies", "distributions", "redirect", "owner", "cleanOnUpdate"},
-	ColAssociations:     {"owner"},
+	ColCommits:          {"document", "proof", "ip", "anchor", "anchorID"},
+	ColRecordKeys:       {"document", "proof", "gen", "policies", "distributions", "redirect", "owner", "cleanOnUpdate"},
+	ColRetainedVersions: {"uri"},
+	ColAssociations:     {"document", "proof", "owner", "unique"},
+	ColAssocUniques:     {"targetURI", "targetGen", "associationID"},
+	ColAcks:             {"document", "proof"},
+	ColAckeds:           {"document", "proof"},
+	ColEntities:         {"document", "proof", "domain", "tag"},
 	ColEntityMetas:      {"info", "inviter"},
 	ColServers:          {"wellKnown", "tag", "layer"},
 	ColSubscriptions:    {"subscription", "schemas", "prefixes"},
 	ColAbuseReports:     {"body", "ip", "reporter", "targetURI"},
-	ColAggregateEntries: {"value", "asOf", "deltas"},
+	ColAggregateEntries: {"counters", "members", "asOf", "deltas"},
 }
 
 // requiredIndexes derives the composite indexes the registered shapes need.
