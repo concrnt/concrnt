@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"os"
@@ -94,8 +95,7 @@ func newOperationContext() (*operationContext, error) {
 	// migrates, the server does that at start
 	switch conf.Backends.Database {
 	case "", "postgres":
-		pool := conf.Backends.Postgres.WithDefaults()
-		db, err := database.NewPostgres(conf.Backends.PostgresDsn, pool.MaxOpenConns)
+		db, err := database.NewPostgres(conf.Backends.PostgresDsn, conf.Backends.Postgres.MaxOpenConnsOrDefault())
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect database: %w", err)
 		}
@@ -152,13 +152,12 @@ func newOperationContext() (*operationContext, error) {
 	}
 
 	// the same aggregate store selection as cmd/concrnt/main.go
+	aggregateName := conf.Backends.Aggregate.Store
+	if aggregateName == "" {
+		aggregateName = cmp.Or(databaseAggregateName, "redis")
+	}
 	var aggregateStore aggregate.Store
-	switch name := conf.Backends.Aggregate.Store; name {
-	case "":
-		aggregateStore = databaseAggregate
-		if aggregateStore == nil {
-			aggregateStore = aggredis.New(database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB))
-		}
+	switch name := aggregateName; name {
 	case "postgres", "spanner", "firestore":
 		if name != databaseAggregateName {
 			op.Close()

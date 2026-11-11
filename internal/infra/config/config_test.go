@@ -6,22 +6,12 @@ import (
 	"testing"
 )
 
-func TestPostgresWithDefaults(t *testing.T) {
-	cases := []struct {
-		name string
-		in   Postgres
-		want Postgres
-	}{
-		{"unset", Postgres{}, Postgres{MaxOpenConns: 64}},
-		{"configured", Postgres{MaxOpenConns: 20}, Postgres{MaxOpenConns: 20}},
-		{"pool of one", Postgres{MaxOpenConns: 1}, Postgres{MaxOpenConns: 1}},
+func TestPostgresMaxOpenConnsOrDefault(t *testing.T) {
+	if got := (Postgres{}).MaxOpenConnsOrDefault(); got != 64 {
+		t.Fatalf("default = %d, want 64", got)
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := c.in.WithDefaults(); got != c.want {
-				t.Fatalf("WithDefaults(%+v) = %+v; want %+v", c.in, got, c.want)
-			}
-		})
+	if got := (Postgres{MaxOpenConns: 20}).MaxOpenConnsOrDefault(); got != 20 {
+		t.Fatalf("configured = %d, want 20", got)
 	}
 }
 
@@ -40,7 +30,6 @@ func TestLoadPoolSettings(t *testing.T) {
   postgresDsn: "host=db"
   postgres:
     maxOpenConns: 40
-    maxConcurrentTx: 30
   jobqueue:
     concurrency: 12
 `
@@ -51,9 +40,8 @@ func TestLoadPoolSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// maxConcurrentTx is a key of older configs: it is ignored, not an error
-	if pg := conf.Backends.Postgres.WithDefaults(); pg.MaxOpenConns != 40 {
-		t.Fatalf("postgres = %+v", pg)
+	if got := conf.Backends.Postgres.MaxOpenConnsOrDefault(); got != 40 {
+		t.Fatalf("postgres maxOpenConns = %d", got)
 	}
 	if got := conf.Backends.JobQueue.ConcurrencyOrDefault(); got != 12 {
 		t.Fatalf("jobqueue concurrency = %d", got)

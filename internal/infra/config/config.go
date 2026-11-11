@@ -118,14 +118,14 @@ const (
 	DefaultJobQueueConcurrency  = 16
 )
 
-// WithDefaults fills the unset values. A commit is one transaction on one
-// connection and reads never run inside it, so the pool needs no headroom
-// beyond the concurrency wanted.
-func (p Postgres) WithDefaults() Postgres {
+// MaxOpenConnsOrDefault is MaxOpenConns, or its default when unset. A
+// commit is one transaction on one connection and reads never run inside
+// it, so the pool needs no headroom beyond the concurrency wanted.
+func (p Postgres) MaxOpenConnsOrDefault() int {
 	if p.MaxOpenConns <= 0 {
-		p.MaxOpenConns = DefaultPostgresMaxOpenConns
+		return DefaultPostgresMaxOpenConns
 	}
-	return p
+	return p.MaxOpenConns
 }
 
 // JobQueue configures the background job consumers of one process.

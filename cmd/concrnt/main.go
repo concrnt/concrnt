@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -241,9 +242,9 @@ func main() {
 	)
 	switch conf.Backends.Database {
 	case "", "postgres":
-		pool := conf.Backends.Postgres.WithDefaults()
-		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", pool.MaxOpenConns))
-		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, pool.MaxOpenConns)
+		maxOpenConns := conf.Backends.Postgres.MaxOpenConnsOrDefault()
+		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", maxOpenConns))
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, maxOpenConns)
 		if err != nil {
 			panic("failed to connect database: " + err.Error())
 		}
@@ -344,13 +345,12 @@ func main() {
 	// the count cache store, built here like the repositories: "" keeps
 	// the counts in the record database (redis on sqlite), and a database
 	// store must be the record database itself
+	aggregateName := conf.Backends.Aggregate.Store
+	if aggregateName == "" {
+		aggregateName = cmp.Or(databaseAggregateName, "redis")
+	}
 	var aggregateStore aggregate.Store
-	switch name := conf.Backends.Aggregate.Store; name {
-	case "":
-		aggregateStore = databaseAggregate
-		if aggregateStore == nil {
-			aggregateStore = aggredis.New(redis)
-		}
+	switch name := aggregateName; name {
 	case "postgres", "spanner", "firestore":
 		if name != databaseAggregateName {
 			panic("backends.aggregate.store " + name + " needs backends.database " + name)
@@ -432,8 +432,6 @@ func main() {
 	})
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
-	chunklineRepo := recordRepo
-
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
 	var webpushOpts *webpush.Options
@@ -494,7 +492,7 @@ func main() {
 	}))
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
-	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineUC := chunkline.New(recordRepo, chunklineGateway, redisKVS, recordUC)
 	chunklineGateway.SetLocal(domainConfig.FQDN, chunklineUC)
 
 	go func() {

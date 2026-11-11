@@ -15,19 +15,17 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-// NewPostgres opens a pool of maxOpenConns connections. A commit is one
-// transaction on one connection and its reads run before it (CONTRACT.md
-// C4), so the pool needs no headroom beyond the concurrency wanted
-// (config.Postgres.WithDefaults).
+// NewPostgres opens a pool of maxOpenConns connections
+// (config.Postgres.MaxOpenConnsOrDefault).
 func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
 		logger.Config{
-			SlowThreshold:             300 * time.Millisecond, // Slow SQL threshold
-			LogLevel:                  logger.Warn,            // Log level
-			IgnoreRecordNotFoundError: true,                   // Ignore ErrRecordNotFound error for logger
-			Colorful:                  true,                   // Enable color
+			SlowThreshold:             300 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  true,
 		},
 	)
 

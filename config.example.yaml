@@ -36,9 +36,8 @@ backends:
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # postgres sizes the connection pool of each replica. replicas x
   # (maxOpenConns + 1, the readiness check's own connection) must stay
-  # under the server's max_connections. a commit
-  # takes one connection for one transaction. (maxConcurrentTx of older
-  # configs is ignored.)
+  # under the server's max_connections. a commit takes one connection for
+  # one transaction.
   # postgres:
   #   maxOpenConns: 64      # default 64
   # sqlite:

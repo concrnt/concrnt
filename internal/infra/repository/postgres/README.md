@@ -1,6 +1,6 @@
 # Postgres backend notes
 
-## Writes and connections (repository contract v2)
+## Writes and connections
 
 Every `Apply*` method of the record repository is one transaction on one
 pooled connection (`record/repository.go`, `apply`): it is re-run from
@@ -10,10 +10,7 @@ attempts with a 10 ms to 500 ms backoff, and it is rolled back when the
 outcome is `Stale` or `Duplicate`, which is how those leave no trace. The
 usecase issues its reads before the call, never inside the transaction.
 
-What that removed: the rule that a transaction needs a second connection
-for its reads and the setting `backends.postgres.maxConcurrentTx` (a config
-that still has it loads; the key is ignored). Size the pool with
-`backends.postgres.maxOpenConns` alone.
+Size the pool with `backends.postgres.maxOpenConns` alone.
 
 What stays bounded: at most `maxOpenConns / 2` `Apply*` transactions are
 open at once (`Repository.txSlots`, derived from the pool; none when the
