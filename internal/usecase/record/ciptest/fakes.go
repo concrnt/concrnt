@@ -154,6 +154,18 @@ func (s *signalRecorder) count() int {
 	return len(s.published)
 }
 
+// tally counts the events published after the first from ones, keyed
+// "<type> <channel>": what each channel's subscribers got, and how often.
+func (s *signalRecorder) tally(from int) map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int{}
+	for _, p := range s.published[from:] {
+		counts[p.Event.Type+" "+p.Channel]++
+	}
+	return counts
+}
+
 // memoryKVS is a usecase.KVS without expiry: no test outlives a ttl.
 type memoryKVS struct {
 	mu    sync.Mutex

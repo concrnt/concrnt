@@ -223,6 +223,18 @@ redirect, or its key. Every field a view needs is on the key side.
 | `LookupLocalItrs(uris, chunkID)` | per uri: eq(parent) ∧ range(recordCreatedAt < end of chunk), order desc, limit 1 → the chunk of the latest such item. Timelines without a key or without such an item are absent. | 1 on Postgres, SQLite and Spanner (one statement). Firestore: one bounded query per timeline and one batch get of the timeline keys, all in parallel (at most 16 at a time). |
 | `LoadLocalBody(uri, chunkID)` | eq(parent) ∧ range(recordCreatedAt), order desc → the items of `chunkID` and the chunk before it, newest first, and at least a page (32) of items when the timeline has older ones. `domain.NotFoundError` when the key does not exist. | 1. Firestore: the first page and a get of the key in parallel, plus a second, sequential query when the two-chunk window holds more than 32 items. |
 
+The reader of these views is the chunkline gateway
+(`internal/infra/gateway/chunkline_gateway.go`), behind a cache: a home
+timeline request for N timelines of this server whose cache does not answer
+calls `GetChunklineManifest` N times, `LookupLocalItrs` once and
+`LoadLocalBody` N times. The per-timeline calls of one request run
+concurrently, at most 16 at a time (`originConcurrency`), so such a request
+is three waves of reads rather than 2N+1 sequential round trips, and holds
+up to 16 connections of a pooled backend while a wave runs. A read of
+several timelines in one call was not added for manifests and bodies: on
+Firestore it would be the same N parallel queries, so only the SQL backends
+would gain.
+
 #### v1 methods that no longer exist
 
 | v1 | v2 |
@@ -351,11 +363,13 @@ job, Spanner and Firestore in jobs of their own).
 
 - `ciptest` builds the real record and chunkline usecases over the backend
   with in-memory fakes for the job queue, signals, kvs, the policy
-  evaluator, peer servers and the aggregate store, and runs 36 cases:
+  evaluator, peer servers and the aggregate store, and runs 40 cases:
   record accept-if-newer, redelivery, onUpdate forget / retain, import, a
   policy denial storing nothing; entity accept-if-newer; association
   listing, uniqueness, a missing target, counts, delete-then-recreate; the
-  ack state machine and its import; single, by-ccfs, retained-version,
+  realtime events of an association counted per channel (one per target
+  channel, with distributions of its own, none for a commit that changed
+  nothing, taken back by its delete); the ack state machine and its import; single, by-ccfs, retained-version,
   association and range deletes (with self, children only, paged through
   the continuation job, offline without a queue), cleanup changing nothing,
   the reference sweep; queries by parent, prefix, key and owner root;

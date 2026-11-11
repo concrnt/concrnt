@@ -107,3 +107,55 @@ func waitForPubsubClients(t *testing.T, rdb *redis.Client, n int) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// Every replica holds its own subscription on the shared Redis, so an event
+// published once, by whichever replica committed, reaches each realtime
+// session exactly once: on the replica the session is connected to, once
+// per event however many of the session's prefixes match the channel.
+func TestRedisPubsubTwoReplicasDeliverOnce(t *testing.T) {
+	rdb, cleanup := testutil.CreateRDB()
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// a second client on the same Redis is a second replica
+	other := redis.NewClient(rdb.Options())
+	defer other.Close()
+	replicas := []*pubsub.RedisPubsub{pubsub.NewRedisPubsub(rdb), pubsub.NewRedisPubsub(other)}
+
+	const timeline = "cckv://alice/home-timeline"
+	sessions := make([]chan concrnt.Event, 0, 4)
+	for _, replica := range replicas {
+		for range 2 {
+			session := make(chan concrnt.Event, 64)
+			// the timeline twice over: by itself and by a shorter prefix
+			if err := replica.Subscribe(ctx, []string{timeline, "cckv://alice/home"}, session); err != nil {
+				t.Fatal(err)
+			}
+			sessions = append(sessions, session)
+		}
+	}
+	waitForPubsubClients(t, rdb, len(replicas))
+
+	const likes = 20
+	for i := range likes {
+		// the commits land on either replica
+		event := concrnt.Event{Type: "associated", URI: "cckv://alice/posts/1"}
+		if err := replicas[i%len(replicas)].Publish(ctx, timeline, event); err != nil {
+			t.Fatal(err)
+		}
+		// the target's own channel, which a timeline subscriber does not follow
+		if err := replicas[i%len(replicas)].Publish(ctx, event.URI, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i, session := range sessions {
+		receive(t, session, likes)
+		select {
+		case ev := <-session:
+			t.Fatalf("session %d received more than one event per association: %+v", i, ev)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+}
