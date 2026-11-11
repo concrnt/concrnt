@@ -11,7 +11,6 @@ import (
 // transaction have in common.
 type Reader interface {
 	Query(ctx context.Context, stmt spanner.Statement) *spanner.RowIterator
-	ReadRow(ctx context.Context, table string, key spanner.Key, columns []string) (*spanner.Row, error)
 }
 
 // QueryAll runs stmt and decodes every row into a T by column name.

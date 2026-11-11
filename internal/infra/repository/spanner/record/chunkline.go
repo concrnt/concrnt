@@ -13,10 +13,6 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 )
 
-const (
-	defaultChunkSize = 32
-)
-
 func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
@@ -117,7 +113,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 			) member ON member.parent_uri = parent.uri
 			WHERE parent.uri = @uri
 			ORDER BY member.record_created_at DESC`,
-		Params: map[string]any{"uri": uri, "end": chunkDate, "start": prevChunkDate, "page": int64(defaultChunkSize)},
+		Params: map[string]any{"uri": uri, "end": chunkDate, "start": prevChunkDate, "page": int64(repoutil.BodyPageSize)},
 	})
 	if err != nil {
 		span.RecordError(err)
@@ -135,15 +131,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 			// the timeline's own row, without a member joined to it
 			continue
 		}
-		href := *row.URI
-		if row.Redirect != nil {
-			href = *row.Redirect
-		}
-		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   row.RecordCreatedAt.UTC(),
-			Href:        href,
-			ContentType: "application/concrnt.document+json",
-		})
+		bodyItems = append(bodyItems, repoutil.BodyItem(*row.URI, row.Redirect, row.RecordCreatedAt.UTC()))
 	}
 
 	return bodyItems, nil

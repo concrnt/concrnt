@@ -27,7 +27,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc/codes"
 
 	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -97,10 +96,6 @@ func readSet[T any](ctx context.Context, tx *spanner.ReadWriteTransaction, stmt 
 		err = errors.New("the read statement returned no row")
 	}
 	return v, err
-}
-
-func isNotFound(err error) bool {
-	return spanner.ErrCode(err) == codes.NotFound
 }
 
 // scalar runs a single-column, single-row statement (a count).

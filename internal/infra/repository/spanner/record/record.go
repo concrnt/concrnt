@@ -7,6 +7,7 @@ import (
 	"time"
 
 	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	"google.golang.org/grpc/codes"
 
 	"cloud.google.com/go/spanner"
 	"github.com/google/uuid"
@@ -373,7 +374,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	defer span.End()
 
 	row, err := r.client.Single().ReadRow(ctx, "record_keys", spanner.Key{keyURI}, []string{"parent_uri", "record_created_at", "redirect"})
-	if isNotFound(err) {
+	if spanner.ErrCode(err) == codes.NotFound {
 		return "", "", domain.NotFoundError{Resource: keyURI}
 	}
 	if err != nil {
@@ -395,13 +396,5 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
-	// (which is what BodyItem.ID() returns): the redirect target for
-	// reference records, the record key URI otherwise
-	itemID := keyURI
-	if rk.Redirect != nil {
-		itemID = *rk.Redirect
-	}
-
-	return *rk.ParentURI, itemID, nil
+	return *rk.ParentURI, repoutil.ItemID(keyURI, rk.Redirect), nil
 }

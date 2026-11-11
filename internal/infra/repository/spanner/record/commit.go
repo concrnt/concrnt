@@ -16,16 +16,15 @@ import (
 )
 
 type commitLogRow struct {
-	ID          string    `spanner:"id"`
-	IP          string    `spanner:"ip"`
-	Document    string    `spanner:"document"`
-	Proof       string    `spanner:"proof"`
-	Owner       string    `spanner:"owner"`
-	GcCandidate bool      `spanner:"gc_candidate"`
-	CDate       time.Time `spanner:"c_date"`
+	ID       string    `spanner:"id"`
+	IP       string    `spanner:"ip"`
+	Document string    `spanner:"document"`
+	Proof    string    `spanner:"proof"`
+	Owner    string    `spanner:"owner"`
+	CDate    time.Time `spanner:"c_date"`
 }
 
-const commitLogSelect = "SELECT id, ip, document, proof, owner, gc_candidate, c_date FROM commit_logs"
+const commitLogSelect = "SELECT id, ip, document, proof, owner, c_date FROM commit_logs"
 
 // duplicateCommit is the subquery every Apply* read starts with: whether
 // the commit id is already in the log.
@@ -44,13 +43,6 @@ func insertCommit(commit ucrecord.Commit, gcCandidate bool) (*spanner.Mutation, 
 		[]any{commit.ID, commit.IP, commit.Document, string(proofBytes), commit.Owner, gcCandidate, spanner.CommitTimestamp}), nil
 }
 
-// markGcCandidate is the mutation flagging commit log id for `conctl op
-// gc-commitlog`. The row must exist: an update of a missing row fails the
-// commit.
-func markGcCandidate(id string) *spanner.Mutation {
-	return spanner.Update("commit_logs", []string{"id", "gc_candidate"}, []any{id, true})
-}
-
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
 	defer span.End()
@@ -66,12 +58,13 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 
 	sds := make([]concrnt.SignedDocument, len(logs))
 	for i, cl := range logs {
-		var proof concrnt.Proof
-		if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+		// no owner: a dump line carries no ccfs
+		sd, err := repoutil.CommitDocument("", cl.ID, cl.Document, cl.Proof)
+		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		sds[i] = concrnt.SignedDocument{Document: cl.Document, Proof: proof}
+		sds[i] = sd
 	}
 	return sds, nil
 }

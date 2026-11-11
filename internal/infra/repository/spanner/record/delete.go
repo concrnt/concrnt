@@ -3,6 +3,7 @@ package record
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"cloud.google.com/go/spanner"
@@ -92,26 +93,29 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyDelete")
 	defer span.End()
 
-	params := map[string]any{"id": "", "keys": []string{}, "versions": []string{}, "associations": []string{}, "gc": commit.GcCommitIDs}
-	if commit.Commit != nil {
-		params["id"] = commit.Commit.ID
-	}
-	if commit.GcCommitIDs == nil {
-		params["gc"] = []string{}
-	}
+	// an array parameter must not be nil
+	keys, versions, associations := []string{}, []string{}, []string{}
 	for _, removal := range commit.Removals {
 		switch removal.Kind {
 		case ucrecord.RemoveKey:
-			params["keys"] = append(params["keys"].([]string), removal.URI)
+			keys = append(keys, removal.URI)
 		case ucrecord.RemoveVersion:
-			params["versions"] = append(params["versions"].([]string), removal.DocumentID)
+			versions = append(versions, removal.DocumentID)
 		case ucrecord.RemoveAssociation:
-			params["associations"] = append(params["associations"].([]string), removal.DocumentID)
+			associations = append(associations, removal.DocumentID)
 		default:
 			err := fmt.Errorf("unknown removal kind %d", removal.Kind)
 			span.RecordError(err)
 			return ucrecord.DeleteOutcome{}, err
 		}
+	}
+	commitID := ""
+	if commit.Commit != nil {
+		commitID = commit.Commit.ID
+	}
+	params := map[string]any{
+		"id": commitID, "keys": keys, "versions": versions, "associations": associations,
+		"gc": append([]string{}, commit.GcCommitIDs...),
 	}
 
 	var outcome ucrecord.DeleteOutcome
@@ -134,11 +138,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 		if commit.Commit != nil {
 			// the delete commit may ask to be flagged itself: it is not in
 			// the log to update yet, so it is inserted flagged
-			flagged := false
-			for _, id := range commit.GcCommitIDs {
-				flagged = flagged || id == commit.Commit.ID
-			}
-			insert, err := insertCommit(*commit.Commit, flagged)
+			insert, err := insertCommit(*commit.Commit, slices.Contains(commit.GcCommitIDs, commit.Commit.ID))
 			if err != nil {
 				return ucrecord.Applied, err
 			}
@@ -217,7 +217,7 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 			if inLog[id] {
 				// flagged once, however often the id is listed
 				delete(inLog, id)
-				mutations = append(mutations, markGcCandidate(id))
+				mutations = append(mutations, spanner.Update("commit_logs", []string{"id", "gc_candidate"}, []any{id, true}))
 			}
 		}
 		return ucrecord.Applied, tx.BufferWrite(mutations)

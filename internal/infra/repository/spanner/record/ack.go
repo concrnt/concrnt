@@ -2,14 +2,13 @@ package record
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"time"
 
-	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
-
 	"cloud.google.com/go/spanner"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
+	spannerdb "github.com/concrnt/concrnt/internal/infra/repository/spanner"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -97,11 +96,21 @@ func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (u
 	return outcome, nil
 }
 
-// ackRecords lists the valid states of one side filtered by its owning
+// GetAcknowledgeRecords lists the valid states of one side by its owning
 // column (from for acks, to for ackeds); CIP-3 §3.4: the ccfs identity of
 // an ack is held by the acker's server, of an acked by the associate
 // owner's.
-func (r *Repository) ackRecords(ctx context.Context, table ackTable, ccid, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
+	defer span.End()
+
+	side, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	table := tableOf(side)
+
 	params := map[string]any{"ccid": ccid}
 	where := []string{"a." + table.owner + " = @ccid", "a.valid"}
 	if schema != "" {
@@ -115,33 +124,23 @@ func (r *Repository) ackRecords(ctx context.Context, table ackTable, ccid, schem
 		orderLimit("a.created_at", "a.id", order, limit, params)
 	rows, err := spannerdb.QueryAll[commitRow](ctx, r.client.Single(), spanner.Statement{SQL: sql, Params: params})
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 	return commitRows(rows)
 }
 
-func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
+func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
-	var rows []ucrecord.QueryRow
-	var err error
-	switch {
-	case from != "":
-		rows, err = r.ackRecords(ctx, ackSide, from, schema, since, until, limit, order)
-	case to != "":
-		rows, err = r.ackRecords(ctx, ackedSide, to, schema, since, until, limit, order)
-	default:
-		err = errors.New("either 'from' or 'to' must be specified")
-	}
+	side, ccid, err := repoutil.AckSideOf(from, to)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-	return rows, nil
-}
+	table := tableOf(side)
 
-func (r *Repository) ackCounts(ctx context.Context, table ackTable, ccid, schema string) (map[string]int64, error) {
 	params := map[string]any{"ccid": ccid}
 	where := []string{table.owner + " = @ccid", "valid"}
 	if schema != "" {
@@ -156,32 +155,12 @@ func (r *Repository) ackCounts(ctx context.Context, table ackTable, ccid, schema
 		Params: params,
 	})
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 	counts := make(map[string]int64)
 	for _, res := range results {
 		counts[res.Schema] = res.Count
-	}
-	return counts, nil
-}
-
-func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
-	defer span.End()
-
-	var counts map[string]int64
-	var err error
-	switch {
-	case from != "":
-		counts, err = r.ackCounts(ctx, ackSide, from, schema)
-	case to != "":
-		counts, err = r.ackCounts(ctx, ackedSide, to, schema)
-	default:
-		err = errors.New("either 'from' or 'to' must be specified")
-	}
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
 	}
 	return counts, nil
 }
