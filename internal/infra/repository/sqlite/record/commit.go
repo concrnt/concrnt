@@ -66,16 +66,13 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 
 	sds := make([]concrnt.SignedDocument, len(commitLogs))
 	for i, cl := range commitLogs {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		// no owner: a dump line carries no ccfs
+		sd, err := repoutil.CommitDocument("", cl.ID, cl.Document, cl.Proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		sds[i] = concrnt.SignedDocument{
-			Document: cl.Document,
-			Proof:    proof,
-		}
+		sds[i] = sd
 	}
 
 	return sds, nil

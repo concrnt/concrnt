@@ -91,11 +91,9 @@ type RecordKey struct {
 //     plus timestamp predicate support for record_keys-to-records joins that still
 //     need records.created_at.
 type Record struct {
-	DocumentID string    `json:"id" gorm:"primaryKey;type:text;index:idx_records_schema_created_at_document_id,priority:3;index:idx_records_author_created_at_document_id,priority:3;index:idx_records_document_id_created_at,priority:1"`
-	Document   CommitLog `json:"documnet" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
-	Owner      string    `json:"owner" gorm:"type:text"`
-	// document author; NULL only on rows written before the column existed
-	// (backfilled by conctl op repair-record-authors)
+	DocumentID    string         `json:"id" gorm:"primaryKey;type:text;index:idx_records_schema_created_at_document_id,priority:3;index:idx_records_author_created_at_document_id,priority:3;index:idx_records_document_id_created_at,priority:1"`
+	Document      CommitLog      `json:"documnet" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
+	Owner         string         `json:"owner" gorm:"type:text"`
 	Author        string         `json:"author" gorm:"type:text;index:idx_records_author_created_at_document_id,priority:1"`
 	Redirect      *string        `json:"redirect" gorm:"type:text"`
 	Schema        string         `json:"schema" gorm:"type:text;index:idx_records_schema_created_at_document_id,priority:1"`
@@ -111,11 +109,10 @@ type Record struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_ack_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by record.Repository.ApplyAck and filtered by
-//     getAckRecords/getAckRecordCounts.
+//     upsert; used by record.Repository.ApplyAck.
 //   - idx_acks_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by record.Repository.getAckRecords and
-//     getAckRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     ack list/count lookup; used by record.Repository.GetAcknowledgeRecords
+//     and ComputeAcknowledgeCounts.
 //     The to side is read from ackeds and schema only narrows a from
 //     lookup, so those have no index of their own.
 type Ack struct {
@@ -136,11 +133,10 @@ type Ack struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_acked_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by record.Repository.ApplyAck and filtered by
-//     getAckedRecords/getAckedRecordCounts.
+//     upsert; used by record.Repository.ApplyAck.
 //   - idx_acked_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; used by record.Repository.getAckedRecords and
-//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     list/count lookup; used by record.Repository.GetAcknowledgeRecords and
+//     ComputeAcknowledgeCounts.
 //     The from side is read from acks and schema only narrows a to lookup,
 //     so those have no index of their own.
 type Acked struct {

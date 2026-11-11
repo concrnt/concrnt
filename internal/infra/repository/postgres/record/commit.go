@@ -66,16 +66,13 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 
 	sds := make([]concrnt.SignedDocument, len(commitLogs))
 	for i, cl := range commitLogs {
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(cl.Proof), &proof)
+		// no owner: a dump line carries no ccfs
+		sd, err := repoutil.CommitDocument("", cl.ID, cl.Document, cl.Proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		sds[i] = concrnt.SignedDocument{
-			Document: cl.Document,
-			Proof:    proof,
-		}
+		sds[i] = sd
 	}
 
 	return sds, nil
@@ -194,7 +191,7 @@ func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLog
 func commitLogEntries(logs []postgres.CommitLog) ([]ucrecord.CommitLogEntry, error) {
 	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
 	for _, cl := range logs {
-		entry, err := repoutil.CommitLogEntry(cl.ID, cl.IP, cl.Document, cl.Proof, cl.Owner, cl.CDate.UTC())
+		entry, err := repoutil.CommitLogEntry(cl.ID, cl.IP, cl.Document, cl.Proof, cl.Owner, cl.CDate)
 		if err != nil {
 			return nil, err
 		}

@@ -2,11 +2,13 @@ package record
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -29,7 +31,11 @@ func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.Assoc
 		// binds it to the key's incarnation: the row goes when the key is
 		// removed (taking the association along) and a key recreated later
 		// is another row
-		targetRK, err := getRecordKeyByURI(ctx, tx, commit.Target)
+		var targetRK postgres.RecordKey
+		err = tx.Where("uri = ?", commit.Target).Take(&targetRK).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ucrecord.Applied, domain.NotFoundError{Resource: commit.Target}
+		}
 		if err != nil {
 			return ucrecord.Applied, err
 		}

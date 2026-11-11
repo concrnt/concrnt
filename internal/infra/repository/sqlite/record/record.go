@@ -61,19 +61,13 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 			return ucrecord.Applied, err
 		}
 
-		// ParentのRecordKeyを探す
-		parentRK, err := getOrCreateParentRecordKey(ctx, tx, commit.Key)
+		pid, err := parentKeyID(tx, commit.Key)
 		if err != nil {
 			return ucrecord.Applied, err
 		}
-
-		var pid *int64
-		if parentRK != nil {
-			pid = &parentRK.ID
-		}
 		cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
 
-		// RecordKeyを作る (or take over the placeholder / the older version)
+		// creates the key, or takes over the placeholder / the older version
 		rk := sqlitedb.RecordKey{
 			URI:             commit.Key,
 			ParentID:        pid,
@@ -365,88 +359,34 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
-	// (which is what BodyItem.ID() returns): the redirect target for
-	// reference records, the record key URI otherwise
-	itemID := keyURI
-	if row.Redirect != nil {
-		itemID = *row.Redirect
-	}
-
-	return *row.ParentURI, itemID, nil
+	return *row.ParentURI, repoutil.ItemID(keyURI, row.Redirect), nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*sqlitedb.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
-	defer span.End()
-
+// parentKeyID is the row id of the key one segment above uri, nil for a
+// top-level key. A parent that does not exist yet is created as a
+// placeholder, and so is every ancestor above it.
+func parentKeyID(tx *gorm.DB, uri string) (*int64, error) {
 	parentURI, ok, err := repoutil.ParentURI(uri)
-	if err != nil {
-		span.RecordError(err)
+	if err != nil || !ok {
 		return nil, err
 	}
-	if !ok {
-		return nil, nil
+
+	var id int64
+	found := tx.Model(&sqlitedb.RecordKey{}).Select("id").Where("uri = ?", parentURI).Scan(&id)
+	if found.Error != nil {
+		return nil, found.Error
+	}
+	if found.RowsAffected > 0 {
+		return &id, nil
 	}
 
-	parentRK, err := getRecordKeyByURI(ctx, db, parentURI)
+	grandparent, err := parentKeyID(tx, parentURI)
 	if err != nil {
-		if errors.Is(err, domain.NotFoundError{}) {
-
-			parentID, err := getOrCreateParentRecordKey(ctx, db, parentURI)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			var pid *int64
-			if parentID != nil {
-				pid = &parentID.ID
-			}
-
-			newRecordKey := sqlitedb.RecordKey{
-				URI:      parentURI,
-				RecordID: nil,
-				ParentID: pid,
-			}
-
-			err = db.WithContext(ctx).Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "uri"}},
-				DoNothing: true,
-			}).Create(&newRecordKey).Error
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			// 別トランザクションが先に作成済み（競合）なら ID は 0 のまま → 再取得
-			if newRecordKey.ID == 0 {
-				return getRecordKeyByURI(ctx, db, parentURI)
-			}
-
-			return &newRecordKey, nil
-
-		} else {
-			span.RecordError(err)
-			return nil, err
-		}
+		return nil, err
 	}
-
-	return parentRK, nil
-}
-
-func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*sqlitedb.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
-	defer span.End()
-
-	var recordKey sqlitedb.RecordKey
-	err := db.WithContext(ctx).
-		Where("uri = ?", uri).
-		Take(&recordKey).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, domain.NotFoundError{Resource: "record key"}
+	placeholder := sqlitedb.RecordKey{URI: parentURI, ParentID: grandparent}
+	if err := tx.Create(&placeholder).Error; err != nil {
+		return nil, err
 	}
-
-	return &recordKey, nil
+	return &placeholder.ID, nil
 }

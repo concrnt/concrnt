@@ -11,10 +11,6 @@ import (
 	sqlitedb "github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 )
 
-const (
-	defaultChunkSize = 32
-)
-
 func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
@@ -53,14 +49,12 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
-	type TimelineRow struct {
-		URI          string `gorm:"column:uri"`
-		MaxCreatedAt *int64 `gorm:"column:max_created_at"`
+	var res []struct {
+		URI          string
+		MaxCreatedAt *int64
 	}
 
-	var res []TimelineRow
-
-	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0) // descending order
+	cutoff := time.Unix((chunkID+1)*repoutil.ChunkSize, 0)
 
 	latestSubQuery := r.db.
 		Table("record_keys AS child").
@@ -75,7 +69,6 @@ func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID
 		Select("parent.uri AS uri, (?) AS max_created_at", latestSubQuery).
 		Where("parent.uri IN ?", uris).
 		Scan(&res).Error
-
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -124,7 +117,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 		) member ON member.parent_id = parent.id
 		WHERE parent.uri = @uri
 		ORDER BY member.record_created_at DESC`,
-		sql.Named("uri", uri), sql.Named("end", sqlitedb.Micros(chunkDate)), sql.Named("start", sqlitedb.Micros(prevChunkDate)), sql.Named("page", defaultChunkSize)).
+		sql.Named("uri", uri), sql.Named("end", sqlitedb.Micros(chunkDate)), sql.Named("start", sqlitedb.Micros(prevChunkDate)), sql.Named("page", repoutil.BodyPageSize)).
 		Scan(&rows).Error
 	if err != nil {
 		span.RecordError(err)
@@ -142,15 +135,7 @@ func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int6
 			// the timeline's own row, without a member joined to it
 			continue
 		}
-		href := *row.URI
-		if row.Redirect != nil {
-			href = *row.Redirect
-		}
-		bodyItems = append(bodyItems, chunkline.BodyItem{
-			Timestamp:   sqlitedb.Time(*row.RecordCreatedAt),
-			Href:        href,
-			ContentType: "application/concrnt.document+json",
-		})
+		bodyItems = append(bodyItems, repoutil.BodyItem(*row.URI, row.Redirect, sqlitedb.Time(*row.RecordCreatedAt)))
 	}
 
 	return bodyItems, nil

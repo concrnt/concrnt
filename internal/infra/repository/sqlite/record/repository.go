@@ -1,5 +1,5 @@
-// Package record is the SQLite implementation of record.Repository, file
-// for file and method for method the same as the Postgres one
+// Package record is the SQLite implementation of record.Repository, laid
+// out file for file like the Postgres one
 // (internal/infra/repository/postgres/record). The differences are the
 // storage types (int64 microsecond timestamps, JSON text arrays, no
 // COLLATE) and the locking: the IMMEDIATE transaction holds the single
@@ -10,12 +10,12 @@ package record
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/ncruces/go-sqlite3"
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -41,12 +41,6 @@ func New(db *gorm.DB) ucrecord.Repository {
 
 var tracer = otel.Tracer("repository")
 
-const (
-	txMaxAttempts  = 8
-	txBackoffStart = 10 * time.Millisecond
-	txBackoffMax   = 500 * time.Millisecond
-)
-
 // errNotStored rolls back a transaction whose write ended Stale or
 // Duplicate: neither leaves a trace, not even the commit log entry.
 var errNotStored = errors.New("not stored")
@@ -63,15 +57,15 @@ func isRetryableTxError(err error) bool {
 // whatever it reports through captured variables at its start. Anything
 // but Applied rolls the transaction back.
 func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.ApplyStatus, error)) (ucrecord.ApplyStatus, error) {
-	backoff := txBackoffStart
-	for attempt := 1; ; attempt++ {
-		status := ucrecord.Applied
+	status := ucrecord.Applied
+	err := repoutil.RetryTx(ctx, isRetryableTxError, func() error {
 		select {
 		case r.writer <- struct{}{}:
+			defer func() { <-r.writer }()
 		case <-ctx.Done():
-			return status, ctx.Err()
+			return ctx.Err()
 		}
-		err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
 			status, err = fn(tx)
 			if err == nil && status != ucrecord.Applied {
@@ -79,22 +73,11 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 			}
 			return err
 		})
-		<-r.writer
-		if err == nil || errors.Is(err, errNotStored) {
-			return status, nil
-		}
-		if !isRetryableTxError(err) || attempt >= txMaxAttempts {
-			return status, err
-		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return status, errors.Join(ctx.Err(), err)
-		case <-timer.C:
-		}
-		backoff = min(backoff*2, txBackoffMax)
+	})
+	if errors.Is(err, errNotStored) {
+		return status, nil
 	}
+	return status, err
 }
 
 // Cleanup has nothing to do: ApplyDelete removes dependents itself (ON

@@ -65,15 +65,9 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 			return ucrecord.Applied, err
 		}
 
-		// ParentのRecordKeyを探す
-		parentRK, err := getOrCreateParentRecordKey(ctx, tx, commit.Key)
+		pid, err := parentKeyID(tx, commit.Key)
 		if err != nil {
 			return ucrecord.Applied, err
-		}
-
-		var pid *int64
-		if parentRK != nil {
-			pid = &parentRK.ID
 		}
 		cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
 
@@ -380,85 +374,47 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
-	// (which is what BodyItem.ID() returns): the redirect target for
-	// reference records, the record key URI otherwise
-	itemID := keyURI
-	if row.Redirect != nil {
-		itemID = *row.Redirect
-	}
-
-	return *row.ParentURI, itemID, nil
+	return *row.ParentURI, repoutil.ItemID(keyURI, row.Redirect), nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
-	defer span.End()
-
+// parentKeyID is the row id of the key one segment above uri, nil for a
+// top-level key. A parent that does not exist yet is created as a
+// placeholder, and so is every ancestor above it.
+func parentKeyID(tx *gorm.DB, uri string) (*int64, error) {
 	parentURI, ok, err := repoutil.ParentURI(uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if !ok {
-		return nil, nil
-	}
-
-	parentRK, err := getRecordKeyByURI(ctx, db, parentURI)
-	if err == nil {
-		return parentRK, nil
-	}
-	if !errors.Is(err, domain.ErrNotFound) {
-		span.RecordError(err)
+	if err != nil || !ok {
 		return nil, err
 	}
 
-	grandparent, err := getOrCreateParentRecordKey(ctx, db, parentURI)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	var id int64
+	found := tx.Model(&postgres.RecordKey{}).Select("id").Where("uri = ?", parentURI).Scan(&id)
+	if found.Error != nil {
+		return nil, found.Error
 	}
-	var pid *int64
-	if grandparent != nil {
-		pid = &grandparent.ID
+	if found.RowsAffected > 0 {
+		return &id, nil
+	}
+
+	grandparent, err := parentKeyID(tx, parentURI)
+	if err != nil {
+		return nil, err
 	}
 
 	// one statement for the placeholder: the insert's id, or the id of the
 	// row a concurrent transaction created first (DO NOTHING returns none).
 	// A DO UPDATE upsert would lock the parent row for the whole
 	// transaction and serialize every commit into the same timeline.
-	newRecordKey := postgres.RecordKey{URI: parentURI, ParentID: pid}
-	err = db.WithContext(ctx).Raw(`WITH ins AS (
+	created := tx.Raw(`WITH ins AS (
 		INSERT INTO record_keys (uri, parent_id, clean_on_update) VALUES (?, ?, false)
 		ON CONFLICT (uri) DO NOTHING RETURNING id
-	) SELECT id FROM ins UNION ALL SELECT id FROM record_keys WHERE uri = ? LIMIT 1`, parentURI, pid, parentURI).
-		Scan(&newRecordKey.ID).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	) SELECT id FROM ins UNION ALL SELECT id FROM record_keys WHERE uri = ? LIMIT 1`, parentURI, grandparent, parentURI).
+		Scan(&id)
+	if created.Error != nil {
+		return nil, created.Error
 	}
-	if newRecordKey.ID == 0 {
+	if created.RowsAffected == 0 {
 		// the row seen by neither branch: inserted and deleted in between
-		return getRecordKeyByURI(ctx, db, parentURI)
+		return nil, errRetryTx
 	}
-	return &newRecordKey, nil
-}
-
-func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
-	defer span.End()
-
-	var recordKey postgres.RecordKey
-	err := db.WithContext(ctx).
-		Where("uri = ?", uri).
-		Take(&recordKey).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, domain.NotFoundError{Resource: "record key"}
-	}
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	return &recordKey, nil
+	return &id, nil
 }

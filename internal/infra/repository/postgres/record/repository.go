@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -50,12 +51,6 @@ func New(db *gorm.DB) ucrecord.Repository {
 
 var tracer = otel.Tracer("repository")
 
-const (
-	txMaxAttempts  = 8
-	txBackoffStart = 10 * time.Millisecond
-	txBackoffMax   = 500 * time.Millisecond
-)
-
 var txSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 	Namespace: "concrnt",
 	Subsystem: "record",
@@ -78,14 +73,24 @@ var errRetryTx = errors.New("retry transaction")
 // reset whatever it reports through captured variables at its start.
 // Anything but Applied rolls the transaction back.
 func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.ApplyStatus, error)) (ucrecord.ApplyStatus, error) {
-	backoff := txBackoffStart
-	for attempt := 1; ; attempt++ {
-		status := ucrecord.Applied
-		release, err := r.txSlot(ctx)
-		if err != nil {
-			return status, err
+	retryable := func(err error) bool {
+		var pgErr *pgconn.PgError
+		return errors.Is(err, errRetryTx) || (errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01"))
+	}
+	status := ucrecord.Applied
+	err := repoutil.RetryTx(ctx, retryable, func() error {
+		// the wait for a slot holds no connection
+		if r.txSlots != nil {
+			start := time.Now()
+			select {
+			case r.txSlots <- struct{}{}:
+				txSlotWait.Observe(time.Since(start).Seconds())
+				defer func() { <-r.txSlots }()
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
-		err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error
 			status, err = fn(tx)
 			if err == nil && status != ucrecord.Applied {
@@ -93,40 +98,11 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 			}
 			return err
 		})
-		release()
-		if err == nil || errors.Is(err, errNotStored) {
-			return status, nil
-		}
-		var pgErr *pgconn.PgError
-		retryable := errors.Is(err, errRetryTx) || (errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01"))
-		if !retryable || attempt >= txMaxAttempts {
-			return status, err
-		}
-		timer := time.NewTimer(backoff)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return status, errors.Join(ctx.Err(), err)
-		case <-timer.C:
-		}
-		backoff = min(backoff*2, txBackoffMax)
+	})
+	if errors.Is(err, errNotStored) {
+		return status, nil
 	}
-}
-
-// txSlot waits for one of the transaction slots and returns what gives it
-// back. The wait holds no connection.
-func (r *Repository) txSlot(ctx context.Context) (release func(), err error) {
-	if r.txSlots == nil {
-		return func() {}, nil
-	}
-	start := time.Now()
-	select {
-	case r.txSlots <- struct{}{}:
-		txSlotWait.Observe(time.Since(start).Seconds())
-		return func() { <-r.txSlots }, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return status, err
 }
 
 // Cleanup has nothing to do: ApplyDelete removes dependents itself (ON

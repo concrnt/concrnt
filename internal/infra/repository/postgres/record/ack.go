@@ -2,13 +2,12 @@ package record
 
 import (
 	"context"
-	"errors"
 	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -17,12 +16,11 @@ import (
 type ackSide struct {
 	table string
 	owner string // the column the ccfs namespace is composed from (CIP-3 §3.4)
-	model any
 }
 
 var (
-	ackerSide  = ackSide{"acks", "from", &postgres.Ack{}}
-	targetSide = ackSide{"ackeds", "to", &postgres.Acked{}}
+	ackerSide  = ackSide{"acks", "from"}
+	targetSide = ackSide{"ackeds", "to"}
 )
 
 func sideOf(side ucrecord.AckSide) ackSide {
@@ -129,15 +127,23 @@ func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (u
 	return outcome, nil
 }
 
-// ackRecords lists the valid acks of one side owned by ccid, each with its
-// commit (the side's ccfs identity is held by its owner's server).
-func (r *Repository) ackRecords(ctx context.Context, side ackSide, ccid, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ackRecords")
+// GetAcknowledgeRecords lists the valid states of one side, each with the
+// commit it is anchored to (the side's ccfs identity is held by its owner's
+// server).
+func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
 	defer span.End()
+
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	side := sideOf(held)
 
 	t := side.table
 	query := r.db.WithContext(ctx).
-		Model(side.model).
+		Table(t).
 		Joins("JOIN commit_logs c ON c.id = "+t+".document_id").
 		Where(t+`."`+side.owner+`" = ?`, ccid).
 		Where(t+".valid = ?", true)
@@ -167,34 +173,24 @@ func (r *Repository) ackRecords(ctx context.Context, side ackSide, ccid, schema 
 	return commitRows(rows)
 }
 
-func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
+func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
-	switch {
-	case from != "":
-		return r.ackRecords(ctx, ackerSide, from, schema, since, until, limit, order)
-	case to != "":
-		return r.ackRecords(ctx, targetSide, to, schema, since, until, limit, order)
-	default:
-		err := errors.New("either 'from' or 'to' must be specified")
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-}
+	side := sideOf(held)
 
-func (r *Repository) ackCounts(ctx context.Context, side ackSide, ccid, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ackCounts")
-	defer span.End()
-
-	t := side.table
 	query := r.db.WithContext(ctx).
-		Model(side.model).
+		Table(side.table).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
-		Where(t+`."`+side.owner+`" = ?`, ccid)
+		Where(`"`+side.owner+`" = ?`, ccid)
 	if schema != "" {
-		query = query.Where(t+".schema = ?", schema)
+		query = query.Where("schema = ?", schema)
 	}
 	var results []struct {
 		Schema string
@@ -209,20 +205,4 @@ func (r *Repository) ackCounts(ctx context.Context, side ackSide, ccid, schema s
 		counts[r.Schema] = r.Count
 	}
 	return counts, nil
-}
-
-func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
-	defer span.End()
-
-	switch {
-	case from != "":
-		return r.ackCounts(ctx, ackerSide, from, schema)
-	case to != "":
-		return r.ackCounts(ctx, targetSide, to, schema)
-	default:
-		err := errors.New("either 'from' or 'to' must be specified")
-		span.RecordError(err)
-		return nil, err
-	}
 }
