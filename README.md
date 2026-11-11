@@ -188,7 +188,10 @@ each answers with a JSON body naming every check.
   a restart would not bring the backend back.
 - `/ready` (readiness) fails until every backend (record database, Redis,
   Memcached) has answered once, while one of them is down, and from SIGTERM
-  on (draining). The backends are checked in the background — every 2s,
+  on (draining). A Memcached address that does not resolve counts as down
+  and is resolved again as requests arrive, so a replica started before its
+  Memcached is resolvable neither turns ready without a cache nor stays
+  without one. The backends are checked in the background — every 2s,
   Postgres and Redis over a connection reserved for the check, Firestore
   every 15s because each check is a billed read — and the probe only reads
   the verdict, so it answers in microseconds however busy the replica and
