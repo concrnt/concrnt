@@ -2,6 +2,7 @@ package record
 
 import (
 	"context"
+	"database/sql"
 	"net/url"
 	"time"
 
@@ -118,61 +119,52 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 	chunkDate := time.Unix((chunkID+1)*600, 0)
 	prevChunkDate := time.Unix((chunkID-1)*600, 0)
 
-	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
+	// Not the newest page first and the whole window only when the page does
+	// not cover it: that is a second round trip. Not an inner join on the
+	// timeline's key either: an empty timeline would look like a missing one.
 	var members []models.RecordKey
-	err = r.db.WithContext(ctx).
-		Where("parent_id = ?", parentRecordKey.ID).
-		Where("record_created_at < ?", chunkDate).
-		Order("record_created_at DESC").
-		Limit(defaultChunkSize).
-		Preload("Record").
-		Preload("Record.Document").
-		Find(&members).Error
+	err := r.db.WithContext(ctx).Raw(`SELECT member.uri AS uri, member.redirect AS redirect, member.record_created_at AS record_created_at
+		FROM record_keys parent
+		LEFT JOIN (
+			SELECT page.* FROM (
+				SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+				WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end
+				ORDER BY record_created_at DESC LIMIT @page
+			) page
+			UNION
+			SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+			WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end AND record_created_at >= @start
+		) member ON member.parent_id = parent.id
+		WHERE parent.uri = @uri
+		ORDER BY member.record_created_at DESC`,
+		sql.Named("uri", uri), sql.Named("end", chunkDate), sql.Named("start", prevChunkDate), sql.Named("page", defaultChunkSize)).
+		Scan(&members).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	// Judge window coverage by record_created_at — the same column the queries
-	// filter and order by — not the joined Record.CreatedAt, which can diverge
-	// (e.g. backdated records) and would skip the window scan.
-	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
-		err = r.db.WithContext(ctx).
-			Where("parent_id = ?", parentRecordKey.ID).
-			Where("record_created_at < ?", chunkDate).
-			Where("record_created_at >= ?", prevChunkDate).
-			Order("record_created_at DESC").
-			Preload("Record").
-			Preload("Record.Document").
-			Find(&members).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+	if len(members) == 0 {
+		err := domain.NotFoundError{Resource: "record key"}
+		span.RecordError(err)
+		return nil, err
 	}
 
 	bodyItems := make([]chunkline.BodyItem, 0, len(members))
 
 	for _, member := range members {
+		if member.RecordCreatedAt == nil {
+			// the timeline's own row, without a member joined to it
+			continue
+		}
 
 		href := member.URI
 		contentType := "application/concrnt.document+json"
-		if member.Record.Redirect != nil {
-			href = *member.Record.Redirect
-		}
-
-		timestamp := member.Record.CreatedAt
-		if member.RecordCreatedAt != nil {
-			timestamp = *member.RecordCreatedAt
+		if member.Redirect != nil {
+			href = *member.Redirect
 		}
 
 		item := chunkline.BodyItem{
-			Timestamp:   timestamp,
+			Timestamp:   *member.RecordCreatedAt,
 			Href:        href,
 			ContentType: contentType,
 		}
