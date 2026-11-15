@@ -145,9 +145,20 @@ func (r *recordingRecordRepo) ApplyEntity(ctx context.Context, commit EntityComm
 	r.createEntityCalled = true
 	return r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt)), nil
 }
-func (r *recordingRecordRepo) CreateRecord(ctx context.Context, tx RepositoryTx, documentID string, key string, owner string, author string, schema string, onUpdate *string, policies *string, distributions []string, redirect *string, createdAt time.Time) (bool, error) {
+func (r *recordingRecordRepo) ApplyRecord(ctx context.Context, commit RecordCommit) (RecordOutcome, error) {
 	r.createRecordCalled = true
-	return r.storedCreatedAt.IsZero() || createdAt.After(r.storedCreatedAt), nil
+	status := r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt))
+	if status != Applied {
+		return RecordOutcome{Status: status}, nil
+	}
+	if r.storedSD == nil {
+		return RecordOutcome{Status: Applied, FreshKey: true}, nil
+	}
+	previousID, err := r.storedSD.CDID()
+	if err != nil {
+		return RecordOutcome{}, err
+	}
+	return RecordOutcome{Status: Applied, PreviousID: previousID}, nil
 }
 func (r *recordingRecordRepo) Acknowledge(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
 	r.acknowledgeCalled = true

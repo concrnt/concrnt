@@ -205,8 +205,10 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 
 	case "record":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createRecord(ctx, tx, ip, *requester, doc, sd, mode)
+		applyResult, err = uc.createRecord(ctx, ip, *requester, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "association":

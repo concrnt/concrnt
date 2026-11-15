@@ -13,7 +13,7 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+func (uc *Usecase) createRecord(ctx context.Context, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateRecord")
 	defer span.End()
 
@@ -142,22 +142,24 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, parsedKey.Owner); err != nil {
-		span.RecordError(err)
-		return nil, err
+	commit := RecordCommit{
+		Commit:        Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: parsedKey.Owner},
+		Key:           parsed.Key,
+		Author:        parsed.Author,
+		Schema:        schema,
+		OnUpdate:      parsed.OnUpdate,
+		Policies:      policies,
+		Distributions: distributions,
+		Redirect:      redirect,
+		CreatedAt:     createdAt,
+	}
+
+	apply := func(ctx context.Context) (ApplyStatus, error) {
+		outcome, err := uc.repo.ApplyRecord(ctx, commit)
+		return outcome.Status, err
 	}
 
 	resultURI := parsed.Key
-	applied, err := uc.repo.CreateRecord(ctx, tx, documentID, parsed.Key, parsedKey.Owner, parsed.Author, schema, parsed.OnUpdate, policies, distributions, redirect, createdAt)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !applied {
-		return &commitApplyResult{result: &sd, noop: true}, nil
-	}
-
 	postProcesses := []PostProcessAction{}
 
 	if mode == domain.CommitModeExecute {
@@ -182,6 +184,8 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 		postProcesses = append(postProcesses, actions...)
 	}
 
+	unapplied := sd
+
 	sd.CCKV = &parsed.Key
 	ccfs := concrnt.CCURI{
 		Scheme: "ccfs",
@@ -192,5 +196,5 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 	sd.CCFS = &ccfs
 
-	return &commitApplyResult{result: &sd, postProcesses: postProcesses}, nil
+	return &commitApplyResult{apply: apply, result: &sd, unapplied: &unapplied, postProcesses: postProcesses}, nil
 }
