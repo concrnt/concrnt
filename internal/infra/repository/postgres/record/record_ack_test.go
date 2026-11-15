@@ -27,7 +27,7 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	from, to := "con1remote", "con1owner"
 	schema := "https://schema.example/follow.json"
@@ -130,7 +130,7 @@ func TestGetAcknowledgeRecordsServesHeldSide(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	schema := "https://schema.example/follow.json"
 	local, localAcker, remoteAcker, remoteTarget := "con1owner", "con1author", "con1remote", "con1elsewhere"

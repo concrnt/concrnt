@@ -24,7 +24,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	key := "cckv://con1owner/timeline/post-1"
 
@@ -270,7 +270,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
-		chunklineRepo := New(db)
+		chunklineRepo := New(db).(*Repository)
 
 		// plain record: item ID is the record key URI
 		timeline, itemID, err := repo.GetTimelineRemoval(ctx, key)
@@ -624,7 +624,7 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	base := "cckv://con1owner/lists/item"
 	keys := []string{
@@ -754,7 +754,7 @@ func TestRecordQueryAuthorFilter(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	parent := "cckv://con1owner/tl"
 	entries := []struct {
@@ -841,7 +841,7 @@ func TestHierarchicalRecordPoliciesRootFirst(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	policyJSON := `{"entries":[{"url":"https://example.com/p.json"}]}`
 	keys := []string{
@@ -897,7 +897,7 @@ func TestHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	policyJSON := `{"entries":[{"url":"https://example.com/p.json"}]}`
 	parentKey := "cckv://con1downer/d1"
@@ -948,7 +948,7 @@ func TestCreateRecordAppliesOverParentPlaceholder(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	parentKey := "cckv://con1ph/parent"
 	childKey := "cckv://con1ph/parent/child"
@@ -994,7 +994,7 @@ func TestCreateRecordFreshKeyConditionalUpsert(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	key := "cckv://con1race/fresh"
 	newID, newAt := "race-2-new", time.Date(2026, 6, 4, 0, 0, 1, 0, time.UTC)
@@ -1068,7 +1068,7 @@ func TestCreateRecordFreshKeyConditionalUpsert(t *testing.T) {
 // withRepositoryTx runs fn inside a commit transaction that already holds the
 // commit log for sd, recorded under owner (the single entity every commit is
 // attributed to).
-func withRepositoryTx(t *testing.T, ctx context.Context, repo ucrecord.Repository, id string, ip string, sd concrnt.SignedDocument, owner string, fn func(tx ucrecord.RepositoryTx) error) {
+func withRepositoryTx(t *testing.T, ctx context.Context, repo *Repository, id string, ip string, sd concrnt.SignedDocument, owner string, fn func(tx ucrecord.RepositoryTx) error) {
 	t.Helper()
 
 	tx, err := repo.BeginTx(ctx)
@@ -1126,7 +1126,7 @@ func TestGetAllCommitLogsByOwner(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	userA, userB := "con1aaaa", "con1bbbb"
 	seed := func(id, owner string) {
@@ -1172,7 +1172,7 @@ func TestRecordQueryByParentOrderByKey(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	owner := "con1keyorder"
 	root := "cckv://" + owner
@@ -1315,7 +1315,7 @@ func TestGetSignedDocuments(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := New(db)
+	repo := New(db).(*Repository)
 
 	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
 	sds := map[string]concrnt.SignedDocument{}

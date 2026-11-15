@@ -18,8 +18,8 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db)
-	chunklineRepo := New(db)
+	recordRepo := New(db).(*Repository)
+	chunklineRepo := New(db).(*Repository)
 
 	parentURI := "cckv://con1owner/timeline"
 	createdAt10 := time.Unix(10*600+10, 0).UTC()
@@ -60,8 +60,8 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db)
-	chunklineRepo := New(db)
+	recordRepo := New(db).(*Repository)
+	chunklineRepo := New(db).(*Repository)
 
 	parentURI := "cckv://con2owner/timeline"
 
@@ -99,8 +99,8 @@ func TestChunklineChunkBoundaryIsHalfOpen(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db)
-	chunklineRepo := New(db)
+	recordRepo := New(db).(*Repository)
+	chunklineRepo := New(db).(*Repository)
 
 	parentURI := "cckv://con3owner/timeline"
 	chunkStart := time.Unix(30*600, 0).UTC()
@@ -127,8 +127,8 @@ func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	recordRepo := New(db)
-	chunklineRepo := New(db)
+	recordRepo := New(db).(*Repository)
+	chunklineRepo := New(db).(*Repository)
 
 	feedURI := "cckv://con4owner/timeline"
 	createChunklineRecord(t, ctx, recordRepo, "empty-feed", feedURI, time.Unix(40*600, 0).UTC())
@@ -138,7 +138,7 @@ func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 	require.Nil(t, manifest.FirstChunk)
 }
 
-func createChunklineRecord(t *testing.T, ctx context.Context, repo ucrecord.Repository, id string, key string, createdAt time.Time) {
+func createChunklineRecord(t *testing.T, ctx context.Context, repo *Repository, id string, key string, createdAt time.Time) {
 	t.Helper()
 
 	sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
