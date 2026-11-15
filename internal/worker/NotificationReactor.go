@@ -144,7 +144,7 @@ func (r *NotificationReactor) runWorker(ctx context.Context, sub domain.Notifica
 	}
 
 	request := make(chan []string)
-	realtime := make(chan concrnt.Event)
+	realtime := make(chan concrnt.Event, 64)
 
 	go r.realtime.Realtime(ctx, request, realtime)
 	select {

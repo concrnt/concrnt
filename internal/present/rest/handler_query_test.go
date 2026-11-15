@@ -41,8 +41,8 @@ func (r *queryRecordRepo) QueryByParentOrderByKey(ctx context.Context, parent, s
 	return []record.QueryRow{}, nil
 }
 
-func (r *queryRecordRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
-	return []concrnt.Policy{}, nil
+func (r *queryRecordRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return map[string][]concrnt.Policy{}, nil
 }
 
 // CIP-5 §3.1: orderby is createdAt or key, and key is only valid with parent.

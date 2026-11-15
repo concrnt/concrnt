@@ -13,11 +13,11 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
-	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateRecord")
+func (uc *Usecase) planRecord(ctx context.Context, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitPlan, error) {
+	ctx, span := tracer.Start(ctx, "Usecase.Record.PlanRecord")
 	defer span.End()
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, parsed.Key)
+	stack, err := uc.policyStack(ctx, parsed.Key)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -26,6 +26,8 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 	action := "record:create"
 	policySelf := parsed
 
+	// the stored version decides the policy action; whether the key was
+	// fresh when the write landed is the repository's to say (RecordOutcome)
 	existingSD, err := uc.repo.GetSignedDocument(ctx, parsed.Key)
 	if err == nil {
 		var existingDoc concrnt.Document[any]
@@ -142,23 +144,45 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, parsedKey.Owner); err != nil {
-		span.RecordError(err)
-		return nil, err
+	commit := RecordCommit{
+		Commit:        Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: parsedKey.Owner},
+		Key:           parsed.Key,
+		Author:        parsed.Author,
+		Schema:        schema,
+		OnUpdate:      parsed.OnUpdate,
+		Policies:      policies,
+		Distributions: distributions,
+		Redirect:      redirect,
+		CreatedAt:     createdAt,
+	}
+
+	var outcome RecordOutcome
+	apply := func(ctx context.Context) (ApplyStatus, error) {
+		var err error
+		outcome, err = uc.repo.ApplyRecord(ctx, commit)
+		return outcome.Status, err
 	}
 
 	resultURI := parsed.Key
-	applied, err := uc.repo.CreateRecord(ctx, tx, documentID, parsed.Key, parsedKey.Owner, parsed.Author, schema, parsed.OnUpdate, policies, distributions, redirect, createdAt)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !applied {
-		return &commitApplyResult{result: &sd, noop: true}, nil
-	}
-
 	postProcesses := []PostProcessAction{}
+
+	// the stored record is a layer of its subtree's stacks when it carries a
+	// policy or distributions, and the one it replaced may have been
+	if parsed.Policy != nil || parsed.Distributes != nil || policyLayerAt(stack, parsed.Key) {
+		postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedKey.Owner))
+	}
+
+	postProcesses = append(postProcesses, func(ctx context.Context) error {
+		if outcome.FreshKey {
+			return uc.associationCountsSeededEmpty(parsed.Key)(ctx)
+		}
+		var previous *string
+		if outcome.PreviousID != "" {
+			ccfs := concrnt.ComposeCCFSURI(parsedKey.Owner, concrnt.CCFSTypeConcrnt, outcome.PreviousID)
+			previous = &ccfs
+		}
+		return uc.documentCacheInvalidated(&parsed.Key, previous)(ctx)
+	})
 
 	if mode == domain.CommitModeExecute {
 		postProcesses = append(postProcesses, func(ctx context.Context) error {
@@ -182,6 +206,8 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 		postProcesses = append(postProcesses, actions...)
 	}
 
+	unapplied := sd
+
 	sd.CCKV = &parsed.Key
 	ccfs := concrnt.CCURI{
 		Scheme: "ccfs",
@@ -192,5 +218,5 @@ func (uc *Usecase) createRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 	sd.CCFS = &ccfs
 
-	return &commitApplyResult{result: &sd, postProcesses: postProcesses}, nil
+	return &commitPlan{apply: apply, result: &sd, unapplied: &unapplied, postProcesses: postProcesses}, nil
 }

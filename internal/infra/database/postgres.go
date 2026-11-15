@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"log"
 	"log/slog"
 	"os"
@@ -12,22 +13,19 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
-
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
-
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections
+// (config.Postgres.MaxOpenConnsOrDefault).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
-		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
+		log.New(os.Stdout, "\r\n", log.LstdFlags),
 		logger.Config{
-			SlowThreshold:             300 * time.Millisecond, // Slow SQL threshold
-			LogLevel:                  logger.Warn,            // Log level
-			IgnoreRecordNotFoundError: true,                   // Ignore ErrRecordNotFound error for logger
-			Colorful:                  true,                   // Enable color
+			SlowThreshold:             300 * time.Millisecond,
+			LogLevel:                  logger.Warn,
+			IgnoreRecordNotFoundError: true,
+			Colorful:                  true,
 		},
 	)
 
@@ -52,13 +50,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// A transaction holds one connection while the reads issued inside it
-	// (through the repository's plain db handle) take another one from this
-	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (postgres.MaxConcurrentTx); otherwise that many
-	// concurrent commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 
@@ -82,29 +75,18 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	return db, nil
 }
 
-// migrationLockID serializes AutoMigrate across replicas starting simultaneously.
-const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
-
-func MigratePostgres(db *gorm.DB) error {
-	// session-level advisory lock must be taken and released on the same connection
-	return db.Connection(func(conn *gorm.DB) error {
-		if err := conn.Exec("SELECT pg_advisory_lock(?)", migrationLockID).Error; err != nil {
-			return err
-		}
-		defer conn.Exec("SELECT pg_advisory_unlock(?)", migrationLockID)
-
-		return conn.AutoMigrate(
-			&models.CommitLog{},
-			&models.Record{},
-			&models.RecordKey{},
-			&models.Association{},
-			&models.Ack{},
-			&models.Acked{},
-			&models.Server{},
-			&models.Entity{},
-			&models.EntityMeta{},
-			&models.Subscription{},
-			&models.AbuseReport{},
-		)
-	})
+// NewPostgresProbe opens a single connection for the readiness check alone.
+// A ping through the serving pool queues behind the requests when every
+// connection is in use (database/sql serves its waiters in random order),
+// so under a burst it times out although the database is answering; this
+// connection is never handed to a request. It is untraced: a ping every
+// few seconds is noise in the spans.
+func NewPostgresProbe(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
 }

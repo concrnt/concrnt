@@ -35,6 +35,9 @@ func (r *replicationRepo) QueryCommitLogs(ctx context.Context, owner string, sin
 func (r *replicationRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return []concrnt.Policy{}, nil
 }
+func (r *replicationRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
+}
 
 // recordingPolicyService allows everything and records the (action, key)
 // pairs it was asked to evaluate.
@@ -102,7 +105,7 @@ func TestReplicateReadAccess(t *testing.T) {
 	}
 
 	newUsecase := func(repo *replicationRepo, pol PolicyService) *Usecase {
-		return New(repo, stubResidenceRepo{}, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
+		return New(withEntities{repo, stubResidenceRepo{}}, nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, pol, nil, nil)
 	}
 
 	t.Run("anonymous requester loses the protected record only", func(t *testing.T) {

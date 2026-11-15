@@ -47,15 +47,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if alreadyCommitted {
-		return &sd, nil
-	}
-
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
 	isServiceAccount := serviceAccountType == "system"
 
@@ -193,76 +184,60 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	var applyCommit func(tx RepositoryTx) (*commitApplyResult, error)
+	// plan: every read, check and policy evaluation of the commit happens
+	// here, against committed state
+	var plan *commitPlan
 
 	switch doc.Kind {
 	case "entity":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.saveEntity(ctx, tx, ip, sd)
-		}
+		plan, err = uc.planEntity(ctx, ip, sd)
 
 	case "record":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createRecord(ctx, tx, ip, *requester, doc, sd, mode)
-		}
+		plan, err = uc.planRecord(ctx, ip, *requester, doc, sd, mode)
 
 	case "association":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createAssociation(ctx, tx, ip, *requester, doc, sd, mode)
-		}
+		plan, err = uc.planAssociation(ctx, ip, *requester, doc, sd, mode)
 
 	case "ack", "acked", "unack", "unacked":
-		targetUser, err := uc.getEntityWithReference(ctx, ip, targetUserID, sd)
+		targetUser, targetErr := uc.getEntityWithReference(ctx, ip, targetUserID, sd)
+		if targetErr != nil {
+			span.RecordError(targetErr)
+			return nil, targetErr
+		}
+		plan, err = uc.planAck(ctx, ip, *requester, *targetUser, doc, sd, mode)
+
+	case "delete":
+		plan, err = uc.planDelete(ctx, ip, *requester, sd, mode)
+
+	default:
+		err = errors.New("unsupported document kind: " + doc.Kind)
+	}
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	// apply: the one repository write. It is atomic and stores nothing when
+	// it ends Stale or Duplicate, so there is nothing to undo here
+	status := Applied
+	if !plan.noop && plan.apply != nil {
+		status, err = plan.apply(ctx)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.processAck(ctx, tx, ip, *requester, *targetUser, doc, sd, mode)
-		}
-
-	case "delete":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.deleteRecord(ctx, tx, ip, *requester, sd, mode)
-		}
-	default:
-		err := errors.New("unsupported document kind: " + doc.Kind)
-		span.RecordError(err)
-		return nil, err
 	}
 
-	//  ** start transatction **
-
-	tx, err := uc.repo.BeginTx(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	if status == Duplicate {
+		// a redelivery: the commit is in the log already and nothing changed
+		return &sd, nil
 	}
 
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
-		}
-	}()
-
-	applyResult, err := applyCommit(tx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if applyResult.noop {
+	if plan.noop || status == Stale {
 		slog.Info("commit no-op (accept-if-newer loss)",
 			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
-		return applyResult.result, nil
+		return plan.unapplied, nil
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	committed = true
 
 	// A same-key overwrite or delete must be visible to this server's own
 	// verification paths immediately, not after the resource cache's TTL:
@@ -284,7 +259,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	for _, task := range applyResult.postProcesses {
+	for _, task := range plan.postProcesses {
 		if err := task(ctx); err != nil {
 			slog.Error(
 				"failed to run post-commit action",
@@ -294,7 +269,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	return applyResult.result, nil
+	return plan.result, nil
 }
 
 // rejectAliasOwners rejects alias-form owners (@<FQDN>, CIP-0 §7.2) in the

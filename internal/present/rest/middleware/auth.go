@@ -116,7 +116,7 @@ func (s *AuthMiddleware) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFun
 
 			srv, err := s.server.Resolve(ctx, requester.Domain, nil)
 			if err != nil {
-				span.RecordError(errors.Wrap(err, "AuthMiddleware.IdentifyIdentity: s.server.GetAndCacheByFQDN failed"))
+				span.RecordError(errors.Wrap(err, "AuthMiddleware.IdentifyIdentity: s.server.Resolve failed"))
 				goto skipCheckAuthorization
 			}
 			srvTag := srv.Tag()

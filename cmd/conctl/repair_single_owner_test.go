@@ -11,7 +11,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -49,7 +49,7 @@ func seedLegacyState(t *testing.T, db *gorm.DB) legacyState {
 		t.Helper()
 		docBytes, err := json.Marshal(doc)
 		require.NoError(t, err)
-		require.NoError(t, db.WithContext(ctx).Create(&models.CommitLog{ID: id, IP: "127.0.0.1", Document: string(docBytes), Proof: `{"type":"none"}`}).Error)
+		require.NoError(t, db.WithContext(ctx).Create(&postgres.CommitLog{ID: id, IP: "127.0.0.1", Document: string(docBytes), Proof: `{"type":"none"}`}).Error)
 		for _, owner := range owners {
 			require.NoError(t, db.Exec(`INSERT INTO commit_owners (commit_log_id, owner) VALUES (?, ?)`, id, owner).Error)
 		}
@@ -58,13 +58,13 @@ func seedLegacyState(t *testing.T, db *gorm.DB) legacyState {
 		t.Helper()
 		id := "entity-" + ccid
 		commit(id, concrnt.Document[schemas.Entity]{Kind: "entity", Value: schemas.Entity{Domain: host}, Author: ccid, CreatedAt: st.entityAt}, ccid)
-		require.NoError(t, db.WithContext(ctx).Create(&models.Entity{ID: ccid, Domain: host, DocumentID: id}).Error)
+		require.NoError(t, db.WithContext(ctx).Create(&postgres.Entity{ID: ccid, Domain: host, DocumentID: id}).Error)
 	}
 	ack := func(id, from, to string, owners ...string) {
 		t.Helper()
 		associate := "cckv://" + to
 		commit(id, concrnt.Document[map[string]string]{Kind: "ack", Value: map[string]string{"context": "follow"}, Author: from, Schema: "https://example.com/follow.json", CreatedAt: st.ackAt, Associate: &associate}, owners...)
-		require.NoError(t, db.WithContext(ctx).Create(&models.Ack{From: from, To: to, Schema: "https://example.com/follow.json", DocumentID: id, Valid: true, CreatedAt: st.ackAt}).Error)
+		require.NoError(t, db.WithContext(ctx).Create(&postgres.Ack{From: from, To: to, Schema: "https://example.com/follow.json", DocumentID: id, Valid: true, CreatedAt: st.ackAt}).Error)
 	}
 
 	entity(st.alice, repairFQDN)
@@ -97,9 +97,9 @@ func TestRepairSingleOwner(t *testing.T) {
 
 	snapshot := func() (int64, int64, int64) {
 		var commits, acks, ackeds int64
-		require.NoError(t, db.Model(&models.CommitLog{}).Where("owner <> '' AND owner IS NOT NULL").Count(&commits).Error)
-		require.NoError(t, db.Model(&models.Ack{}).Count(&acks).Error)
-		require.NoError(t, db.Model(&models.Acked{}).Count(&ackeds).Error)
+		require.NoError(t, db.Model(&postgres.CommitLog{}).Where("owner <> '' AND owner IS NOT NULL").Count(&commits).Error)
+		require.NoError(t, db.Model(&postgres.Ack{}).Count(&acks).Error)
+		require.NoError(t, db.Model(&postgres.Acked{}).Count(&ackeds).Error)
 		return commits, acks, ackeds
 	}
 
@@ -117,7 +117,7 @@ func TestRepairSingleOwner(t *testing.T) {
 	require.Equal(t, repairSingleOwnerStats{Owners: 6, EntityTimestamps: 3, AckedHoldings: 2, DisownedRawAcks: 1}, stats)
 
 	ownerOf := func(id string) (string, bool) {
-		var log models.CommitLog
+		var log postgres.CommitLog
 		require.NoError(t, db.Where("id = ?", id).Take(&log).Error)
 		return log.Owner, log.GcCandidate
 	}
@@ -136,13 +136,13 @@ func TestRepairSingleOwner(t *testing.T) {
 	}
 
 	// step 2: entity timestamps
-	var bob models.Entity
+	var bob postgres.Entity
 	require.NoError(t, db.Where("id = ?", st.bob).Take(&bob).Error)
 	require.True(t, bob.CreatedAt.Equal(st.entityAt))
 
 	// step 3: every ack whose target is local now has the target's holding
 	for _, from := range []string{st.alice, st.carol} {
-		var holding models.Acked
+		var holding postgres.Acked
 		require.NoError(t, db.Where(`"from" = ? AND "to" = ?`, from, st.bob).Take(&holding).Error, "acked holding for %s -> bob", from)
 		require.True(t, holding.Valid)
 		require.True(t, holding.CreatedAt.Equal(st.ackAt))
@@ -150,7 +150,7 @@ func TestRepairSingleOwner(t *testing.T) {
 		require.Equal(t, st.bob, owner)
 		require.False(t, gc)
 
-		var log models.CommitLog
+		var log postgres.CommitLog
 		require.NoError(t, db.Where("id = ?", holding.DocumentID).Take(&log).Error)
 		var doc concrnt.Document[map[string]string]
 		require.NoError(t, json.Unmarshal([]byte(log.Document), &doc))
@@ -163,12 +163,12 @@ func TestRepairSingleOwner(t *testing.T) {
 	}
 	// no holding for a remote target
 	var count int64
-	require.NoError(t, db.Model(&models.Acked{}).Where(`"to" = ?`, st.carol).Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.Acked{}).Where(`"to" = ?`, st.carol).Count(&count).Error)
 	require.Zero(t, count)
 
 	// step 4: the receiving-side raw ack is gone from acks, its commit
 	// disowned and flagged; the acker-side rows stay
-	require.NoError(t, db.Model(&models.Ack{}).Where("document_id = ?", st.ackCarolBob).Count(&count).Error)
+	require.NoError(t, db.Model(&postgres.Ack{}).Where("document_id = ?", st.ackCarolBob).Count(&count).Error)
 	require.Zero(t, count)
 	owner, gc := ownerOf(st.ackCarolBob)
 	require.Empty(t, owner)
@@ -195,11 +195,11 @@ func TestRepairSingleOwnerWithoutLegacyTable(t *testing.T) {
 		Author: "con1author", Schema: "https://example.com/post.json", CreatedAt: time.Now(),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.Create(&models.CommitLog{ID: "rec-1", Document: string(docBytes), Proof: `{"type":"none"}`}).Error)
+	require.NoError(t, db.Create(&postgres.CommitLog{ID: "rec-1", Document: string(docBytes), Proof: `{"type":"none"}`}).Error)
 	// enough rows to span several batches
-	filler := make([]models.CommitLog, 0, 1200)
+	filler := make([]postgres.CommitLog, 0, 1200)
 	for i := range 1200 {
-		filler = append(filler, models.CommitLog{ID: fmt.Sprintf("rec-filler-%04d", i), Document: string(docBytes), Proof: `{"type":"none"}`})
+		filler = append(filler, postgres.CommitLog{ID: fmt.Sprintf("rec-filler-%04d", i), Document: string(docBytes), Proof: `{"type":"none"}`})
 	}
 	require.NoError(t, db.CreateInBatches(&filler, 200).Error)
 	require.NoError(t, db.Exec(`UPDATE commit_logs SET owner = NULL`).Error)
@@ -208,10 +208,10 @@ func TestRepairSingleOwnerWithoutLegacyTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, repairSingleOwnerStats{Owners: 1201}, stats)
 	var unowned int64
-	require.NoError(t, db.Model(&models.CommitLog{}).Where("owner IS NULL OR owner = ''").Count(&unowned).Error)
+	require.NoError(t, db.Model(&postgres.CommitLog{}).Where("owner IS NULL OR owner = ''").Count(&unowned).Error)
 	require.Zero(t, unowned)
 
-	var log models.CommitLog
+	var log postgres.CommitLog
 	require.NoError(t, db.Where("id = ?", "rec-1").Take(&log).Error)
 	require.Equal(t, "con1owner", log.Owner)
 }

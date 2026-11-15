@@ -15,7 +15,6 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
-	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/policy"
 	"github.com/concrnt/concrnt/schemas"
 )
@@ -63,74 +62,105 @@ func TestParseRangeDeleteTarget(t *testing.T) {
 	}
 }
 
-// recordingTx records whether the commit transaction was committed or rolled
-// back, so tests can assert the commitlog's fate.
-type recordingTx struct {
-	committed  bool
-	rolledBack bool
-}
-
-func (t *recordingTx) Commit(ctx context.Context) error   { t.committed = true; return nil }
-func (t *recordingTx) Rollback(ctx context.Context) error { t.rolledBack = true; return nil }
-
 type subtreeQueryCall struct {
 	base        string
 	includeSelf bool
+	afterURI    string
+	limit       int
 }
 
 // rangeDeleteRepo serves a fixed subtree enumeration and records the
-// enumeration arguments and every delete attempt. stored is what
+// enumeration arguments and every ApplyDelete call. stored is what
 // GetSignedDocument serves per URI (delete targets, reference rows);
 // removals is what GetTimelineRemoval serves per key URI as (timeline, item).
+// Every removal finds something to remove. cleanups, when set, are the
+// tokens each ApplyDelete call hands back, and cleanupNext the token Cleanup
+// answers each token with (none: that chain is done).
 type rangeDeleteRepo struct {
 	Repository
 	subtree     []concrnt.SignedDocument
 	stored      map[string]concrnt.SignedDocument
 	removals    map[string][2]string
+	cleanups    []string
+	cleanupNext map[string]string
 	queryCalls  []subtreeQueryCall
+	// cleanupCalls is the token of every Cleanup call in order.
+	cleanupCalls []string
+	// deletes is every ApplyDelete call in order: the first page of a delete
+	// carries its Commit, a range delete's continuation pages none.
+	deletes []DeleteCommit
+	// deletedURIs are the keys the RemoveKey removals named, in order.
 	deletedURIs []string
-	txs         []*recordingTx
-	// commitLogOwners records CreateCommitLog calls: documentID -> owner.
+	// commitLogOwners is the owner each delete commit was recorded under.
 	commitLogOwners map[string]string
-	// gcFlagged records MarkCommitLogGcCandidate calls in order.
-	gcFlagged []string
 }
 
-func (r *rangeDeleteRepo) BeginTx(ctx context.Context) (RepositoryTx, error) {
-	tx := &recordingTx{}
-	r.txs = append(r.txs, tx)
-	return tx, nil
-}
-func (r *rangeDeleteRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	if r.commitLogOwners == nil {
-		r.commitLogOwners = map[string]string{}
+func (r *rangeDeleteRepo) ApplyDelete(ctx context.Context, commit DeleteCommit) (DeleteOutcome, error) {
+	r.deletes = append(r.deletes, commit)
+	if commit.Commit != nil {
+		if r.commitLogOwners == nil {
+			r.commitLogOwners = map[string]string{}
+		}
+		r.commitLogOwners[commit.Commit.ID] = commit.Commit.Owner
 	}
-	r.commitLogOwners[id] = owner
-	return nil
+	removed := make([]bool, len(commit.Removals))
+	for i, removal := range commit.Removals {
+		if removal.Kind == RemoveKey {
+			r.deletedURIs = append(r.deletedURIs, removal.URI)
+		}
+		removed[i] = true
+	}
+	return DeleteOutcome{Status: Applied, Removed: removed, Cleanups: r.cleanups}, nil
 }
-func (r *rangeDeleteRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return false, nil
+
+func (r *rangeDeleteRepo) Cleanup(ctx context.Context, token string) (string, error) {
+	r.cleanupCalls = append(r.cleanupCalls, token)
+	return r.cleanupNext[token], nil
 }
-func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error {
-	r.gcFlagged = append(r.gcFlagged, documentID)
-	return nil
+
+// gcFlagged lists the commits flagged for gc over every ApplyDelete call, in
+// order.
+func (r *rangeDeleteRepo) gcFlagged() []string {
+	flagged := []string{}
+	for _, commit := range r.deletes {
+		flagged = append(flagged, commit.GcCommitIDs...)
+	}
+	return flagged
 }
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
-func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
-	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf})
-	return r.subtree, nil
+func (r *rangeDeleteRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	return emptyStacks(uris), nil
 }
-func (r *rangeDeleteRepo) DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error {
-	r.deletedURIs = append(r.deletedURIs, targetURI)
-	return nil
+func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
+	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf, afterURI: afterURI, limit: limit})
+	out := []concrnt.SignedDocument{}
+	for _, sd := range r.subtree {
+		if *sd.CCKV <= afterURI || slices.Contains(r.deletedURIs, *sd.CCKV) {
+			continue
+		}
+		out = append(out, sd)
+		if limit > 0 && len(out) == limit {
+			break
+		}
+	}
+	return out, nil
 }
 func (r *rangeDeleteRepo) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
 	if sd, ok := r.stored[uri]; ok {
 		return &sd, nil
 	}
 	return nil, domain.NotFoundError{Resource: uri}
+}
+func (r *rangeDeleteRepo) GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error) {
+	out := map[string]*concrnt.SignedDocument{}
+	for _, uri := range uris {
+		if sd, ok := r.stored[uri]; ok {
+			out[uri] = &sd
+		}
+	}
+	return out, nil
 }
 func (r *rangeDeleteRepo) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	if rm, ok := r.removals[keyURI]; ok {
@@ -157,15 +187,50 @@ func (p *denyKeysPolicyService) Eval(ctx context.Context, req policy.RequestCont
 // recordingDeliveryQueue captures the DeliveryJobs a usecase enqueues and
 // the handlers it registers, keyed by job type.
 type recordingDeliveryQueue struct {
-	jobs     []DeliveryJob
-	handlers map[string]func(ctx context.Context, payload json.RawMessage) error
+	jobs        []DeliveryJob
+	rangeJobs   []RangeDeleteJob
+	cleanupJobs []CleanupJob
+	handlers    map[string]func(ctx context.Context, payload json.RawMessage) error
+	// published holds the events sent through publishRecorder
+	published []concrnt.Event
+}
+
+// publishRecorder is the signal of a usecase whose local channels skip the
+// queue; it keeps their events next to the queued ones.
+type publishRecorder struct{ d *recordingDeliveryQueue }
+
+func (p publishRecorder) Publish(ctx context.Context, channel string, event concrnt.Event) error {
+	p.d.published = append(p.d.published, event)
+	return nil
+}
+
+// deletedEventURIs lists the URIs of the deleted events, published or queued.
+func (d *recordingDeliveryQueue) deletedEventURIs() []string {
+	uris := []string{}
+	for _, event := range d.published {
+		if event.Type == "deleted" {
+			uris = append(uris, event.URI)
+		}
+	}
+	for _, job := range d.jobs {
+		if job.Event != nil && job.Event.Type == "deleted" {
+			uris = append(uris, job.Event.URI)
+		}
+	}
+	return uris
 }
 
 func (d *recordingDeliveryQueue) Enqueue(ctx context.Context, jobType string, payload any) error {
-	if jobType != JobTypeRecordDelivery {
+	switch jobType {
+	case JobTypeRecordDelivery:
+		d.jobs = append(d.jobs, payload.(DeliveryJob))
+	case JobTypeRecordRangeDelete:
+		d.rangeJobs = append(d.rangeJobs, payload.(RangeDeleteJob))
+	case JobTypeRecordCleanup:
+		d.cleanupJobs = append(d.cleanupJobs, payload.(CleanupJob))
+	default:
 		return fmt.Errorf("unexpected job type %q", jobType)
 	}
-	d.jobs = append(d.jobs, payload.(DeliveryJob))
 	return nil
 }
 
@@ -221,14 +286,14 @@ func signedDelete(t *testing.T, ccid, privKeyHex, target string) concrnt.SignedD
 // newRangeDeleteUsecase wires a usecase whose delete author is a local,
 // resolvable entity. The subtree base's owner is the server FQDN itself, so
 // ResolveResourceHost resolves it locally without any network.
-func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery usecase.JobQueue, kvs usecase.KVS) *Usecase {
+func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery *recordingDeliveryQueue, kvs usecase.KVS) *Usecase {
 	return New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities{repo, fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
-		nopSignalService{},
+		publishRecorder{delivery},
 		pol,
 		delivery,
 		kvs,
@@ -238,8 +303,8 @@ func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol
 const rangeBaseURI = "cckv://example.com/profiles/main/lists/l1"
 
 // A subtree range delete ("...l1*") enumerates with includeSelf, evaluates the
-// policy on every target, deletes them all in one batch, commits, and then
-// announces each deleted target.
+// policy on every target, deletes them all in one write together with the
+// commit, and then announces each deleted target.
 func TestCommitRangeDeleteSubtree(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -261,7 +326,7 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 		t.Fatalf("Commit returned error: %v", err)
 	}
 
-	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: true}) {
+	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: true, limit: rangeDeleteSyncLimit + 1}) {
 		t.Fatalf("unexpected enumeration calls: %+v", repo.queryCalls)
 	}
 
@@ -272,18 +337,17 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 	if !slices.Equal(pol.evaled, wantURIs) {
 		t.Fatalf("policy evaluated on %v, want %v", pol.evaled, wantURIs)
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed || repo.txs[0].rolledBack {
-		t.Fatalf("unexpected tx state: %+v", repo.txs)
+	if len(repo.deletes) != 1 || repo.deletes[0].Commit == nil || repo.deletes[0].Commit.ID != documentIDOf(t, sd) {
+		t.Fatalf("expected one ApplyDelete call carrying the delete commit, got %+v", repo.deletes)
+	}
+	for i, removal := range repo.deletes[0].Removals {
+		if removal != (Removal{Kind: RemoveKey, URI: wantURIs[i]}) {
+			t.Fatalf("removal %d = %+v, want RemoveKey of %s", i, removal, wantURIs[i])
+		}
 	}
 
 	// one "deleted" event per target, addressed to the concrete URI
-	deletedEventURIs := []string{}
-	for _, job := range delivery.jobs {
-		if job.Event != nil && job.Event.Type == "deleted" {
-			deletedEventURIs = append(deletedEventURIs, job.Event.URI)
-		}
-	}
-	if !slices.Equal(deletedEventURIs, wantURIs) {
+	if deletedEventURIs := delivery.deletedEventURIs(); !slices.Equal(deletedEventURIs, wantURIs) {
 		t.Fatalf("deleted events for %v, want %v", deletedEventURIs, wantURIs)
 	}
 
@@ -300,8 +364,8 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 		wantFlagged = append(wantFlagged, id)
 	}
 	wantFlagged = append(wantFlagged, documentIDOf(t, sd))
-	if !slices.Equal(repo.gcFlagged, wantFlagged) {
-		t.Fatalf("gc flagged = %v, want %v", repo.gcFlagged, wantFlagged)
+	if flagged := repo.gcFlagged(); !slices.Equal(flagged, wantFlagged) {
+		t.Fatalf("gc flagged = %v, want %v", flagged, wantFlagged)
 	}
 }
 
@@ -324,8 +388,8 @@ func TestCommitDeleteRetainKeepsHistory(t *testing.T) {
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if len(repo.gcFlagged) != 0 {
-			t.Fatalf("nothing may be flagged for gc when the target is retained, got %v", repo.gcFlagged)
+		if flagged := repo.gcFlagged(); len(flagged) != 0 {
+			t.Fatalf("nothing may be flagged for gc when the target is retained, got %v", flagged)
 		}
 	})
 
@@ -338,8 +402,109 @@ func TestCommitDeleteRetainKeepsHistory(t *testing.T) {
 			t.Fatalf("Commit returned error: %v", err)
 		}
 		forgottenID, _ := forgotten.CDID()
-		if !slices.Equal(repo.gcFlagged, []string{forgottenID}) {
-			t.Fatalf("gc flagged = %v, want only the forgotten target %s", repo.gcFlagged, forgottenID)
+		if flagged := repo.gcFlagged(); !slices.Equal(flagged, []string{forgottenID}) {
+			t.Fatalf("gc flagged = %v, want only the forgotten target %s", flagged, forgottenID)
+		}
+	})
+}
+
+// A subtree larger than rangeDeleteSyncLimit is removed one page per
+// ApplyDelete call: the commit takes the first page and enqueues a
+// RecordRangeDelete job for the rest; each job page re-enqueues the next
+// until the subtree is exhausted, and only the last page flags the delete
+// commit for gc. A retained document in any page keeps the commit.
+func TestCommitRangeDeleteLargeSubtreePagesThroughJobs(t *testing.T) {
+	ccid, priv := newIdentity(t)
+	cfg := &domain.Config{FQDN: "example.com"}
+
+	const extra = 3
+	targets := []concrnt.SignedDocument{subtreeRecord(t, rangeBaseURI)}
+	for i := 0; i < rangeDeleteSyncLimit+extra-1; i++ {
+		targets = append(targets, subtreeRecord(t, fmt.Sprintf("%s/c%05d", rangeBaseURI, i)))
+	}
+	repo := &rangeDeleteRepo{subtree: targets}
+	delivery := &recordingDeliveryQueue{}
+	uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, delivery, &stubKVS{})
+
+	sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+		t.Fatalf("Commit returned error: %v", err)
+	}
+	if len(repo.deletedURIs) != rangeDeleteSyncLimit {
+		t.Fatalf("the commit must delete exactly one page, deleted %d", len(repo.deletedURIs))
+	}
+	if slices.Contains(repo.gcFlagged(), documentIDOf(t, sd)) {
+		t.Fatalf("the delete commit must not be flagged before the last page")
+	}
+	if len(delivery.rangeJobs) != 1 {
+		t.Fatalf("one continuation job must be enqueued, got %d", len(delivery.rangeJobs))
+	}
+	job := delivery.rangeJobs[0]
+	if job.AfterURI != *targets[rangeDeleteSyncLimit-1].CCKV || !job.IncludeSelf || job.Base != rangeBaseURI || job.Requester != ccid {
+		t.Fatalf("unexpected job: %+v", job)
+	}
+
+	// the queue hands the payload back to the registered handler
+	payload, _ := json.Marshal(job)
+	if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+		t.Fatalf("job returned error: %v", err)
+	}
+	wantURIs := []string{}
+	for _, target := range targets {
+		wantURIs = append(wantURIs, *target.CCKV)
+	}
+	if !slices.Equal(repo.deletedURIs, wantURIs) {
+		t.Fatalf("after the job every target must be deleted, got %d of %d", len(repo.deletedURIs), len(wantURIs))
+	}
+	if len(delivery.rangeJobs) != 1 {
+		t.Fatalf("the last page must not enqueue another job, got %d", len(delivery.rangeJobs))
+	}
+	if len(repo.deletes) != 2 || repo.deletes[0].Commit == nil || repo.deletes[1].Commit != nil {
+		t.Fatalf("expected the commit's page and one continuation page without a commit, got %d calls", len(repo.deletes))
+	}
+	if flagged := repo.deletes[1].GcCommitIDs; len(flagged) == 0 || flagged[len(flagged)-1] != documentIDOf(t, sd) {
+		t.Fatalf("the last page must flag the delete commit, flagged %v", flagged)
+	}
+
+	t.Run("a retained document in a later page keeps the delete commit", func(t *testing.T) {
+		retained := subtreeRecord(t, rangeBaseURI+"/zzz")
+		retained.Document = strings.Replace(retained.Document, `"kind":"record"`, `"kind":"record","onUpdate":"retain"`, 1)
+		repo := &rangeDeleteRepo{subtree: append(slices.Clone(targets), retained)}
+		delivery := &recordingDeliveryQueue{}
+		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, delivery, &stubKVS{})
+
+		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+			t.Fatalf("Commit returned error: %v", err)
+		}
+		payload, _ := json.Marshal(delivery.rangeJobs[0])
+		if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+			t.Fatalf("job returned error: %v", err)
+		}
+		if slices.Contains(repo.gcFlagged(), documentIDOf(t, sd)) {
+			t.Fatalf("the delete commit must stay when a page retained a document")
+		}
+	})
+
+	t.Run("a denied target in a later page is skipped", func(t *testing.T) {
+		repo := &rangeDeleteRepo{subtree: targets}
+		denied := *targets[len(targets)-1].CCKV
+		delivery := &recordingDeliveryQueue{}
+		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{deny: map[string]bool{denied: true}}, delivery, &stubKVS{})
+
+		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+			t.Fatalf("Commit returned error: %v", err)
+		}
+		payload, _ := json.Marshal(delivery.rangeJobs[0])
+		if err := delivery.handlers[JobTypeRecordRangeDelete](context.Background(), payload); err != nil {
+			t.Fatalf("job returned error: %v", err)
+		}
+		if slices.Contains(repo.deletedURIs, denied) {
+			t.Fatalf("the denied target must survive")
+		}
+		if len(repo.deletedURIs) != len(targets)-1 {
+			t.Fatalf("every other target must be deleted, got %d", len(repo.deletedURIs))
 		}
 	})
 }
@@ -356,14 +521,14 @@ func TestCommitRangeDeleteChildrenOnly(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: false}) {
+	if len(repo.queryCalls) != 1 || repo.queryCalls[0] != (subtreeQueryCall{base: rangeBaseURI, includeSelf: false, limit: rangeDeleteSyncLimit + 1}) {
 		t.Fatalf("unexpected enumeration calls: %+v", repo.queryCalls)
 	}
 }
 
-// A single denied target fails the whole range delete: nothing is deleted, the
-// transaction (commitlog included) is rolled back, and no advertisement or
-// signal is emitted.
+// A single denied target fails the whole range delete: nothing reaches the
+// repository (no removal, no commitlog), and no advertisement or signal is
+// emitted.
 func TestCommitRangeDeleteDenyRollsBackEverything(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -387,8 +552,8 @@ func TestCommitRangeDeleteDenyRollsBackEverything(t *testing.T) {
 	if len(repo.deletedURIs) != 0 {
 		t.Fatalf("no target may be deleted on denial, got %v", repo.deletedURIs)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("transaction must be rolled back, got %+v", repo.txs)
+	if len(repo.deletes) != 0 {
+		t.Fatalf("a denied delete must not reach the repository, got %+v", repo.deletes)
 	}
 	if len(kvs.addedSets) != 0 {
 		t.Fatalf("no removed-item advertisement may be set on denial, got %v", kvs.addedSets)
@@ -403,7 +568,7 @@ func TestCommitRangeDeleteDenyRollsBackEverything(t *testing.T) {
 }
 
 // A range that matches nothing is an error (consistent with deleting a missing
-// single key) and rolls back the commitlog.
+// single key) and records no commitlog.
 func TestCommitRangeDeleteEmptyIsNotFound(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -416,8 +581,8 @@ func TestCommitRangeDeleteEmptyIsNotFound(t *testing.T) {
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected not-found error, got %v", err)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("transaction must be rolled back, got %+v", repo.txs)
+	if len(repo.deletes) != 0 {
+		t.Fatalf("an empty range must not reach the repository, got %+v", repo.deletes)
 	}
 }
 
@@ -459,15 +624,15 @@ func TestCommitRejectsAsteriskInRecordKey(t *testing.T) {
 	if !errors.Is(err, domain.ErrValidation) {
 		t.Fatalf("expected validation error, got %v", err)
 	}
-	if repo.createRecordCalled {
-		t.Fatal("CreateRecord must not be called for a key containing '*'")
+	if len(repo.recordCommits) != 0 {
+		t.Fatal("ApplyRecord must not be called for a key containing '*'")
 	}
 }
 
 // The remote arm of a range delete recovers the concrete targets from
 // References by subtree match, sweeps each target's local reference row and
 // emits one "deleted" signal set per target. The target owner is not local,
-// so deleteRecord acts only on the rows it holds.
+// so the delete acts only on the rows this server holds.
 func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 	ccid, _ := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -484,12 +649,12 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		dest + "/" + refSegment(base+"/a"): referenceRecord(t, dest+"/"+refSegment(base+"/a"), base+"/a"),
 	}}
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &requester},
+		withEntities{repo, fixedResidenceRepo{entity: &requester}},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
-		nopSignalService{},
+		publishRecorder{delivery},
 		&denyKeysPolicyService{},
 		delivery,
 		nil,
@@ -513,9 +678,19 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		},
 	}
 
-	result, err := uc.deleteRecord(context.Background(), nil, "127.0.0.1", requester, sd, domain.CommitModeExecute)
+	result, err := uc.planDelete(context.Background(), "127.0.0.1", requester, sd, domain.CommitModeExecute)
 	if err != nil {
-		t.Fatalf("deleteRecord returned error: %v", err)
+		t.Fatalf("planDelete returned error: %v", err)
+	}
+	if status, err := result.apply(context.Background()); err != nil || status != Applied {
+		t.Fatalf("apply = %v, %v, want Applied", status, err)
+	}
+	wantRemovals := []Removal{
+		{Kind: RemoveKey, URI: dest + "/" + refSegment(base)},
+		{Kind: RemoveKey, URI: dest + "/" + refSegment(base+"/a")},
+	}
+	if len(repo.deletes) != 1 || !slices.Equal(repo.deletes[0].Removals, wantRemovals) {
+		t.Fatalf("ApplyDelete calls = %+v, want one removing the two reference rows %+v", repo.deletes, wantRemovals)
 	}
 	for _, task := range result.postProcesses {
 		if err := task(context.Background()); err != nil {
@@ -525,12 +700,8 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 
 	// one "deleted" event per target and destination (the target itself and
 	// its distribute destination), so each target shows up once per channel
-	eventURIs := []string{}
-	for _, job := range delivery.jobs {
-		if job.Event != nil && job.Event.Type == "deleted" {
-			eventURIs = append(eventURIs, job.Event.URI)
-		}
-	}
+	eventURIs := delivery.deletedEventURIs()
+	slices.Sort(eventURIs)
 	want := []string{base, base, base + "/a", base + "/a"}
 	if !slices.Equal(eventURIs, want) {
 		t.Fatalf("deleted events for %v, want %v", eventURIs, want)
@@ -538,17 +709,17 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 
 	// no matching reference at all passes through as a no-op success
 	sd.References = map[string]concrnt.SignedDocument{*unrelated.CCKV: unrelated}
-	res, err := uc.deleteRecord(context.Background(), nil, "127.0.0.1", requester, sd, domain.CommitModeExecute)
+	res, err := uc.planDelete(context.Background(), "127.0.0.1", requester, sd, domain.CommitModeExecute)
 	if err != nil {
 		t.Fatalf("expected no-op success when no reference matches the range, got %v", err)
 	}
-	if !res.noop || len(res.postProcesses) != 0 {
-		t.Fatalf("expected noop result without post processes, got %+v", res)
+	if !res.noop || res.apply != nil || len(res.postProcesses) != 0 {
+		t.Fatalf("expected a noop plan without a write or post processes, got %+v", res)
 	}
 }
 
 // refSegment derives the key segment a fixture is distributed under — the
-// hash-based CDID of its href, the same derivation deleteRecord's
+// hash-based CDID of its href, the same derivation planDeleteTargets'
 // reference-record sweep performs.
 func refSegment(href string) string {
 	return cdid.MakeHash([]byte(href)).String()
@@ -579,7 +750,7 @@ func referenceRecord(t *testing.T, refKey, href string) concrnt.SignedDocument {
 }
 
 // Deleting a record whose distribute destination lives on this same server
-// sweeps the destination's reference row in the same commit: both rows are
+// sweeps the destination's reference row in the same write: both rows are
 // deleted, the reference row's chunkline slot is advertised as removed, and
 // the fan-out re-federates the delete.
 func TestCommitDeleteSweepsLocalDistributeReference(t *testing.T) {
@@ -614,11 +785,11 @@ func TestCommitDeleteSweepsLocalDistributeReference(t *testing.T) {
 	if !slices.Equal(pol.evaled, []string{targetURI, refKey}) {
 		t.Fatalf("policy evaluated on %v, want [%s %s]", pol.evaled, targetURI, refKey)
 	}
-	if !slices.Equal(kvs.addedSets, []string{chunkline.RemovedItemsKey(dest)}) {
-		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, chunkline.RemovedItemsKey(dest))
+	if !slices.Equal(kvs.addedSets, []string{usecase.RemovedItemsKey(dest)}) {
+		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, usecase.RemovedItemsKey(dest))
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("unexpected tx state: %+v", repo.txs)
+	if len(repo.deletes) != 1 || repo.deletes[0].Commit == nil {
+		t.Fatalf("expected one ApplyDelete call carrying the commit, got %+v", repo.deletes)
 	}
 	for _, job := range delivery.jobs {
 		if job.Remote != DeliveryRemoteCommit {
@@ -629,7 +800,7 @@ func TestCommitDeleteSweepsLocalDistributeReference(t *testing.T) {
 
 // A delete arriving for a remote target sweeps the reference rows this server
 // holds for the target's distribute destinations: the row is deleted in the
-// same commit (commitlog kept), its chunkline slot is advertised as removed,
+// same write as the commitlog, its chunkline slot is advertised as removed,
 // and the delete is not re-federated.
 func TestCommitDeleteRemoteTargetSweepsLocalReference(t *testing.T) {
 	ccid, priv := newIdentity(t)
@@ -661,11 +832,11 @@ func TestCommitDeleteRemoteTargetSweepsLocalReference(t *testing.T) {
 	if !slices.Equal(pol.evaled, []string{refKey}) {
 		t.Fatalf("policy evaluated on %v, want [%s]", pol.evaled, refKey)
 	}
-	if !slices.Equal(kvs.addedSets, []string{chunkline.RemovedItemsKey(dest)}) {
-		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, chunkline.RemovedItemsKey(dest))
+	if !slices.Equal(kvs.addedSets, []string{usecase.RemovedItemsKey(dest)}) {
+		t.Fatalf("removed-item advertisements = %v, want [%s]", kvs.addedSets, usecase.RemovedItemsKey(dest))
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("commitlog must be kept for a delete that acted locally, got %+v", repo.txs)
+	if len(repo.deletes) != 1 || repo.deletes[0].Commit == nil {
+		t.Fatalf("a delete that acted locally must record its commitlog, got %+v", repo.deletes)
 	}
 	// the forwarded delete is committed like any other, under the deleted
 	// namespace's owner (CIP-4 §6.1 / CIP-3 §3.1); the swept reference row and
@@ -675,8 +846,8 @@ func TestCommitDeleteRemoteTargetSweepsLocalReference(t *testing.T) {
 		t.Fatalf("delete commit owner = %q, want the deleted namespace's owner", repo.commitLogOwners[deleteID])
 	}
 	refID, _ := (&concrnt.SignedDocument{Document: repo.stored[refKey].Document}).CDID()
-	if !slices.Equal(repo.gcFlagged, []string{refID, deleteID}) {
-		t.Fatalf("gc flagged = %v, want [%s %s]", repo.gcFlagged, refID, deleteID)
+	if flagged := repo.gcFlagged(); !slices.Equal(flagged, []string{refID, deleteID}) {
+		t.Fatalf("gc flagged = %v, want [%s %s]", flagged, refID, deleteID)
 	}
 	deletedEvents := 0
 	for _, job := range delivery.jobs {
@@ -696,9 +867,9 @@ func TestCommitDeleteRemoteTargetSweepsLocalReference(t *testing.T) {
 }
 
 // A delete that concerns neither the target key nor anything in References is
-// passed through: no error, nothing deleted, nothing signalled, and the
-// commitlog is rolled back so a later delivery carrying the targets still
-// applies.
+// passed through: no error, nothing deleted, nothing signalled, and no
+// commitlog (the repository is not called at all) so a later delivery
+// carrying the targets still applies.
 func TestCommitDeleteUnrelatedIsNoop(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -718,15 +889,15 @@ func TestCommitDeleteUnrelatedIsNoop(t *testing.T) {
 		if len(repo.deletedURIs) != 0 || len(delivery.jobs) != 0 {
 			t.Fatalf("nothing may be deleted or signalled for %s, got %v / %d jobs", target, repo.deletedURIs, len(delivery.jobs))
 		}
-		if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-			t.Fatalf("commitlog must be rolled back for %s, got %+v", target, repo.txs)
+		if len(repo.deletes) != 0 {
+			t.Fatalf("no commitlog may be recorded for %s, got %+v", target, repo.deletes)
 		}
 	}
 }
 
 // A delete for a remote target whose destinations left no rows here removes
-// nothing, so it is not recorded (CIP-4 §6.1): the tx rolls back, no
-// commitlog, no signals — a later delivery that does find rows still applies.
+// nothing, so it is not recorded (CIP-4 §6.1): the repository is not called,
+// no commitlog, no signals — a later delivery that does find rows still applies.
 func TestCommitDeleteRemoteTargetWithoutLocalCopies(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
@@ -745,8 +916,8 @@ func TestCommitDeleteRemoteTargetWithoutLocalCopies(t *testing.T) {
 	if len(repo.deletedURIs) != 0 {
 		t.Fatalf("nothing may be deleted, got %v", repo.deletedURIs)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("a delete that removed nothing must roll back, got %+v", repo.txs)
+	if len(repo.deletes) != 0 {
+		t.Fatalf("a delete that removes nothing must not be recorded, got %+v", repo.deletes)
 	}
 	if len(delivery.jobs) != 0 {
 		t.Fatalf("a delete that removed nothing must not signal, got %+v", delivery.jobs)
@@ -785,8 +956,8 @@ func TestCommitDeleteReferenceSweepDenyKeepsRow(t *testing.T) {
 	if len(kvs.addedSets) != 0 {
 		t.Fatalf("a kept row must not be advertised as removed, got %v", kvs.addedSets)
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("unexpected tx state: %+v", repo.txs)
+	if len(repo.deletes) != 1 || repo.deletes[0].Commit == nil {
+		t.Fatalf("expected one ApplyDelete call carrying the commit, got %+v", repo.deletes)
 	}
 }
 

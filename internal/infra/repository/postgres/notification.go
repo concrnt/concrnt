@@ -8,7 +8,6 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 )
 
@@ -20,7 +19,7 @@ func NewNotificationRepository(db *gorm.DB) notification.Repository {
 	return &NotificationRepository{db: db}
 }
 
-func modelToDomainNotification(m models.Subscription) domain.NotificationSubscription {
+func modelToDomainNotification(m Subscription) domain.NotificationSubscription {
 	return domain.NotificationSubscription{
 		VendorID:     m.VendorID,
 		Owner:        m.Owner,
@@ -32,23 +31,19 @@ func modelToDomainNotification(m models.Subscription) domain.NotificationSubscri
 	}
 }
 
-func domainToModelNotification(d domain.NotificationSubscription) models.Subscription {
-	return models.Subscription{
-		VendorID:     d.VendorID,
-		Owner:        d.Owner,
-		Schemas:      pq.StringArray(d.Schemas),
-		Prefixes:     pq.StringArray(d.Prefixes),
-		Subscription: d.Subscription,
-		CDate:        d.CDate,
-		MDate:        d.MDate,
-	}
-}
-
 func (r *NotificationRepository) Subscribe(ctx context.Context, subscription domain.NotificationSubscription) (domain.NotificationSubscription, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()
 
-	model := domainToModelNotification(subscription)
+	model := Subscription{
+		VendorID:     subscription.VendorID,
+		Owner:        subscription.Owner,
+		Schemas:      pq.StringArray(subscription.Schemas),
+		Prefixes:     pq.StringArray(subscription.Prefixes),
+		Subscription: subscription.Subscription,
+		CDate:        subscription.CDate,
+		MDate:        subscription.MDate,
+	}
 	if err := r.db.WithContext(ctx).Save(&model).Error; err != nil {
 		span.RecordError(err)
 		return domain.NotificationSubscription{}, err
@@ -61,7 +56,7 @@ func (r *NotificationRepository) List(ctx context.Context) ([]domain.Notificatio
 	ctx, span := tracer.Start(ctx, "Repository.Notification.List")
 	defer span.End()
 
-	var models []models.Subscription
+	var models []Subscription
 	if err := r.db.WithContext(ctx).Find(&models).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -78,7 +73,7 @@ func (r *NotificationRepository) Get(ctx context.Context, vendorID, owner string
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Get")
 	defer span.End()
 
-	var model models.Subscription
+	var model Subscription
 	err := r.db.WithContext(ctx).
 		Where("vendor_id = ? AND owner = ?", vendorID, owner).
 		Take(&model).Error
@@ -99,7 +94,7 @@ func (r *NotificationRepository) Delete(ctx context.Context, vendorID, owner str
 
 	if err := r.db.WithContext(ctx).
 		Where("vendor_id = ? AND owner = ?", vendorID, owner).
-		Delete(&models.Subscription{}).Error; err != nil {
+		Delete(&Subscription{}).Error; err != nil {
 		span.RecordError(err)
 		return err
 	}

@@ -6,7 +6,6 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 )
 
@@ -22,7 +21,7 @@ func (r *AbuseRepository) CreateAbuseReport(ctx context.Context, report *concrnt
 	ctx, span := tracer.Start(ctx, "AbuseRepository.CreateAbuseReport")
 	defer span.End()
 
-	abuseReport := &models.AbuseReport{
+	abuseReport := &AbuseReport{
 		IP:        reposterIP,
 		Reporter:  reporter,
 		TargetURI: report.TargetURI,

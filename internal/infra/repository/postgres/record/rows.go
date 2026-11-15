@@ -1,46 +1,81 @@
 package record
 
 import (
-	"encoding/json"
+	"time"
 
-	"go.opentelemetry.io/otel/trace"
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// recordKeysToQueryRows converts preloaded record keys into query rows
-// carrying the created_at sort key the query ordered by. A placeholder key
-// (record_id NULL, reachable only through QueryByParentOrderByKey's LEFT
-// JOIN) becomes a key-only row holding just its cckv (CIP-5 §3.2.1).
-func recordKeysToQueryRows(rks []models.RecordKey, span trace.Span) ([]ucrecord.QueryRow, error) {
-	rows := make([]ucrecord.QueryRow, 0, len(rks))
-	for _, rk := range rks {
-		if rk.RecordID == nil {
-			rows = append(rows, ucrecord.QueryRow{Row: concrnt.SignedDocument{CCKV: &rk.URI}})
+// recordRow is one record key joined with its record and commit log in a
+// single statement (no Preload round trips). The record and commit columns
+// are NULL on a placeholder key, which only the LEFT JOIN listing returns.
+type recordRow struct {
+	URI       string
+	RecordID  *string
+	Owner     *string
+	CreatedAt *time.Time
+	Document  *string
+	Proof     *string
+}
+
+const recordRowSelect = "record_keys.uri AS uri, record_keys.record_id AS record_id, r.owner AS owner, r.created_at AS created_at, c.document AS document, c.proof AS proof"
+
+// joinRecords joins records (r) and commit_logs (c) onto a record_keys
+// query; left keeps placeholder keys.
+func joinRecords(query *gorm.DB, left bool) *gorm.DB {
+	join := "JOIN"
+	if left {
+		join = "LEFT JOIN"
+	}
+	return query.
+		Joins(join + " records r ON r.document_id = record_keys.record_id").
+		Joins(join + " commit_logs c ON c.id = record_keys.record_id")
+}
+
+func scanRecordRows(query *gorm.DB) ([]recordRow, error) {
+	var rows []recordRow
+	if err := query.Select(recordRowSelect).Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// signedDocument builds the signed document of a row holding a record.
+func (row recordRow) signedDocument() (concrnt.SignedDocument, error) {
+	return repoutil.RecordDocument(row.URI, deref(row.Owner), *row.RecordID, deref(row.Document), deref(row.Proof))
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+// queryRows converts joined rows into query rows carrying the created_at
+// sort key. A placeholder key (record_id NULL) becomes a key-only row
+// holding just its cckv (CIP-5 §3.2.1).
+func queryRows(rows []recordRow) ([]ucrecord.QueryRow, error) {
+	out := make([]ucrecord.QueryRow, 0, len(rows))
+	for _, row := range rows {
+		if row.RecordID == nil {
+			uri := row.URI
+			out = append(out, ucrecord.QueryRow{Row: concrnt.SignedDocument{CCKV: &uri}})
 			continue
 		}
-
-		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
+		sd, err := row.signedDocument()
 		if err != nil {
-			span.RecordError(err)
 			return nil, err
 		}
-
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
-
-		rows = append(rows, ucrecord.QueryRow{
-			Row: concrnt.SignedDocument{
-				CCKV:     &rk.URI,
-				CCFS:     &ccfs,
-				Document: rk.Record.Document.Document,
-				Proof:    proof,
-			},
-			CreatedAt: rk.Record.CreatedAt,
-		})
+		var createdAt time.Time
+		if row.CreatedAt != nil {
+			createdAt = *row.CreatedAt
+		}
+		out = append(out, ucrecord.QueryRow{Row: sd, CreatedAt: createdAt})
 	}
-
-	return rows, nil
+	return out, nil
 }

@@ -19,14 +19,9 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// committedRecordRepo answers HasCommitLog true for every id, so Commit
-// returns before verification: the handler can be driven with unsigned lines.
-type committedRecordRepo struct{ record.Repository }
-
-func (committedRecordRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return true, nil
-}
-
+// repositoryImportLine is a well-formed line whose none proof Commit rejects
+// before it reaches any dependency, so the handler can be driven with a nil
+// repository: every parsed line ends as one commit failure in the response.
 func repositoryImportLine(t *testing.T) string {
 	t.Helper()
 	docBytes, err := json.Marshal(concrnt.Document[any]{Kind: "record", CreatedAt: time.Now()})
@@ -36,11 +31,23 @@ func repositoryImportLine(t *testing.T) string {
 	return string(line)
 }
 
+// requireImportFailures checks that every one of n lines was processed and
+// reported as a commit failure.
+func requireImportFailures(t *testing.T, rec *httptest.ResponseRecorder, n int) {
+	t.Helper()
+	var results []record.ImportResult
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &results))
+	require.Len(t, results, n)
+	for _, r := range results {
+		require.True(t, strings.HasPrefix(r.Error, "failed to commit document"), "unexpected error text: %s", r.Error)
+	}
+}
+
 func newRepositoryTestHandler() *Handler {
 	cfg := domain.Config{FQDN: "example.com", CSID: "ccs1test"}
 	return &Handler{
 		config: cfg,
-		record: record.New(committedRecordRepo{}, nil, nil, &cfg, nil, nil, nil, nil, nil),
+		record: record.New(nil, nil, nil, &cfg, nil, nil, nil, nil, nil),
 	}
 }
 
@@ -68,7 +75,7 @@ func TestImportRepositoryRequiresAuthentication(t *testing.T) {
 		ctx := context.WithValue(context.Background(), interop.RequesterCtxKey, domain.Entity{ID: "con1user"})
 		rec := call(t, ctx, strings.NewReader(repositoryImportLine(t)+"\n"))
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		require.JSONEq(t, "[]", strings.TrimSpace(rec.Body.String()))
+		requireImportFailures(t, rec, 1)
 	})
 
 	t.Run("service account", func(t *testing.T) {
@@ -102,7 +109,7 @@ func TestImportRepositoryBodyLimits(t *testing.T) {
 		line := repositoryImportLine(t) + "\n"
 		rec := call(t, strings.NewReader(strings.Repeat(line, 5000)))
 		require.Equal(t, http.StatusOK, rec.Code, "body: %s", rec.Body.String())
-		require.JSONEq(t, "[]", strings.TrimSpace(rec.Body.String()))
+		requireImportFailures(t, rec, 5000)
 	})
 
 	t.Run("over-long line", func(t *testing.T) {
