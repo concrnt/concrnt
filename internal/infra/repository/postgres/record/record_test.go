@@ -1246,6 +1246,44 @@ func TestRecordQueryByParentOrderByKey(t *testing.T) {
 		require.Empty(t, rows, "a sibling owner sharing the prefix must not match")
 	})
 
+	// "B" < "a" < "a-b" < "a_b", whatever the database collation does with
+	// case and punctuation
+	t.Run("key order is byte order", func(t *testing.T) {
+		parent := root + "/bytes"
+		for i, key := range []string{parent + "/a_b", parent + "/B", parent + "/a-b", parent + "/a"} {
+			id := fmt.Sprintf("byteorder-%d", i)
+			sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
+				Kind:      "record",
+				Key:       key,
+				Value:     map[string]string{"body": key},
+				Author:    owner,
+				Schema:    "https://schema.example/item.json",
+				CreatedAt: createdAt,
+			})
+			withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, owner, func(tx ucrecord.RepositoryTx) error {
+				_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
+				return err
+			})
+		}
+
+		rows, err := repo.QueryByParentOrderByKey(ctx, parent, "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows))
+
+		since := parent + "/a"
+		rows, err = repo.QueryByParentOrderByKey(ctx, parent, "", "", &since, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows), "the since bound is a byte-order bound too")
+
+		sds, err := repo.QueryRecordSubtree(ctx, parent, false)
+		require.NoError(t, err)
+		uris := make([]string, 0, len(sds))
+		for _, sd := range sds {
+			uris = append(uris, *sd.CCKV)
+		}
+		require.Equal(t, []string{parent + "/B", parent + "/a", parent + "/a-b", parent + "/a_b"}, uris)
+	})
+
 	t.Run("createdAt ordering also accepts the owner root", func(t *testing.T) {
 		rows, err := repo.QueryByParent(ctx, root, "", "", nil, nil, 0, "asc")
 		require.NoError(t, err)

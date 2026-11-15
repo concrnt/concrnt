@@ -93,6 +93,10 @@ type migration struct {
 
 var migrations = []migration{
 	{1, "baseline_tables", autoMigrateTables},
+	// AutoMigrate does not rebuild an existing index whose collation changed
+	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
+		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
+	}},
 }
 
 // Not a numbered step alone: AutoMigrate only adds, so it also runs at every

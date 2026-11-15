@@ -86,7 +86,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	}
 
 	var rks []models.RecordKey
-	if err := query.Order("uri ASC").Select(recordKeySelect).Find(&rks).Error; err != nil {
+	if err := query.Order(`uri COLLATE "C" ASC`).Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -214,17 +214,19 @@ func (r *Repository) QueryByParentOrderByKey(
 	if author != "" {
 		query = query.Where("r.author = ?", author)
 	}
+	// not the database's default collation: it orders keys differently
+	// from server to server (CIP-5 orderby=key must not)
 	if since != nil {
-		query = query.Where("record_keys.uri >= ?", *since)
+		query = query.Where(`record_keys.uri COLLATE "C" >= ?`, *since)
 	}
 	if until != nil {
-		query = query.Where("record_keys.uri <= ?", *until)
+		query = query.Where(`record_keys.uri COLLATE "C" <= ?`, *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("record_keys.uri DESC")
+		query = query.Order(`record_keys.uri COLLATE "C" DESC`)
 	} else {
-		query = query.Order("record_keys.uri ASC")
+		query = query.Order(`record_keys.uri COLLATE "C" ASC`)
 	}
 
 	if limit > 0 {
