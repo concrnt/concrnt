@@ -83,7 +83,7 @@ func (r *Repository) GetAssociatedRecords(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.Association{}).
-		Preload("Document").
+		Joins("Document").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI)
 
