@@ -47,13 +47,15 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if alreadyCommitted {
-		return &sd, nil
+	if doc.Kind == "delete" {
+		alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		if alreadyCommitted {
+			return &sd, nil
+		}
 	}
 
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
@@ -284,6 +286,7 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 
 		if status == Duplicate {
+			// a redelivery: the commit is in the log already and nothing changed
 			return &sd, nil
 		}
 

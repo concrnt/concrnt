@@ -142,12 +142,13 @@ func (r *recordingRecordRepo) apply(commit Commit, applied bool) ApplyStatus {
 	return Applied
 }
 func (r *recordingRecordRepo) ApplyEntity(ctx context.Context, commit EntityCommit) (ApplyStatus, error) {
-	r.createEntityCalled = true
-	return r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt)), nil
+	status := r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt))
+	r.createEntityCalled = status != Duplicate
+	return status, nil
 }
 func (r *recordingRecordRepo) ApplyRecord(ctx context.Context, commit RecordCommit) (RecordOutcome, error) {
-	r.createRecordCalled = true
 	status := r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt))
+	r.createRecordCalled = status != Duplicate
 	if status != Applied {
 		return RecordOutcome{Status: status}, nil
 	}
