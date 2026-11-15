@@ -95,6 +95,7 @@ func (r *Repository) CreateRecord(
 		ParentID:        pid,
 		RecordID:        &documentID,
 		RecordCreatedAt: &createdAt,
+		Redirect:        redirect,
 		CleanOnUpdate:   cleanOnUpdate,
 	}
 
@@ -105,7 +106,7 @@ func (r *Repository) CreateRecord(
 	// writes to parent placeholder rows (RecordID nil) working.
 	result := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "clean_on_update": cleanOnUpdate}),
+		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "redirect": redirect, "clean_on_update": cleanOnUpdate}),
 		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
 	}).Create(&rk)
 	if result.Error != nil {

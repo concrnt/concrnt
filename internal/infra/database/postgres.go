@@ -97,6 +97,18 @@ var migrations = []migration{
 	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
 		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
 	}},
+	{4, "record_keys_redirect", func(tx *gorm.DB) error {
+		for _, stmt := range []string{
+			`ALTER TABLE record_keys ADD COLUMN IF NOT EXISTS redirect text`,
+			`UPDATE record_keys rk SET redirect = r.redirect FROM records r WHERE rk.record_id = r.document_id AND r.redirect IS NOT NULL AND rk.redirect IS NULL`,
+			`UPDATE record_keys rk SET record_created_at = r.created_at FROM records r WHERE rk.record_id = r.document_id AND rk.record_created_at IS NULL`,
+		} {
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
 }
 
 // Not a numbered step alone: AutoMigrate only adds, so it also runs at every
