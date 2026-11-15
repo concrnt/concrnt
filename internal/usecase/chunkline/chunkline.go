@@ -9,15 +9,6 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase"
 )
 
-// RemovedItemsTTL bounds how long a timeline advertises a removed item;
-// mirrors v1's 2-day retracted window. Readers only use the list to filter
-// already-cached chunks, so entries outliving their usefulness are harmless.
-const RemovedItemsTTL = 48 * time.Hour
-
-// RemovedItemsKey namespaces the KVS set of item IDs recently removed from a
-// timeline, written by record on delete and served via /chunkline/removed.
-func RemovedItemsKey(timeline string) string { return "removed:" + timeline }
-
 type Usecase struct {
 	repo     Repository
 	gateway  Gateway
@@ -79,7 +70,7 @@ func (uc *Usecase) GetLocalRemovedItems(ctx context.Context, uri string) ([]stri
 	if uc.kvs == nil {
 		return []string{}, nil
 	}
-	items, err := uc.kvs.SetMembers(ctx, RemovedItemsKey(uri))
+	items, err := uc.kvs.SetMembers(ctx, usecase.RemovedItemsKey(uri))
 	if err != nil {
 		return nil, err
 	}
