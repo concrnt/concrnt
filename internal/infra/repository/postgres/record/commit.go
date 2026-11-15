@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -179,4 +180,57 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	}
 
 	return rows, nil
+}
+
+func (r *Repository) CountGcCandidates(ctx context.Context, cutoffID string) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).
+		Model(&models.CommitLog{}).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Count(&count).Error
+	return count, err
+}
+
+func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]ucrecord.CommitLogEntry, error) {
+	q := r.db.WithContext(ctx).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Order("id ASC").
+		Limit(limit)
+	if afterID != "" {
+		q = q.Where("id > ?", afterID)
+	}
+	var logs []models.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return commitLogEntries(logs)
+}
+
+func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res := r.db.WithContext(ctx).Where("id IN ?", ids).Delete(&models.CommitLog{})
+	return int(res.RowsAffected), res.Error
+}
+
+func commitLogEntries(logs []models.CommitLog) ([]ucrecord.CommitLogEntry, error) {
+	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
+	for _, cl := range logs {
+		var proof concrnt.Proof
+		if cl.Proof != "" {
+			if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
+			}
+		}
+		entries = append(entries, ucrecord.CommitLogEntry{
+			ID:       cl.ID,
+			IP:       cl.IP,
+			Document: cl.Document,
+			Proof:    proof,
+			Owner:    cl.Owner,
+			CDate:    cl.CDate,
+		})
+	}
+	return entries, nil
 }

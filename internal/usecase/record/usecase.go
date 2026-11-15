@@ -74,6 +74,11 @@ type Repository interface {
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
 
+	// Offline tooling (conctl gc-commitlog)
+	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
+	ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]CommitLogEntry, error)
+	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
+
 	// Entities
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
 	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
@@ -83,6 +88,16 @@ type Repository interface {
 	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
 	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
 	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
+}
+
+// CommitLogEntry is one commit log row as offline tooling sees it.
+type CommitLogEntry struct {
+	ID       string
+	IP       string
+	Document string
+	Proof    concrnt.Proof
+	Owner    string
+	CDate    time.Time
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
