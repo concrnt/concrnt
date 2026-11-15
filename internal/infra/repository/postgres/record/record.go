@@ -89,6 +89,7 @@ func createRecord(ctx context.Context, db *gorm.DB, commit ucrecord.RecordCommit
 	err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", commit.Key).
 		Take(&oldRecordKey).Error
+	keyExisted := err == nil
 	if err != nil && err != gorm.ErrRecordNotFound {
 		span.RecordError(err)
 		return ucrecord.RecordOutcome{}, err
@@ -129,31 +130,34 @@ func createRecord(ctx context.Context, db *gorm.DB, commit ucrecord.RecordCommit
 	cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
 
 	// RecordKeyを作る
-	rk := models.RecordKey{
-		URI:             commit.Key,
-		ParentID:        pid,
-		RecordID:        &commit.ID,
-		RecordCreatedAt: &commit.CreatedAt,
-		Redirect:        commit.Redirect,
-		CleanOnUpdate:   cleanOnUpdate,
-	}
-
 	// The FOR UPDATE fast-path above cannot lock a RecordKey row that does not
 	// exist yet, so two concurrent commits to a fresh key both pass it. The
 	// conditional upsert closes that window the same way CreateEntity does:
 	// only a strictly newer document may take the key. IS NULL keeps normal
 	// writes to parent placeholder rows (RecordID nil) working.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{"record_id": commit.ID, "parent_id": pid, "record_created_at": commit.CreatedAt, "redirect": commit.Redirect, "clean_on_update": cleanOnUpdate}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
-	}).Create(&rk)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return ucrecord.RecordOutcome{}, result.Error
+	// Not gorm's Create: it cannot return xmax, which tells an insert from
+	// an update of a row that appeared after the read.
+	var upserted []struct{ Inserted bool }
+	err = db.Raw(`INSERT INTO record_keys (uri, parent_id, record_id, record_created_at, redirect, clean_on_update)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (uri) DO UPDATE SET record_id = excluded.record_id, parent_id = excluded.parent_id,
+			record_created_at = excluded.record_created_at, redirect = excluded.redirect, clean_on_update = excluded.clean_on_update
+		WHERE record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at
+		RETURNING (xmax = 0) AS inserted`,
+		commit.Key, pid, commit.ID, commit.CreatedAt, commit.Redirect, cleanOnUpdate).
+		Scan(&upserted).Error
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.RecordOutcome{}, err
 	}
-	if result.RowsAffected == 0 {
+	if len(upserted) == 0 {
 		return ucrecord.RecordOutcome{Status: ucrecord.Stale}, nil
+	}
+	if !keyExisted && !upserted[0].Inserted {
+		// a concurrent commit created the key between the read and the
+		// upsert: what this write replaced is unknown, so start over
+		// with the row there to lock
+		return ucrecord.RecordOutcome{}, errRetryTx
 	}
 
 	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す

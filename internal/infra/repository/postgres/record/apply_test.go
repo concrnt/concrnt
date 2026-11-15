@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
@@ -148,4 +149,54 @@ func TestApplyAssociation(t *testing.T) {
 	rows, err := repo.GetAssociatedRecords(ctx, target, "", "", "", nil, nil, 10, "desc")
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
+}
+
+// A record that waited for a concurrent commit creating the same key
+// reports that commit's document as the one it replaced.
+func TestApplyRecordReportsVersionCreatedConcurrently(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := &Repository{db: db}
+
+	owner := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+	key := "cckv://" + owner + "/posts/race"
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	record := func(id string, createdAt time.Time) ucrecord.RecordCommit {
+		return ucrecord.RecordCommit{Commit: testCommit(id, owner), Key: key, Author: owner, CreatedAt: createdAt}
+	}
+
+	created := make(chan struct{})
+	release := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		_, err := repo.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+			if _, err := insertCommit(tx, testCommit("race-old", owner)); err != nil {
+				return ucrecord.Applied, err
+			}
+			outcome, err := createRecord(ctx, tx, record("race-old", at))
+			close(created)
+			<-release
+			return outcome.Status, err
+		})
+		first <- err
+	}()
+	<-created
+
+	second := make(chan ucrecord.RecordOutcome, 1)
+	go func() {
+		outcome, err := repo.ApplyRecord(ctx, record("race-new", at.Add(time.Hour)))
+		if err != nil {
+			t.Error(err)
+		}
+		second <- outcome
+	}()
+
+	// let the newer commit reach the unique-index wait, then land the older one
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	require.NoError(t, <-first)
+
+	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Applied, PreviousID: "race-old"}, <-second)
 }
