@@ -3,8 +3,11 @@ package record
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
@@ -16,46 +19,65 @@ var tracer = otel.Tracer("repository")
 
 type Repository struct {
 	db *gorm.DB
+	// txSlots bounds the Apply* transactions open at once, nil when the
+	// pool is unbounded. A transaction keeps its connection for several
+	// round trips and a read for one, and the pool gives a freed
+	// connection to any waiter: without the bound a burst of commits
+	// takes every connection and each read waits among them.
+	txSlots chan struct{}
 }
 
 type recordTx struct {
-	tx   *gorm.DB
-	done bool // slot released (Commit or Rollback ran)
+	tx    *gorm.DB
+	slots chan struct{}
+	done  bool // slot released (Commit or Rollback ran)
 }
-
-// MaxConcurrentTx caps the transactions one process runs at once. A
-// transaction pins one pooled connection and the reads issued inside it go
-// through r.db, i.e. a second connection of the same pool; with
-// MaxConcurrentTx >= pool size every transaction can be left waiting for a
-// connection another transaction holds. Half the pool (database.MaxOpenConns)
-// keeps one free connection per transaction.
-const MaxConcurrentTx = 8
-
-var txSlots = make(chan struct{}, MaxConcurrentTx)
 
 func (tx *recordTx) release() {
 	if !tx.done {
 		tx.done = true
-		<-txSlots
+		if tx.slots != nil {
+			<-tx.slots
+		}
 	}
 }
 
+// New builds the repository over db. Half of a bounded pool is the most
+// its transactions take at once; the rest stays with the reads.
 func New(db *gorm.DB) ucrecord.Repository {
-	return &Repository{db: db}
+	r := &Repository{db: db}
+	if sqlDB, err := db.DB(); err == nil {
+		if maxOpen := sqlDB.Stats().MaxOpenConnections; maxOpen > 1 {
+			r.txSlots = make(chan struct{}, maxOpen/2)
+		}
+	}
+	return r
 }
 
+var txSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
+	Namespace: "concrnt",
+	Subsystem: "record",
+	Name:      "tx_slot_wait_seconds",
+	Help:      "Time an Apply* transaction waited for one of the transaction slots (half the connection pool).",
+	Buckets:   []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+})
+
 func (r *Repository) BeginTx(ctx context.Context) (ucrecord.RepositoryTx, error) {
-	select {
-	case txSlots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	if r.txSlots != nil {
+		select {
+		case r.txSlots <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	tx := r.db.WithContext(ctx).Begin()
 	if tx.Error != nil {
-		<-txSlots
+		if r.txSlots != nil {
+			<-r.txSlots
+		}
 		return nil, tx.Error
 	}
-	return &recordTx{tx: tx}, nil
+	return &recordTx{tx: tx, slots: r.txSlots}, nil
 }
 
 func (tx *recordTx) Commit(ctx context.Context) error {
@@ -88,11 +110,16 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 	}
 	status := ucrecord.Applied
 	err := repoutil.RetryTx(ctx, retryable, func() error {
-		select {
-		case txSlots <- struct{}{}:
-			defer func() { <-txSlots }()
-		case <-ctx.Done():
-			return ctx.Err()
+		// the wait for a slot holds no connection
+		if r.txSlots != nil {
+			start := time.Now()
+			select {
+			case r.txSlots <- struct{}{}:
+				txSlotWait.Observe(time.Since(start).Seconds())
+				defer func() { <-r.txSlots }()
+			case <-ctx.Done():
+				return ctx.Err()
+			}
 		}
 		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			var err error

@@ -56,7 +56,7 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	// A transaction holds one connection while the reads issued inside it
 	// (through the repository's plain db handle) take another one from this
 	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (postgres.MaxConcurrentTx); otherwise that many
+	// allowed at once (half of it, see the record repository); otherwise that many
 	// concurrent commits block each other until their context expires.
 	sqlDB.SetMaxOpenConns(MaxOpenConns)
 	sqlDB.SetMaxIdleConns(MaxOpenConns)
