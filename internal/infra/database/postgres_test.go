@@ -28,6 +28,20 @@ func TestMigratePostgresIsIdempotent(t *testing.T) {
 		require.True(t, db.Migrator().HasTable(model), "table for %T must exist after migration", model)
 	}
 
+	type migrationRow struct {
+		Version int
+		Name    string
+	}
+	var rows []migrationRow
+	require.NoError(t, db.Raw("SELECT version, name FROM schema_migrations ORDER BY version").Scan(&rows).Error)
+	require.NotEmpty(t, rows)
+
+	// a second run finds every step recorded and applies nothing
+	require.NoError(t, database.MigratePostgres(db))
+	var again []migrationRow
+	require.NoError(t, db.Raw("SELECT version, name FROM schema_migrations ORDER BY version").Scan(&again).Error)
+	require.Equal(t, rows, again)
+
 	// Index names are unique per schema in Postgres, and gorm's HasIndex check
 	// is satisfied by a same-named index on another table — so an index a
 	// model shares by name with another model is silently never created. The

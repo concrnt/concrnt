@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -82,29 +83,75 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	return db, nil
 }
 
+// A schema change is a new step, never an edit of an applied one: a step
+// runs once per database.
+type migration struct {
+	Version int
+	Name    string
+	Up      func(tx *gorm.DB) error
+}
+
+var migrations = []migration{
+	{1, "baseline_tables", autoMigrateTables},
+}
+
+// Not a numbered step alone: AutoMigrate only adds, so it also runs at every
+// start and a new column or index needs nothing but its tag. Changing an
+// existing index needs a step that drops it by name first.
+func autoMigrateTables(db *gorm.DB) error {
+	return db.AutoMigrate(
+		&models.CommitLog{},
+		&models.Record{},
+		&models.RecordKey{},
+		&models.Association{},
+		&models.Ack{},
+		&models.Acked{},
+		&models.Server{},
+		&models.Entity{},
+		&models.EntityMeta{},
+		&models.Subscription{},
+		&models.AbuseReport{},
+	)
+}
+
 // migrationLockID serializes AutoMigrate across replicas starting simultaneously.
 const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
 
+// Not a session-level advisory lock around the steps: without a transaction
+// a failed step would leave the database half migrated.
 func MigratePostgres(db *gorm.DB) error {
-	// session-level advisory lock must be taken and released on the same connection
-	return db.Connection(func(conn *gorm.DB) error {
-		if err := conn.Exec("SELECT pg_advisory_lock(?)", migrationLockID).Error; err != nil {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLockID).Error; err != nil {
 			return err
 		}
-		defer conn.Exec("SELECT pg_advisory_unlock(?)", migrationLockID)
+		if err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version integer PRIMARY KEY,
+			name text NOT NULL,
+			applied_at timestamp with time zone NOT NULL DEFAULT now()
+		)`).Error; err != nil {
+			return err
+		}
 
-		return conn.AutoMigrate(
-			&models.CommitLog{},
-			&models.Record{},
-			&models.RecordKey{},
-			&models.Association{},
-			&models.Ack{},
-			&models.Acked{},
-			&models.Server{},
-			&models.Entity{},
-			&models.EntityMeta{},
-			&models.Subscription{},
-			&models.AbuseReport{},
-		)
+		var versions []int
+		if err := tx.Raw("SELECT version FROM schema_migrations").Scan(&versions).Error; err != nil {
+			return err
+		}
+		applied := make(map[int]bool, len(versions))
+		for _, v := range versions {
+			applied[v] = true
+		}
+
+		for _, m := range migrations {
+			if applied[m.Version] {
+				continue
+			}
+			if err := m.Up(tx); err != nil {
+				return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
+			}
+			if err := tx.Exec("INSERT INTO schema_migrations (version, name) VALUES (?, ?)", m.Version, m.Name).Error; err != nil {
+				return err
+			}
+		}
+		return autoMigrateTables(tx)
 	})
 }
