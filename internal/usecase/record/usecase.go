@@ -65,8 +65,6 @@ type Repository interface {
 	// that c_date. owner "" means no owner filter.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 
-	GetDistributions(ctx context.Context, uri string) ([]string, error)
-
 	// Delete
 	// MarkCommitLogGcCandidate flags a commit log for `conctl op gc-commitlog`
 	// once the backdate window has passed (CIP-3 §3.4 replay guard).
