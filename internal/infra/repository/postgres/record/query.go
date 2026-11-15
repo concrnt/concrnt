@@ -27,7 +27,7 @@ func (r *Repository) QueryByPrefix(
 		Model(&models.RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id").
 		Joins("JOIN commit_logs c ON c.id = record_keys.record_id").
-		Where("uri LIKE ?", prefix+"%")
+		Where(`uri LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
