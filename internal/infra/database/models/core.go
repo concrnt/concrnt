@@ -38,6 +38,9 @@ type CommitLog struct {
 //     postgres.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument, ChunklineRepository.GetChunklineManifest/LookupLocalItrs,
 //     and association target lookups.
+//   - idx_record_keys_uri_c (uri COLLATE "C"): prefix scans, which the unique
+//     index cannot serve under the database's default collation; used by
+//     postgres.RecordRepository.QueryByPrefix and QueryRecordSubtree.
 //   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup
 //     and record joins; used by postgres.RecordRepository.GetSignedDocument and
 //     GetHierarchicalRecordPolicies.
@@ -54,7 +57,7 @@ type CommitLog struct {
 type RecordKey struct {
 	ID              int64      `json:"id" gorm:"primaryKey;autoIncrement"`
 	ParentID        *int64     `json:"parentID" gorm:"index:idx_record_keys_parent_id_record_id,priority:1;index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
-	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\""`
+	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2,collate:\"C\";index:idx_record_keys_uri_c,collate:\"C\""`
 	RecordID        *string    `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_id_record_id,priority:2;index:idx_record_keys_parent_created_at_record_id,priority:3,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL"`
 	Record          Record     `json:"record" gorm:"foreignKey:RecordID;references:DocumentID;constraint:OnDelete:CASCADE;"`
 	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone;index:idx_record_keys_parent_created_at_record_id,priority:2,sort:desc,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL"`

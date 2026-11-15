@@ -27,7 +27,7 @@ func (r *Repository) QueryByPrefix(
 		Model(&models.RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id").
 		Joins("JOIN commit_logs c ON c.id = record_keys.record_id").
-		Where(`uri LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
+		Where(`record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
@@ -80,9 +80,13 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		// not the disjunction alone: it hides the LIKE prefix from the planner,
+		// which then walks the whole index. base and base/... both sort in
+		// [base, base+"0") ('/' < '0')
+		query = query.Where(`record_keys.uri COLLATE "C" >= ? AND record_keys.uri COLLATE "C" < ? AND (uri = ? OR record_keys.uri COLLATE "C" LIKE ? ESCAPE '\')`,
+			base, base+"0", base, subtreePattern)
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where(`record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, subtreePattern)
 	}
 
 	var rks []models.RecordKey
@@ -139,7 +143,7 @@ func (r *Repository) QueryByParent(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
@@ -203,7 +207,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
