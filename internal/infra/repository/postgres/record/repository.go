@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -70,23 +72,36 @@ func (tx *recordTx) Rollback(ctx context.Context) error {
 // Duplicate: neither leaves a trace, not even the commit log entry.
 var errNotStored = errors.New("not stored")
 
-// apply runs fn as one transaction and returns its status. Anything but
-// Applied rolls the transaction back.
+// errRetryTx restarts a transaction whose view of a row was overtaken by a
+// concurrent writer before it could lock it.
+var errRetryTx = errors.New("retry transaction")
+
+// apply runs fn as one transaction and returns its status. fn is re-run
+// from scratch on serialization_failure / deadlock_detected (the two
+// outcomes Postgres asks the client to retry) and on errRetryTx, so it must
+// reset whatever it reports through captured variables at its start.
+// Anything but Applied rolls the transaction back.
 func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.ApplyStatus, error)) (ucrecord.ApplyStatus, error) {
-	select {
-	case txSlots <- struct{}{}:
-		defer func() { <-txSlots }()
-	case <-ctx.Done():
-		return ucrecord.Applied, ctx.Err()
+	retryable := func(err error) bool {
+		var pgErr *pgconn.PgError
+		return errors.Is(err, errRetryTx) || (errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01"))
 	}
 	status := ucrecord.Applied
-	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		var err error
-		status, err = fn(tx)
-		if err == nil && status != ucrecord.Applied {
-			return errNotStored
+	err := repoutil.RetryTx(ctx, retryable, func() error {
+		select {
+		case txSlots <- struct{}{}:
+			defer func() { <-txSlots }()
+		case <-ctx.Done():
+			return ctx.Err()
 		}
-		return err
+		return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			var err error
+			status, err = fn(tx)
+			if err == nil && status != ucrecord.Applied {
+				return errNotStored
+			}
+			return err
+		})
 	})
 	if errors.Is(err, errNotStored) {
 		return status, nil
