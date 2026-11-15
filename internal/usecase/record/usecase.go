@@ -8,6 +8,7 @@ import (
 	"github.com/patrickmn/go-cache"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -77,6 +78,11 @@ type Repository interface {
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
 	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
 	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
+
+	// Chunkline views over record keys
+	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
+	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
+	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key

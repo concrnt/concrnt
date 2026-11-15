@@ -7,20 +7,14 @@ import (
 
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 type Usecase struct {
-	repo     Repository
+	repo     record.Repository
 	gateway  Gateway
 	kvs      usecase.KVS
 	resolver URIResolver
-}
-
-// Repository defines storage operations for chunkline timelines.
-type Repository interface {
-	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
-	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
-	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 
 // Gateway encapsulates external timeline resolution.
@@ -35,7 +29,7 @@ type URIResolver interface {
 	CanonicalizeURI(ctx context.Context, uri string) (string, error)
 }
 
-func New(repo Repository, gateway Gateway, kvs usecase.KVS, resolver URIResolver) *Usecase {
+func New(repo record.Repository, gateway Gateway, kvs usecase.KVS, resolver URIResolver) *Usecase {
 	return &Usecase{
 		repo:     repo,
 		gateway:  gateway,

@@ -6,8 +6,6 @@ import (
 	"net/url"
 	"time"
 
-	"gorm.io/gorm"
-
 	"github.com/concrnt/concrnt/chunkline"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
@@ -17,15 +15,7 @@ const (
 	defaultChunkSize = 32
 )
 
-type ChunklineRepository struct {
-	db *gorm.DB
-}
-
-func NewChunklineRepository(db *gorm.DB) *ChunklineRepository {
-	return &ChunklineRepository{db: db}
-}
-
-func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
@@ -70,7 +60,7 @@ func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri stri
 	}, nil
 }
 
-func (r *ChunklineRepository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
+func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
@@ -112,7 +102,7 @@ func (r *ChunklineRepository) LookupLocalItrs(ctx context.Context, uris []string
 	return lookup, nil
 }
 
-func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
+func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 

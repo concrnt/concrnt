@@ -270,7 +270,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
-		chunklineRepo := NewChunklineRepository(db)
+		chunklineRepo := New(db)
 
 		// plain record: item ID is the record key URI
 		timeline, itemID, err := repo.GetTimelineRemoval(ctx, key)

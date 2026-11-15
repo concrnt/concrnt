@@ -19,7 +19,7 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 
 	ctx := context.Background()
 	recordRepo := New(db)
-	chunklineRepo := NewChunklineRepository(db)
+	chunklineRepo := New(db)
 
 	parentURI := "cckv://con1owner/timeline"
 	createdAt10 := time.Unix(10*600+10, 0).UTC()
@@ -61,7 +61,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 
 	ctx := context.Background()
 	recordRepo := New(db)
-	chunklineRepo := NewChunklineRepository(db)
+	chunklineRepo := New(db)
 
 	parentURI := "cckv://con2owner/timeline"
 
@@ -100,7 +100,7 @@ func TestChunklineChunkBoundaryIsHalfOpen(t *testing.T) {
 
 	ctx := context.Background()
 	recordRepo := New(db)
-	chunklineRepo := NewChunklineRepository(db)
+	chunklineRepo := New(db)
 
 	parentURI := "cckv://con3owner/timeline"
 	chunkStart := time.Unix(30*600, 0).UTC()
@@ -128,7 +128,7 @@ func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 
 	ctx := context.Background()
 	recordRepo := New(db)
-	chunklineRepo := NewChunklineRepository(db)
+	chunklineRepo := New(db)
 
 	feedURI := "cckv://con4owner/timeline"
 	createChunklineRecord(t, ctx, recordRepo, "empty-feed", feedURI, time.Unix(40*600, 0).UTC())

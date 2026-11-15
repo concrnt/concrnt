@@ -264,8 +264,6 @@ func main() {
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
-	chunklineRepo := pgrecord.NewChunklineRepository(db)
-
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
 	var webpushOpts *webpush.Options
@@ -327,7 +325,7 @@ func main() {
 	}))
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
-	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineUC := chunkline.New(recordRepo, chunklineGateway, redisKVS, recordUC)
 
 	go func() {
 		if err := jobQueue.Run(ctx); err != nil {
