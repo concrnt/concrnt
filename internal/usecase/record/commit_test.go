@@ -160,25 +160,29 @@ func (r *recordingRecordRepo) ApplyRecord(ctx context.Context, commit RecordComm
 	}
 	return RecordOutcome{Status: Applied, PreviousID: previousID}, nil
 }
-func (r *recordingRecordRepo) Acknowledge(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	r.acknowledgeCalled = true
-	r.ackCalls = append(r.ackCalls, ackCall{"Acknowledge", documentID, from, to, schema, createdAt})
-	return !r.ackStale, nil
-}
-func (r *recordingRecordRepo) UnAcknowledge(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	r.unacknowledgeCalled = true
-	r.ackCalls = append(r.ackCalls, ackCall{"UnAcknowledge", documentID, from, to, schema, createdAt})
-	return !r.ackStale, nil
-}
-func (r *recordingRecordRepo) Acknowledged(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	r.acknowledgedCalled = true
-	r.ackCalls = append(r.ackCalls, ackCall{"Acknowledged", documentID, from, to, schema, createdAt})
-	return !r.ackedStale, nil
-}
-func (r *recordingRecordRepo) UnAcknowledged(ctx context.Context, tx RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	r.unacknowledgedCalled = true
-	r.ackCalls = append(r.ackCalls, ackCall{"UnAcknowledged", documentID, from, to, schema, createdAt})
-	return !r.ackedStale, nil
+func (r *recordingRecordRepo) ApplyAck(ctx context.Context, commit AckCommit) (AckOutcome, error) {
+	stale := r.ackStale
+	method := "Acknowledge"
+	switch {
+	case commit.Side == AckerSide && commit.Valid:
+		r.acknowledgeCalled = true
+	case commit.Side == AckerSide:
+		r.unacknowledgeCalled = true
+		method = "UnAcknowledge"
+	case commit.Valid:
+		r.acknowledgedCalled = true
+		method, stale = "Acknowledged", r.ackedStale
+	default:
+		r.unacknowledgedCalled = true
+		method, stale = "UnAcknowledged", r.ackedStale
+	}
+	r.ackCalls = append(r.ackCalls, ackCall{method, commit.ID, commit.From, commit.To, commit.Schema, commit.CreatedAt})
+	status := r.apply(commit.Commit, !stale)
+	if status != Applied {
+		return AckOutcome{Status: status}, nil
+	}
+	// there was no state before the call
+	return AckOutcome{Status: Applied, IsValid: commit.Valid}, nil
 }
 func (r *recordingRecordRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil

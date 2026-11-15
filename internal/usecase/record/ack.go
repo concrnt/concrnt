@@ -2,18 +2,17 @@ package record
 
 import (
 	"context"
-	"errors"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
-func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, from domain.Entity, to domain.Entity, doc concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+func (uc *Usecase) processAck(ctx context.Context, ip string, from domain.Entity, to domain.Entity, doc concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Acknowledge")
 	defer span.End()
 
 	postProcesses := []PostProcessAction{}
-	created := false
+	var commit *AckCommit
 
 	documentID, err := sd.CDID()
 	if err != nil {
@@ -21,33 +20,16 @@ func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, f
 		return nil, err
 	}
 
-	switch doc.Kind {
-	case "ack", "unack":
-		if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, from.ID); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-	case "acked", "unacked":
-		if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, to.ID); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-	}
-
 	if uc.IsLocalEntity(ctx, &from) && (doc.Kind == "ack" || doc.Kind == "unack") { // create ack
 
-		if doc.Kind == "ack" {
-			created, err = uc.repo.Acknowledge(ctx, tx, documentID, from.ID, to.ID, doc.Schema, doc.CreatedAt)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-		} else {
-			created, err = uc.repo.UnAcknowledge(ctx, tx, documentID, from.ID, to.ID, doc.Schema, doc.CreatedAt)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
+		commit = &AckCommit{
+			Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: from.ID},
+			Side:      AckerSide,
+			From:      from.ID,
+			To:        to.ID,
+			Schema:    doc.Schema,
+			Valid:     doc.Kind == "ack",
+			CreatedAt: doc.CreatedAt,
 		}
 
 		// フォロー通知などを生成
@@ -113,23 +95,14 @@ func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, f
 
 	if uc.IsLocalEntity(ctx, &to) && (doc.Kind == "acked" || doc.Kind == "unacked") { // create acked
 
-		switch doc.Kind {
-		case "acked":
-			created, err = uc.repo.Acknowledged(ctx, tx, documentID, from.ID, to.ID, doc.Schema, doc.CreatedAt)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-		case "unacked":
-			created, err = uc.repo.UnAcknowledged(ctx, tx, documentID, from.ID, to.ID, doc.Schema, doc.CreatedAt)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-		default:
-			err := errors.New("unsupported document kind for acked: " + doc.Kind)
-			span.RecordError(err)
-			return nil, err
+		commit = &AckCommit{
+			Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: to.ID},
+			Side:      TargetSide,
+			From:      from.ID,
+			To:        to.ID,
+			Schema:    doc.Schema,
+			Valid:     doc.Kind == "acked",
+			CreatedAt: doc.CreatedAt,
 		}
 
 		// CIP-3 §3.4: the acked's ccfs identity is held by the associate
@@ -143,6 +116,15 @@ func (uc *Usecase) processAck(ctx context.Context, tx RepositoryTx, ip string, f
 		sd.CCFS = &ccfs
 	}
 
-	return &commitApplyResult{result: &sd, noop: !created, postProcesses: postProcesses}, nil
+	if commit == nil {
+		return &commitApplyResult{noop: true, unapplied: &sd}, nil
+	}
+
+	apply := func(ctx context.Context) (ApplyStatus, error) {
+		outcome, err := uc.repo.ApplyAck(ctx, *commit)
+		return outcome.Status, err
+	}
+
+	return &commitApplyResult{apply: apply, result: &sd, unapplied: &sd, postProcesses: postProcesses}, nil
 
 }

@@ -224,8 +224,10 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 			span.RecordError(err)
 			return nil, err
 		}
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.processAck(ctx, tx, ip, *requester, *targetUser, doc, sd, mode)
+		applyResult, err = uc.processAck(ctx, ip, *requester, *targetUser, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "delete":

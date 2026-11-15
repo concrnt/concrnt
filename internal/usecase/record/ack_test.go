@@ -478,8 +478,8 @@ func TestCommitAckedExemptions(t *testing.T) {
 
 	t.Run("ignored when the associate owner is not local", func(t *testing.T) {
 		// a server that manages neither side has nothing to hold: the commit
-		// is a no-op success (CIP-3 §3.1), nothing is stored and the tx
-		// rolls back
+		// is a no-op success (CIP-3 §3.1) decided before any write, so the
+		// repository is not called at all
 		elsewhere := newAckParty(t, "other.example.net")
 		repo := &recordingRecordRepo{}
 		uc := newAckUsecase(cfg, repo, residenceOf(from, elsewhere), &recordingDeliveryQueue{})
@@ -491,8 +491,8 @@ func TestCommitAckedExemptions(t *testing.T) {
 		if repo.acknowledgedCalled {
 			t.Fatal("a mirror for an associate owner this server does not manage must not reach the repository")
 		}
-		if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-			t.Fatalf("expected a single rolled-back tx, got %+v", repo.txs)
+		if len(repo.txs) != 0 {
+			t.Fatalf("expected no write, got %+v", repo.txs)
 		}
 	})
 }
