@@ -72,6 +72,11 @@ type Repository interface {
 	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
+
+	// Entities
+	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
@@ -115,15 +120,6 @@ type PolicyService interface {
 	Eval(ctx context.Context, req policy.RequestContext, stack []concrnt.Policy, action string, key string) error
 }
 
-// EntityRepository is the slice of the residence repository this usecase
-// needs: residency checks on entity commits and entity lookups. The full
-// residence.Repository embeds it.
-type EntityRepository interface {
-	GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error)
-	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
-	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
-}
-
 type commitApplyResult struct {
 	result        *concrnt.SignedDocument
 	postProcesses []PostProcessAction
@@ -132,7 +128,7 @@ type commitApplyResult struct {
 
 type Usecase struct {
 	repo   Repository
-	entity EntityRepository
+	meta   usecase.EntityMetaRepository
 	server *server.Usecase
 	config *domain.Config
 	client *client.Client
@@ -145,7 +141,7 @@ type Usecase struct {
 
 func New(
 	repo Repository,
-	entity EntityRepository,
+	meta usecase.EntityMetaRepository,
 	server *server.Usecase,
 	config *domain.Config,
 	client *client.Client,
@@ -156,7 +152,7 @@ func New(
 ) *Usecase {
 	uc := &Usecase{
 		repo:   repo,
-		entity: entity,
+		meta:   meta,
 		server: server,
 		config: config,
 		client: client,

@@ -65,7 +65,7 @@ func (s *remoteCommitServer) committed() []concrnt.SignedDocument {
 // newDeliverUsecase wires a usecase with a real client (no fakes possible:
 // the usecase holds *client.Client) whose remote.example is remapped to the
 // given httptest server, if any.
-func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, residence EntityRepository, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
+func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, residence entityLookups, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
 	t.Helper()
 	cl := client.New(cfg.FQDN)
 	if remote != nil {
@@ -73,8 +73,8 @@ func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, reside
 	}
 	queue := &recordingDeliveryQueue{}
 	uc := New(
-		repo,
-		residence,
+		withEntities{repo, residence},
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		cl,

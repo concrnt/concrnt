@@ -259,10 +259,10 @@ func main() {
 	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
-	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
+	entityMetaRepo := postgres.NewEntityMetaRepository(db)
 	recordRepo := pgrecord.New(db)
-	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
+	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)
 
