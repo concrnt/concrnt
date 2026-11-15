@@ -18,7 +18,7 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain.Entity, sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Delete")
 	defer span.End()
 
@@ -86,7 +86,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		// act on — pass it through as a no-op success (commitlog included, so
 		// a later delivery that does carry the targets is not deduplicated away)
 		if len(targetURIs) == 0 {
-			return &commitApplyResult{result: &sd, noop: true}, nil
+			return &commitApplyResult{noop: true, unapplied: &sd}, nil
 		}
 		for _, targetURI := range targetURIs {
 			targets = append(targets, sd.References[targetURI])
@@ -158,9 +158,8 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, parsedBase.Owner); err != nil {
-		span.RecordError(err)
-		return nil, err
+	commit := DeleteCommit{
+		Commit: &Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: parsedBase.Owner},
 	}
 
 	// History is only kept for what asked for it: a deleted document with
@@ -179,7 +178,8 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		if err != nil {
 			return err
 		}
-		return uc.repo.MarkCommitLogGcCandidate(ctx, tx, deletedID)
+		commit.GcCommitIDs = append(commit.GcCommitIDs, deletedID)
+		return nil
 	}
 
 	postProcesses := []PostProcessAction{}
@@ -214,22 +214,14 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 				switch parsedURI.Scheme {
 				case "cckv":
-					err = uc.repo.DeleteRecordByKey(ctx, tx, targetURI)
-					if err != nil {
-						span.RecordError(err)
-						return nil, err
-					}
+					commit.Removals = append(commit.Removals, Removal{Kind: RemoveKey, URI: targetURI})
 				case "ccfs":
 					if parsedURI.Type != concrnt.CCFSTypeConcrnt {
 						err := errors.New("unsupported ccfs type for delete record: " + parsedURI.Type)
 						span.RecordError(err)
 						return nil, err
 					}
-					err = uc.repo.DeleteRecordByDocumentID(ctx, tx, parsedURI.CDID)
-					if err != nil {
-						span.RecordError(err)
-						return nil, err
-					}
+					commit.Removals = append(commit.Removals, Removal{Kind: RemoveVersion, URI: targetDoc.Key, DocumentID: parsedURI.CDID})
 				default:
 					err := errors.New("unsupported document scheme for delete record: " + parsedURI.Scheme)
 					span.RecordError(err)
@@ -255,11 +247,11 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					return nil, err
 				}
 
-				err = uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
-				if err != nil {
-					span.RecordError(err)
-					return nil, err
+				removal := Removal{Kind: RemoveAssociation, DocumentID: parsedURI.CDID}
+				if targetDoc.Associate != nil {
+					removal.URI = *targetDoc.Associate
 				}
+				commit.Removals = append(commit.Removals, removal)
 
 				if err := flagDeleted(targetSD, nil); err != nil {
 					span.RecordError(err)
@@ -372,11 +364,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 				}
 			}
 
-			err = uc.repo.DeleteRecordByKey(ctx, tx, refKey)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
+			commit.Removals = append(commit.Removals, Removal{Kind: RemoveKey, URI: refKey})
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
@@ -488,23 +476,28 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		}
 	}
 
-	// CIP-4 §6.1: a delete that removed nothing here (the forwarded targets
-	// had no local reference rows) is not recorded — the tx rolls back — so
-	// a later delivery that does find rows is not deduplicated away
+	// CIP-4 §6.1: a delete that removes nothing here (the forwarded targets
+	// have no local reference rows) is not recorded, so a later delivery
+	// that does find rows is not deduplicated away
 	if !deletedAny {
-		return &commitApplyResult{result: &sd, noop: true}, nil
+		return &commitApplyResult{noop: true, unapplied: &sd}, nil
 	}
 
 	if !deleteRetained {
-		if err := uc.repo.MarkCommitLogGcCandidate(ctx, tx, documentID); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+		commit.GcCommitIDs = append(commit.GcCommitIDs, documentID)
 	}
 
 	// targets are URI-ordered, so with includeSelf the base record itself
 	// leads and becomes the reported result
-	return &commitApplyResult{result: &targets[0], postProcesses: postProcesses}, nil
+	return &commitApplyResult{
+		apply: func(ctx context.Context) (ApplyStatus, error) {
+			outcome, err := uc.repo.ApplyDelete(ctx, commit)
+			return outcome.Status, err
+		},
+		result:        &targets[0],
+		unapplied:     &sd,
+		postProcesses: postProcesses,
+	}, nil
 }
 
 // parseRangeDeleteTarget detects the trailing-asterisk range notation on a

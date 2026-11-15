@@ -89,30 +89,31 @@ type rangeDeleteRepo struct {
 	queryCalls  []subtreeQueryCall
 	deletedURIs []string
 	txs         []*recordingTx
-	// commitLogOwners records CreateCommitLog calls: documentID -> owner.
+	// commitLogOwners records the commit of every ApplyDelete call: documentID -> owner.
 	commitLogOwners map[string]string
-	// gcFlagged records MarkCommitLogGcCandidate calls in order.
+	// gcFlagged records the commits flagged for gc in order.
 	gcFlagged []string
 }
 
-func (r *rangeDeleteRepo) BeginTx(ctx context.Context) (RepositoryTx, error) {
+func (r *rangeDeleteRepo) ApplyDelete(ctx context.Context, commit DeleteCommit) (DeleteOutcome, error) {
 	tx := &recordingTx{}
 	r.txs = append(r.txs, tx)
-	return tx, nil
-}
-func (r *rangeDeleteRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	if r.commitLogOwners == nil {
-		r.commitLogOwners = map[string]string{}
+	if commit.Commit != nil {
+		if r.commitLogOwners == nil {
+			r.commitLogOwners = map[string]string{}
+		}
+		r.commitLogOwners[commit.Commit.ID] = commit.Commit.Owner
 	}
-	r.commitLogOwners[id] = owner
-	return nil
-}
-func (r *rangeDeleteRepo) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	return false, nil
-}
-func (r *rangeDeleteRepo) MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error {
-	r.gcFlagged = append(r.gcFlagged, documentID)
-	return nil
+	removed := make([]bool, len(commit.Removals))
+	for i, removal := range commit.Removals {
+		if removal.Kind == RemoveKey {
+			r.deletedURIs = append(r.deletedURIs, removal.URI)
+		}
+		removed[i] = true
+	}
+	r.gcFlagged = append(r.gcFlagged, commit.GcCommitIDs...)
+	_ = tx.Commit(ctx)
+	return DeleteOutcome{Status: Applied, Removed: removed}, nil
 }
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
@@ -120,10 +121,6 @@ func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri
 func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
 	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf})
 	return r.subtree, nil
-}
-func (r *rangeDeleteRepo) DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error {
-	r.deletedURIs = append(r.deletedURIs, targetURI)
-	return nil
 }
 func (r *rangeDeleteRepo) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {
 	if sd, ok := r.stored[uri]; ok {
@@ -395,8 +392,8 @@ func TestCommitRangeDeleteDenyRollsBackEverything(t *testing.T) {
 	if len(repo.deletedURIs) != 0 {
 		t.Fatalf("no target may be deleted on denial, got %v", repo.deletedURIs)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("transaction must be rolled back, got %+v", repo.txs)
+	if len(repo.txs) != 0 {
+		t.Fatalf("a denied delete must not reach the repository, got %+v", repo.txs)
 	}
 	if len(kvs.addedSets) != 0 {
 		t.Fatalf("no removed-item advertisement may be set on denial, got %v", kvs.addedSets)
@@ -424,8 +421,8 @@ func TestCommitRangeDeleteEmptyIsNotFound(t *testing.T) {
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("expected not-found error, got %v", err)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("transaction must be rolled back, got %+v", repo.txs)
+	if len(repo.txs) != 0 {
+		t.Fatalf("an empty range must not reach the repository, got %+v", repo.txs)
 	}
 }
 
@@ -521,7 +518,7 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		},
 	}
 
-	result, err := uc.deleteRecord(context.Background(), nil, "127.0.0.1", requester, sd, domain.CommitModeExecute)
+	result, err := uc.deleteRecord(context.Background(), "127.0.0.1", requester, sd, domain.CommitModeExecute)
 	if err != nil {
 		t.Fatalf("deleteRecord returned error: %v", err)
 	}
@@ -546,7 +543,7 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 
 	// no matching reference at all passes through as a no-op success
 	sd.References = map[string]concrnt.SignedDocument{*unrelated.CCKV: unrelated}
-	res, err := uc.deleteRecord(context.Background(), nil, "127.0.0.1", requester, sd, domain.CommitModeExecute)
+	res, err := uc.deleteRecord(context.Background(), "127.0.0.1", requester, sd, domain.CommitModeExecute)
 	if err != nil {
 		t.Fatalf("expected no-op success when no reference matches the range, got %v", err)
 	}
@@ -726,8 +723,8 @@ func TestCommitDeleteUnrelatedIsNoop(t *testing.T) {
 		if len(repo.deletedURIs) != 0 || len(delivery.jobs) != 0 {
 			t.Fatalf("nothing may be deleted or signalled for %s, got %v / %d jobs", target, repo.deletedURIs, len(delivery.jobs))
 		}
-		if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-			t.Fatalf("commitlog must be rolled back for %s, got %+v", target, repo.txs)
+		if len(repo.txs) != 0 {
+			t.Fatalf("a delete of %s must not be recorded, got %+v", target, repo.txs)
 		}
 	}
 }
@@ -753,8 +750,8 @@ func TestCommitDeleteRemoteTargetWithoutLocalCopies(t *testing.T) {
 	if len(repo.deletedURIs) != 0 {
 		t.Fatalf("nothing may be deleted, got %v", repo.deletedURIs)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("a delete that removed nothing must roll back, got %+v", repo.txs)
+	if len(repo.txs) != 0 {
+		t.Fatalf("a delete that removes nothing must not be recorded, got %+v", repo.txs)
 	}
 	if len(delivery.jobs) != 0 {
 		t.Fatalf("a delete that removed nothing must not signal, got %+v", delivery.jobs)

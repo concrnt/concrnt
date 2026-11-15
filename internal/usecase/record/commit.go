@@ -47,17 +47,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	if doc.Kind == "delete" {
-		alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		if alreadyCommitted {
-			return &sd, nil
-		}
-	}
-
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
 	isServiceAccount := serviceAccountType == "system"
 
@@ -195,7 +184,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	var applyCommit func(tx RepositoryTx) (*commitApplyResult, error)
 	var applyResult *commitApplyResult
 
 	switch doc.Kind {
@@ -233,68 +221,36 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 
 	case "delete":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.deleteRecord(ctx, tx, ip, *requester, sd, mode)
+		applyResult, err = uc.deleteRecord(ctx, ip, *requester, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
+
 	default:
 		err := errors.New("unsupported document kind: " + doc.Kind)
 		span.RecordError(err)
 		return nil, err
 	}
 
-	if applyCommit != nil {
-		//  ** start transatction **
-
-		tx, err := uc.repo.BeginTx(ctx)
+	status := Applied
+	if !applyResult.noop && applyResult.apply != nil {
+		status, err = applyResult.apply(ctx)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
+	}
 
-		committed := false
-		defer func() {
-			if !committed {
-				_ = tx.Rollback(ctx)
-			}
-		}()
+	if status == Duplicate {
+		// a redelivery: the commit is in the log already and nothing changed
+		return &sd, nil
+	}
 
-		applyResult, err = applyCommit(tx)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		if applyResult.noop {
-			slog.Info("commit no-op (accept-if-newer loss)",
-				"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
-			return applyResult.result, nil
-		}
-
-		if err := tx.Commit(ctx); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		committed = true
-	} else {
-		status := Applied
-		if !applyResult.noop && applyResult.apply != nil {
-			status, err = applyResult.apply(ctx)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-		}
-
-		if status == Duplicate {
-			// a redelivery: the commit is in the log already and nothing changed
-			return &sd, nil
-		}
-
-		if applyResult.noop || status == Stale {
-			slog.Info("commit no-op (accept-if-newer loss)",
-				"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
-			return applyResult.unapplied, nil
-		}
+	if applyResult.noop || status == Stale {
+		slog.Info("commit no-op (accept-if-newer loss)",
+			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
+		return applyResult.unapplied, nil
 	}
 
 	// A same-key overwrite or delete must be visible to this server's own
