@@ -118,7 +118,7 @@ func (r *rangeDeleteRepo) ApplyDelete(ctx context.Context, commit DeleteCommit) 
 func (r *rangeDeleteRepo) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
 	return nil, nil
 }
-func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
+func (r *rangeDeleteRepo) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	r.queryCalls = append(r.queryCalls, subtreeQueryCall{base: base, includeSelf: includeSelf})
 	return r.subtree, nil
 }

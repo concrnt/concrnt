@@ -69,7 +69,7 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 // URI so base leads. Unlike QueryByPrefix's raw prefix match this never picks
 // up sibling keys ("item2" for base "item"), and metacharacters in base are
 // escaped — the result is exactly the set a range delete may remove.
-func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
+func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
@@ -87,6 +87,13 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 			base, base+"0", base, subtreePattern)
 	} else {
 		query = query.Where(`record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, subtreePattern)
+	}
+
+	if afterURI != "" {
+		query = query.Where(`uri COLLATE "C" > ?`, afterURI)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
 	}
 
 	var rks []models.RecordKey

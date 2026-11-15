@@ -49,7 +49,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain
 	var targetURIs []string // per-target address (cckv/ccfs URI) deletion and policy key on
 	if authoritative {
 		if isRange {
-			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf)
+			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf, "", 0)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err

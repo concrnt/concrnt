@@ -677,13 +677,13 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 	}
 
 	t.Run("subtree including self", func(t *testing.T) {
-		sds, err := repo.QueryRecordSubtree(ctx, base, true)
+		sds, err := repo.QueryRecordSubtree(ctx, base, true, "", 0)
 		require.NoError(t, err)
 		require.Equal(t, []string{base, base + "/a", base + "/a/b"}, urisOf(sds))
 	})
 
 	t.Run("children only", func(t *testing.T) {
-		sds, err := repo.QueryRecordSubtree(ctx, base, false)
+		sds, err := repo.QueryRecordSubtree(ctx, base, false, "", 0)
 		require.NoError(t, err)
 		require.Equal(t, []string{base + "/a", base + "/a/b"}, urisOf(sds))
 	})
@@ -691,13 +691,13 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 	t.Run("metacharacters in base are escaped", func(t *testing.T) {
 		// unescaped, 'it_em' would also match 'it/em', 'item', ... — it must
 		// only match its own literal subtree
-		sds, err := repo.QueryRecordSubtree(ctx, "cckv://con1owner/lists/it_em", true)
+		sds, err := repo.QueryRecordSubtree(ctx, "cckv://con1owner/lists/it_em", true, "", 0)
 		require.NoError(t, err)
 		require.Equal(t, []string{"cckv://con1owner/lists/it_em/x"}, urisOf(sds))
 	})
 
 	t.Run("subtree delete removes exactly the enumerated keys", func(t *testing.T) {
-		sds, err := repo.QueryRecordSubtree(ctx, base, true)
+		sds, err := repo.QueryRecordSubtree(ctx, base, true, "", 0)
 		require.NoError(t, err)
 
 		deleteSD := repositorySignedDocument(t, concrnt.Document[schemas.Delete]{
@@ -1287,7 +1287,7 @@ func TestRecordQueryByParentOrderByKey(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/a", parent + "/a-b", parent + "/a_b"}, urisOfRows(rows), "the since bound is a byte-order bound too")
 
-		sds, err := repo.QueryRecordSubtree(ctx, parent, false)
+		sds, err := repo.QueryRecordSubtree(ctx, parent, false, "", 0)
 		require.NoError(t, err)
 		uris := make([]string, 0, len(sds))
 		for _, sd := range sds {

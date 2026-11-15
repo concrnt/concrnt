@@ -110,7 +110,12 @@ type Repository interface {
 	// is unused.
 	QueryByParentOrderByKey(ctx context.Context, parent, schema, author string, since, until *string, limit int, order string) ([]QueryRow, error)
 
-	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
+	// QueryRecordSubtree lists the live records under base (base itself too
+	// when includeSelf) in key order (byte order), those after afterURI
+	// only when it is set, at most limit when it is positive. Matching is
+	// by path hierarchy, never by string prefix. Round trips: 1 (a backend
+	// without a disjunction reads base itself in parallel with its subtree).
+	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
 	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
