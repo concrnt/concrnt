@@ -212,8 +212,10 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 
 	case "association":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createAssociation(ctx, tx, ip, *requester, doc, sd, mode)
+		applyResult, err = uc.createAssociation(ctx, ip, *requester, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "ack", "acked", "unack", "unacked":

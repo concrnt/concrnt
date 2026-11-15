@@ -849,15 +849,15 @@ func TestCommitSystemAccountBypassesBackdateWindow(t *testing.T) {
 	})
 }
 
-// associationRecordingRepo captures the unique key passed to CreateAssociation.
+// associationRecordingRepo captures the unique key passed to ApplyAssociation.
 type associationRecordingRepo struct {
 	recordingRecordRepo
 	uniques []string
 }
 
-func (r *associationRecordingRepo) CreateAssociation(ctx context.Context, tx RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
-	r.uniques = append(r.uniques, unique)
-	return true, nil
+func (r *associationRecordingRepo) ApplyAssociation(ctx context.Context, commit AssociationCommit) (ApplyStatus, error) {
+	r.uniques = append(r.uniques, commit.Unique)
+	return r.apply(commit.Commit, true), nil
 }
 
 // importRecordingRepo additionally answers the blocking-list query issued when

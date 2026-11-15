@@ -14,7 +14,7 @@ import (
 	"github.com/concrnt/concrnt/policy"
 )
 
-func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+func (uc *Usecase) createAssociation(ctx context.Context, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateAssociation")
 	defer span.End()
 
@@ -83,6 +83,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 	}
 
 	postProcesses := []PostProcessAction{}
+	unapplied := sd
 
 	requesterSD, err := uc.GetSigned(ctx, requester.CCKVWithHint())
 	if err != nil {
@@ -90,6 +91,9 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		return nil, err
 	}
 
+	// the association is stored where its target lives; on any other server
+	// the commit only fans the event out
+	var apply func(ctx context.Context) (ApplyStatus, error)
 	if isLocal {
 		uniqueKey := *parsed.Associate + parsed.Author + parsed.Schema
 		if parsed.AssociationVariant != nil {
@@ -105,19 +109,17 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		uniqueKey += string(bodyBytes)
 		uniqueHash := xxh3.HashString(uniqueKey)
 
-		if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, targetURI.Owner); err != nil {
-			span.RecordError(err)
-			return nil, err
+		commit := AssociationCommit{
+			Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: targetURI.Owner},
+			Target:    *parsed.Associate,
+			Author:    parsed.Author,
+			Schema:    parsed.Schema,
+			Variant:   parsed.AssociationVariant,
+			Unique:    fmt.Sprintf("%x", uniqueHash),
+			CreatedAt: parsed.CreatedAt,
 		}
-
-		applied, err := uc.repo.CreateAssociation(ctx, tx, documentID, *parsed.Associate, targetURI.Owner, parsed.Author, parsed.Schema, parsed.AssociationVariant, fmt.Sprintf("%x", uniqueHash), parsed.CreatedAt)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		if !applied {
-			return &commitApplyResult{result: &sd, noop: true}, nil
+		apply = func(ctx context.Context) (ApplyStatus, error) {
+			return uc.repo.ApplyAssociation(ctx, commit)
 		}
 
 		if mode == domain.CommitModeExecute {
@@ -205,5 +207,5 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 
 	sd.CCFS = &ccfs
 
-	return &commitApplyResult{result: &sd, postProcesses: postProcesses}, nil
+	return &commitApplyResult{apply: apply, result: &sd, unapplied: &unapplied, postProcesses: postProcesses}, nil
 }
