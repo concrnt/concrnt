@@ -876,6 +876,17 @@ func TestHierarchicalRecordPoliciesRootFirst(t *testing.T) {
 		sources[i] = layer.Source
 	}
 	require.Equal(t, keys, sources, "layers must be emitted root-first, self last")
+
+	unwritten := "cckv://con1powner/elsewhere/x"
+	stacks, err := repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{keys[2], keys[0], unwritten})
+	require.NoError(t, err)
+	require.Equal(t, stack, stacks[keys[2]], "a batch yields the stack of the single lookup")
+	require.Len(t, stacks[keys[0]], 1)
+	require.Contains(t, stacks, unwritten, "every input has an entry")
+	require.Empty(t, stacks[unwritten])
+
+	_, err = repo.GetHierarchicalRecordPoliciesMulti(ctx, []string{concrnt.ComposeCCFSURI("con1powner", concrnt.CCFSTypeConcrnt, "policy-record-0")})
+	require.Error(t, err, "a batch is keyed by cckv only")
 }
 
 // A level with no policy of its own but with distributions must still be

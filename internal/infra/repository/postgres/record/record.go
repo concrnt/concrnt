@@ -162,19 +162,54 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		cckv = rk.URI
 	}
 
-	hierarchy := []string{}
-	currentURI := cckv
-	for {
-		hierarchy = append([]string{currentURI}, hierarchy...)
-		parentURI, err := url.JoinPath(currentURI, "..")
+	stacks, err := r.GetHierarchicalRecordPoliciesMulti(ctx, []string{cckv})
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+
+	return stacks[cckv], nil
+}
+
+func (r *Repository) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetHierarchicalRecordPoliciesMulti")
+	defer span.End()
+
+	hierarchies := make(map[string][]string, len(uris))
+	ancestors := []string{}
+	for _, cckv := range uris {
+		parsed, err := concrnt.ParseCCURI(cckv)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
-		if parentURI == currentURI {
-			break
+		if parsed.Scheme != "cckv" {
+			err := fmt.Errorf("policy stacks are keyed by cckv, got %s", cckv)
+			span.RecordError(err)
+			return nil, err
 		}
-		currentURI = parentURI
+
+		hierarchy := []string{}
+		currentURI := cckv
+		for {
+			hierarchy = append([]string{currentURI}, hierarchy...)
+			parentURI, err := url.JoinPath(currentURI, "..")
+			if err != nil {
+				span.RecordError(err)
+				return nil, err
+			}
+			if parentURI == currentURI {
+				break
+			}
+			currentURI = parentURI
+		}
+		hierarchies[cckv] = hierarchy
+		ancestors = append(ancestors, hierarchy...)
+	}
+
+	stacks := make(map[string][]concrnt.Policy, len(uris))
+	if len(ancestors) == 0 {
+		return stacks, nil
 	}
 
 	type tuple struct {
@@ -184,11 +219,11 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	}
 
 	var entries []tuple
-	err = r.db.WithContext(ctx).
+	err := r.db.WithContext(ctx).
 		Model(&models.Record{}).
 		Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
 		Joins("JOIN record_keys rk ON rk.record_id = records.document_id").
-		Where("rk.uri IN ?", hierarchy).
+		Where("rk.uri IN ?", ancestors).
 		Find(&entries).Error
 	if err != nil {
 		span.RecordError(err)
@@ -210,31 +245,34 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	// strong=first-wins / weak=last-wins folding this makes strong conclusions
 	// prefer the outer (global-side) layers and weak conclusions the resource
 	// itself.
-	policies := []concrnt.Policy{}
-	for _, uri := range hierarchy {
-		if t, ok := tupleMap[uri]; ok {
-			var policyDoc concrnt.Policy
-			if t.Policy != nil {
-				err := json.Unmarshal([]byte(*t.Policy), &policyDoc)
-				if err != nil {
-					span.RecordError(err)
-					return nil, err
+	for cckv, hierarchy := range hierarchies {
+		policies := []concrnt.Policy{}
+		for _, uri := range hierarchy {
+			if t, ok := tupleMap[uri]; ok {
+				var policyDoc concrnt.Policy
+				if t.Policy != nil {
+					err := json.Unmarshal([]byte(*t.Policy), &policyDoc)
+					if err != nil {
+						span.RecordError(err)
+						return nil, err
+					}
 				}
-			}
 
-			policyDoc.Source = uri
-			// convert pq.StringArray to []string
-			virtualParents := []string{}
-			for _, dist := range t.Distributions {
-				virtualParents = append(virtualParents, dist)
-			}
-			policyDoc.VirtualParents = &virtualParents
+				policyDoc.Source = uri
+				// convert pq.StringArray to []string
+				virtualParents := []string{}
+				for _, dist := range t.Distributions {
+					virtualParents = append(virtualParents, dist)
+				}
+				policyDoc.VirtualParents = &virtualParents
 
-			policies = append(policies, policyDoc)
+				policies = append(policies, policyDoc)
+			}
 		}
+		stacks[cckv] = policies
 	}
 
-	return policies, nil
+	return stacks, nil
 }
 
 func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {

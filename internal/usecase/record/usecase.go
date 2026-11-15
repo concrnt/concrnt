@@ -56,6 +56,9 @@ type Repository interface {
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error)
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
+	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
+	// for several cckv URIs at once; every input URI has an entry.
+	GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error)
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
 	// QueryCommitLogs pages the commit log by server receipt time (c_date,
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
