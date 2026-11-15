@@ -26,6 +26,17 @@ type Repository interface {
 	// are exempt from onUpdate).
 	ApplyEntity(ctx context.Context, commit EntityCommit) (ApplyStatus, error)
 
+	// ApplyRecord stores a record under its key: the commit log entry, the
+	// record, the key pointing at it, and a placeholder for every ancestor
+	// key that does not exist yet (a placeholder is listed by
+	// QueryByParentOrderByKey as a key-only row and resolves to nothing).
+	// Accept-if-newer on CreatedAt per key: equal or older is Stale. Unless
+	// the version it replaces was written with onUpdate "retain", that
+	// version is forgotten and its commit flagged for gc; a retained one
+	// stays readable by its ccfs URI. Overwriting does not touch the key's
+	// associations (the incarnation continues, see ApplyDelete).
+	ApplyRecord(ctx context.Context, commit RecordCommit) (RecordOutcome, error)
+
 	// Utilities
 	BeginTx(ctx context.Context) (RepositoryTx, error)
 
@@ -147,6 +158,39 @@ type EntityCommit struct {
 	Alias     *string
 	Domain    string
 	CreatedAt time.Time
+}
+
+// RecordCommit is a record document to store (ApplyRecord). The record is
+// owned by Commit.Owner, the owner of Key.
+type RecordCommit struct {
+	Commit
+	// Key is the cckv URI the record is written to.
+	Key    string
+	Author string
+	// Schema and CreatedAt are what the listings filter and order by: the
+	// document's own, or those of the target for a reference record.
+	Schema string
+	// OnUpdate is the document's onUpdate; only "retain" keeps this version
+	// when a later one replaces it.
+	OnUpdate *string
+	// Policies is the JSON of the document's policy, nil without one.
+	Policies      *string
+	Distributions []string
+	// Redirect is the href of a reference record, nil otherwise.
+	Redirect  *string
+	CreatedAt time.Time
+}
+
+// RecordOutcome is the result of ApplyRecord. FreshKey and PreviousID are
+// meaningful when Status is Applied.
+type RecordOutcome struct {
+	Status ApplyStatus
+	// FreshKey is true when the key held no record before (it did not
+	// exist or was a placeholder).
+	FreshKey bool
+	// PreviousID is the id of the document the key pointed at before, ""
+	// when FreshKey.
+	PreviousID string
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.

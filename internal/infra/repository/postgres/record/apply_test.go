@@ -64,3 +64,46 @@ func TestApplyEntity(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "b.example.com", stored.Domain)
 }
+
+// A record takes its key when it is newer than the version there, reports
+// what it replaced, and an equal or older one stores nothing.
+func TestApplyRecord(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := &Repository{db: db}
+
+	owner := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+	key := "cckv://" + owner + "/posts/a"
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	record := func(id string, createdAt time.Time) ucrecord.RecordCommit {
+		return ucrecord.RecordCommit{Commit: testCommit(id, owner), Key: key, Author: owner, Schema: "https://schema.example.com/post.json", CreatedAt: createdAt}
+	}
+
+	outcome, err := repo.ApplyRecord(ctx, record("record-1", at))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Applied, FreshKey: true}, outcome)
+
+	outcome, err = repo.ApplyRecord(ctx, record("record-1", at.Add(time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Duplicate}, outcome)
+
+	outcome, err = repo.ApplyRecord(ctx, record("record-0", at))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Stale}, outcome)
+	requireCommitLogged(t, repo, "record-0", false)
+
+	outcome, err = repo.ApplyRecord(ctx, record("record-2", at.Add(time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Applied, PreviousID: "record-1"}, outcome)
+
+	sd, err := repo.GetSignedDocument(ctx, key)
+	require.NoError(t, err)
+	require.Equal(t, "ccfs://"+owner+"/concrnt/record-2", *sd.CCFS)
+
+	candidates, err := repo.ListGcCandidates(ctx, "zzzz", "", 10)
+	require.NoError(t, err)
+	require.Len(t, candidates, 1)
+	require.Equal(t, "record-1", candidates[0].ID)
+}

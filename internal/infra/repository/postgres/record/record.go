@@ -18,6 +18,30 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
+func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordCommit) (ucrecord.RecordOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyRecord")
+	defer span.End()
+
+	var outcome ucrecord.RecordOutcome
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+		outcome, err = createRecord(ctx, tx, commit)
+		return outcome.Status, err
+	})
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.RecordOutcome{}, err
+	}
+	outcome.Status = status
+	return outcome, nil
+}
+
 func (r *Repository) CreateRecord(
 	ctx context.Context,
 	tx ucrecord.RepositoryTx,
@@ -32,14 +56,29 @@ func (r *Repository) CreateRecord(
 	redirect *string,
 	createdAt time.Time,
 ) (bool, error) {
+	db, err := getRecordTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	outcome, err := createRecord(ctx, db, ucrecord.RecordCommit{
+		Commit:        ucrecord.Commit{ID: documentID, Owner: owner},
+		Key:           key,
+		Author:        author,
+		Schema:        schema,
+		OnUpdate:      onUpdate,
+		Policies:      policies,
+		Distributions: distributions,
+		Redirect:      redirect,
+		CreatedAt:     createdAt,
+	})
+	return outcome.Status == ucrecord.Applied, err
+}
+
+func createRecord(ctx context.Context, db *gorm.DB, commit ucrecord.RecordCommit) (ucrecord.RecordOutcome, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateRecord")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+	db = db.WithContext(ctx)
 
 	// Lock the RecordKey before writing anything. CIP-3 §3.4 accept-if-newer
 	// on the document's createdAt: only a strictly newer document takes the
@@ -47,55 +86,55 @@ func (r *Repository) CreateRecord(
 	// closes the read-then-write race between concurrent commits, same as
 	// CreateEntity's conditional upsert.
 	var oldRecordKey models.RecordKey
-	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("uri = ?", key).
+	err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("uri = ?", commit.Key).
 		Take(&oldRecordKey).Error
 	if err != nil && err != gorm.ErrRecordNotFound {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.RecordOutcome{}, err
 	}
-	if oldRecordKey.RecordID != nil && oldRecordKey.RecordCreatedAt != nil && !createdAt.After(*oldRecordKey.RecordCreatedAt) {
-		return false, nil
+	if oldRecordKey.RecordID != nil && oldRecordKey.RecordCreatedAt != nil && !commit.CreatedAt.After(*oldRecordKey.RecordCreatedAt) {
+		return ucrecord.RecordOutcome{Status: ucrecord.Stale}, nil
 	}
 
 	record := models.Record{
-		DocumentID:    documentID,
-		Owner:         owner,
-		Author:        author,
-		Redirect:      redirect,
-		Schema:        schema,
-		Policies:      policies,
-		Distributions: distributions,
-		CreatedAt:     createdAt,
+		DocumentID:    commit.ID,
+		Owner:         commit.Owner,
+		Author:        commit.Author,
+		Redirect:      commit.Redirect,
+		Schema:        commit.Schema,
+		Policies:      commit.Policies,
+		Distributions: commit.Distributions,
+		CreatedAt:     commit.CreatedAt,
 	}
 
 	if err := db.Clauses(clause.OnConflict{
 		DoNothing: true,
 	}).Create(&record).Error; err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.RecordOutcome{}, err
 	}
 
 	// ParentのRecordKeyを探す
-	parentRK, err := getOrCreateParentRecordKey(ctx, db, key)
+	parentRK, err := getOrCreateParentRecordKey(ctx, db, commit.Key)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.RecordOutcome{}, err
 	}
 
 	var pid *int64
 	if parentRK != nil {
 		pid = &parentRK.ID
 	}
-	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
+	cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
 
 	// RecordKeyを作る
 	rk := models.RecordKey{
-		URI:             key,
+		URI:             commit.Key,
 		ParentID:        pid,
-		RecordID:        &documentID,
-		RecordCreatedAt: &createdAt,
-		Redirect:        redirect,
+		RecordID:        &commit.ID,
+		RecordCreatedAt: &commit.CreatedAt,
+		Redirect:        commit.Redirect,
 		CleanOnUpdate:   cleanOnUpdate,
 	}
 
@@ -106,33 +145,36 @@ func (r *Repository) CreateRecord(
 	// writes to parent placeholder rows (RecordID nil) working.
 	result := db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "redirect": redirect, "clean_on_update": cleanOnUpdate}),
+		DoUpdates: clause.Assignments(map[string]any{"record_id": commit.ID, "parent_id": pid, "record_created_at": commit.CreatedAt, "redirect": commit.Redirect, "clean_on_update": cleanOnUpdate}),
 		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
 	}).Create(&rk)
 	if result.Error != nil {
 		span.RecordError(result.Error)
-		return false, result.Error
+		return ucrecord.RecordOutcome{}, result.Error
 	}
 	if result.RowsAffected == 0 {
-		return false, nil
+		return ucrecord.RecordOutcome{Status: ucrecord.Stale}, nil
 	}
 
 	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
-	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
+	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != commit.ID {
 		if err := db.Model(&models.CommitLog{}).
 			Where("id = ?", oldRecordKey.RecordID).
 			Update("gc_candidate", true).Error; err != nil {
 			span.RecordError(err)
-			return false, err
+			return ucrecord.RecordOutcome{}, err
 		}
 		if err := db.Delete(&models.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
 			span.RecordError(err)
-			return false, err
+			return ucrecord.RecordOutcome{}, err
 		}
 	}
 
-	return true, nil
-
+	outcome := ucrecord.RecordOutcome{Status: ucrecord.Applied, FreshKey: oldRecordKey.RecordID == nil}
+	if oldRecordKey.RecordID != nil {
+		outcome.PreviousID = *oldRecordKey.RecordID
+	}
+	return outcome, nil
 }
 
 func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
