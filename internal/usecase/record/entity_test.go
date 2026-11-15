@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -26,7 +27,7 @@ import (
 const remoteEntityHost = "remote.example.net"
 
 // signedEntityDoc builds a signed entity document for ccid at createdAt.
-// No alias: saveEntity verifies aliases against live DNS.
+// No alias: planEntity verifies aliases against live DNS.
 func signedEntityDoc(t *testing.T, ccid, priv string, createdAt time.Time) concrnt.SignedDocument {
 	t.Helper()
 	return signTestDocument(t, concrnt.Document[schemas.Entity]{
@@ -63,8 +64,8 @@ func newReferenceCommitUsecase(cfg *domain.Config, repo Repository, residence en
 }
 
 // A commit inlining an entity document strictly newer than the stored one
-// applies it (commit log + accept-if-newer upsert in its own tx) before the
-// commit itself is processed.
+// applies it (its own ApplyEntity write) before the commit itself is
+// processed.
 func TestCommitAppliesNewerReferencedEntity(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	storedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
@@ -79,24 +80,24 @@ func TestCommitAppliesNewerReferencedEntity(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if !repo.createEntityCalled {
+	if len(repo.entityCommits) == 0 {
 		t.Fatal("the inlined entity document was not applied")
 	}
-	if !repo.createRecordCalled {
+	if len(repo.recordCommits) == 0 {
 		t.Fatal("the record itself was not created")
 	}
 	want := []string{documentIDOf(t, newer), documentIDOf(t, sd)}
-	if strings.Join(repo.createdCommitLogs, ",") != strings.Join(want, ",") {
-		t.Fatalf("commit logs = %v, want entity then record %v", repo.createdCommitLogs, want)
+	if strings.Join(repo.commitIDs, ",") != strings.Join(want, ",") {
+		t.Fatalf("commit logs = %v, want entity then record %v", repo.commitIDs, want)
 	}
-	if len(repo.txs) != 2 || !repo.txs[0].committed || !repo.txs[1].committed {
-		t.Fatalf("expected two committed txs (entity, record), got %+v", repo.txs)
+	if !slices.Equal(repo.statuses, []ApplyStatus{Applied, Applied}) {
+		t.Fatalf("expected two applied writes (entity, record), got %v", repo.statuses)
 	}
 }
 
 // The steady state is a client inlining the same (or an older) entity
 // document on every commit; that must not even reach the repository, since a
-// losing accept-if-newer commit rolls back and would be re-verified forever.
+// losing accept-if-newer commit stores nothing and would be re-verified forever.
 func TestCommitIgnoresOlderOrEqualReferencedEntity(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	storedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
@@ -121,11 +122,11 @@ func TestCommitIgnoresOlderOrEqualReferencedEntity(t *testing.T) {
 			if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 				t.Fatalf("Commit returned error: %v", err)
 			}
-			if repo.createEntityCalled {
+			if len(repo.entityCommits) != 0 {
 				t.Fatal("a not-newer inlined entity document must not be applied")
 			}
-			if !repo.createRecordCalled || len(repo.txs) != 1 || !repo.txs[0].committed {
-				t.Fatalf("the record must still be committed on its own, got txs %+v", repo.txs)
+			if len(repo.recordCommits) != 1 || !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+				t.Fatalf("the record must still be committed on its own, got statuses %v", repo.statuses)
 			}
 		})
 	}
@@ -153,10 +154,10 @@ func TestCommitIgnoresForeignReferencedEntity(t *testing.T) {
 			if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 				t.Fatalf("Commit returned error: %v", err)
 			}
-			if repo.createEntityCalled {
+			if len(repo.entityCommits) != 0 {
 				t.Fatal("a foreign document under the author's key must not be applied as their entity")
 			}
-			if !repo.createRecordCalled {
+			if len(repo.recordCommits) == 0 {
 				t.Fatal("the record itself was not created")
 			}
 		})
@@ -180,11 +181,11 @@ func TestCommitReferencedEntityFailureDoesNotFailCommit(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if repo.createEntityCalled {
+	if len(repo.entityCommits) != 0 {
 		t.Fatal("a forged entity document must not be applied")
 	}
-	if !repo.createRecordCalled || len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("the record must still be committed, got txs %+v", repo.txs)
+	if len(repo.recordCommits) != 1 || !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+		t.Fatalf("the record must still be committed, got statuses %v", repo.statuses)
 	}
 }
 
@@ -207,10 +208,10 @@ func TestCommitAckAppliesTargetReferencedEntity(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if !repo.createEntityCalled {
+	if len(repo.entityCommits) == 0 {
 		t.Fatal("the target's inlined entity document was not applied")
 	}
-	if !repo.acknowledgeCalled {
+	if !repo.sawAck(AckerSide, true) {
 		t.Fatal("the ack itself was not recorded")
 	}
 	if len(delivery.jobs) != 1 {
@@ -408,7 +409,7 @@ func TestRecheckEntityByHintAppliesNewerDocument(t *testing.T) {
 	if n := f.resolves.Load(); n != 1 {
 		t.Fatalf("resolve hits = %d, want 1", n)
 	}
-	if !f.repo.createEntityCalled {
+	if len(f.repo.entityCommits) == 0 {
 		t.Fatalf("fetched entity document was not committed")
 	}
 	if want := entityRecheckKey(f.ccid, remoteEntityHost); len(f.kvs.setNXKeys) != 1 || f.kvs.setNXKeys[0] != want {
@@ -428,7 +429,7 @@ func TestRecheckEntityByHintThrottled(t *testing.T) {
 	if n := f.resolves.Load(); n != 0 {
 		t.Fatalf("resolve hits = %d, want 0 (throttled)", n)
 	}
-	if f.repo.createEntityCalled {
+	if len(f.repo.entityCommits) != 0 {
 		t.Fatalf("entity committed although the recheck was throttled")
 	}
 }
@@ -446,7 +447,7 @@ func TestRecheckEntityByHintRejectsForeignAuthor(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "served a") {
 		t.Fatalf("error = %v, want a foreign-author rejection", err)
 	}
-	if f.repo.createEntityCalled {
+	if len(f.repo.entityCommits) != 0 {
 		t.Fatalf("a document by another author was committed")
 	}
 }
@@ -457,7 +458,7 @@ func TestRecheckEntityByHintRemoteFailureStillThrottles(t *testing.T) {
 	if err := f.uc.recheckEntityByHint(context.Background(), f.ccid, remoteEntityHost); err == nil {
 		t.Fatalf("recheckEntityByHint returned nil for a failing hint host")
 	}
-	if f.repo.createEntityCalled {
+	if len(f.repo.entityCommits) != 0 {
 		t.Fatalf("entity committed although the fetch failed")
 	}
 	if len(f.kvs.setNXKeys) != 1 {

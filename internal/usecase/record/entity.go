@@ -18,8 +18,8 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, sd concrnt.SignedDocument) (*commitApplyResult, error) {
-	ctx, span := tracer.Start(ctx, "Usecase.Record.SaveEntity")
+func (uc *Usecase) planEntity(ctx context.Context, ip string, sd concrnt.SignedDocument) (*commitPlan, error) {
+	ctx, span := tracer.Start(ctx, "Usecase.Record.PlanEntity")
 	defer span.End()
 
 	var entity concrnt.Document[schemas.Entity]
@@ -89,33 +89,33 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, entity.Author); err != nil {
-		span.RecordError(err)
-		return nil, err
+	commit := EntityCommit{
+		Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: entity.Author},
+		CCID:      entity.Author,
+		Alias:     entity.Value.Alias,
+		Domain:    entity.Value.Domain,
+		CreatedAt: entity.CreatedAt,
 	}
 
-	applied, err := uc.repo.CreateEntity(ctx, tx, entity.Author, entity.Value.Alias, entity.Value.Domain, documentID, entity.CreatedAt)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !applied {
-		return &commitApplyResult{result: &sd, noop: true}, nil
-	}
-
-	return &commitApplyResult{result: &sd, postProcesses: []PostProcessAction{
-		func(ctx context.Context) error {
-			uc.cache.Delete(entityCacheKey(entity.Author))
-			if uc.sharedCache == nil {
-				return nil
-			}
-			if err := uc.sharedCacheDelete(entityCacheKey(entity.Author)); err != nil {
-				return fmt.Errorf("invalidate cached entity %s: %w", entity.Author, err)
-			}
-			return nil
+	return &commitPlan{
+		apply: func(ctx context.Context) (ApplyStatus, error) {
+			return uc.repo.ApplyEntity(ctx, commit)
 		},
-	}}, nil
+		result:    &sd,
+		unapplied: &sd,
+		postProcesses: []PostProcessAction{
+			func(ctx context.Context) error {
+				uc.cache.Delete(entityCacheKey(entity.Author))
+				if uc.sharedCache == nil {
+					return nil
+				}
+				if err := uc.sharedCacheDelete(entityCacheKey(entity.Author)); err != nil {
+					return fmt.Errorf("invalidate cached entity %s: %w", entity.Author, err)
+				}
+				return nil
+			},
+		},
+	}, nil
 }
 
 func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, error) {
@@ -211,7 +211,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 	}
 }
 
-// entityCacheTTL bounds how long a write that bypasses saveEntity (conctl)
+// entityCacheTTL bounds how long a write that bypasses planEntity (conctl)
 // stays invisible.
 const entityCacheTTL = 60
 
@@ -330,7 +330,7 @@ func (uc *Usecase) recheckEntityByHint(ctx context.Context, ccid, hint string) (
 // is no other channel that brings a newer entity document here.
 //
 // The inlined document is only committed when it is strictly newer than the
-// stored one: an accept-if-newer loss rolls its commit back without a commit
+// stored one: an accept-if-newer loss stores nothing, not even a commit
 // log, so without this pre-check every commit carrying the unchanged self
 // document (the steady state) would pay proof verification, domain
 // resolution and the alias DNS lookup just to be rejected. A failed

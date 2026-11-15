@@ -8,8 +8,8 @@ import (
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
 
-	"github.com/concrnt/concrnt"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	"github.com/concrnt/concrnt/internal/infra/repository/repoutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -25,163 +25,136 @@ var (
 	targetSide = ackSide{collection: fs.ColAckeds, field: "to"}
 )
 
-// upsertAck is the CIP-10 §4 state move: only a document with a strictly
+func sideOf(side ucrecord.AckSide) ackSide {
+	if side == ucrecord.TargetSide {
+		return targetSide
+	}
+	return ackerSide
+}
+
+// ApplyAck is the CIP-10 §4 state move: only a document with a strictly
 // newer createdAt may move the (from, to, schema) state; an equal or older
-// one is a no-op (false). The key is createdAt alone, never the document id,
-// so the acker's and the associate owner's servers, which hold different
-// documents with the same createdAt, reach the same decision. The state doc
-// is keyed by the triple, so a move is one write.
-func (r *Repository) upsertAck(ctx context.Context, tx ucrecord.RepositoryTx, side ackSide, documentID, from, to, schema string, createdAt time.Time, valid bool) (bool, error) {
-	t, err := getRecordTx(tx)
-	if err != nil {
-		return false, err
-	}
-
-	ref := r.col(side.collection).Doc(ackID(from, to, schema))
-	m, exists, err := t.read(ref)
-	if err != nil {
-		return false, err
-	}
-	if exists && !createdAt.After(ackFromMap(m).CreatedAt) {
-		return false, nil
-	}
-
-	t.set(ref, ackDoc{
-		From:       from,
-		To:         to,
-		Schema:     schema,
-		DocumentID: documentID,
-		Valid:      valid,
-		CreatedAt:  createdAt,
-	}.toMap())
-	return true, nil
-}
-
-func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
+// one is Stale. The key is createdAt alone, never the document id, so the
+// acker's and the associate owner's servers, which hold different documents
+// with the same createdAt, reach the same decision. The state document is
+// keyed by the triple, so the read set is the commit and that one document,
+// and a move is one write.
+func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAck")
 	defer span.End()
 
-	moved, err := r.upsertAck(ctx, tx, ackerSide, documentID, from, to, schema, createdAt, valid)
+	side := sideOf(commit.Side)
+	stateID := ackID(commit.From, commit.To, commit.Schema)
+	entry, err := newCommit(commit.Commit, side.collection, stateID)
 	if err != nil {
 		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
 	}
-	return moved, err
-}
+	commitRef := r.col(fs.ColCommits).Doc(commit.ID)
+	stateRef := r.col(side.collection).Doc(stateID)
 
-func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, true)
-}
+	var outcome ucrecord.AckOutcome
+	status, err := r.apply(ctx, func(tx *firestore.Transaction) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.AckOutcome{}
 
-func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, false)
-}
+		reads := newReadSet(commitRef, stateRef)
+		if err := reads.loadTx(tx); err != nil {
+			return ucrecord.Applied, err
+		}
+		if _, exists := reads.data(commitRef); exists {
+			return ucrecord.Duplicate, nil
+		}
+		if m, exists := reads.data(stateRef); exists {
+			state := ackFromMap(m)
+			outcome.WasValid = state.Valid
+			if !commit.CreatedAt.After(state.CreatedAt) {
+				outcome.IsValid = state.Valid
+				return ucrecord.Stale, nil
+			}
+		}
 
-func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
-	defer span.End()
-
-	moved, err := r.upsertAck(ctx, tx, targetSide, documentID, from, to, schema, createdAt, valid)
+		if err := tx.Create(commitRef, entry.toMap()); err != nil {
+			return ucrecord.Applied, err
+		}
+		outcome.IsValid = commit.Valid
+		return ucrecord.Applied, tx.Set(stateRef, ackDoc{
+			From:       commit.From,
+			To:         commit.To,
+			Schema:     commit.Schema,
+			DocumentID: commit.ID,
+			Valid:      commit.Valid,
+			CreatedAt:  commit.CreatedAt,
+			Document:   entry.Document,
+			Proof:      entry.Proof,
+		}.toMap())
+	})
 	if err != nil {
 		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
 	}
-	return moved, err
+	outcome.Status = status
+	return outcome, nil
 }
 
-func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, true)
-}
-
-func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, false)
-}
-
-// ackQuery is the shared filter of the list and count queries of one side.
-func (r *Repository) ackQuery(side ackSide, ccid, schema string) firestore.Query {
+// sideQuery is the shared filter of the list and count queries: the valid
+// states of the side a from / to pair asks for.
+func (r *Repository) sideQuery(from, to, schema string) (ackSide, firestore.Query, error) {
+	held, ccid, err := repoutil.AckSideOf(from, to)
+	if err != nil {
+		return ackSide{}, firestore.Query{}, err
+	}
+	side := sideOf(held)
 	q := r.col(side.collection).Where(side.field, "==", ccid).Where("valid", "==", true)
 	if schema != "" {
 		q = q.Where("schema", "==", schema)
 	}
-	return q
+	return side, q, nil
 }
 
-// ackRecords lists the valid states of one side; CIP-3 §3.4: the ccfs
-// identity of an ack is held by the acker's server, of an acked by the
-// associate owner's.
-func (r *Repository) ackRecords(ctx context.Context, side ackSide, ccid, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
-	q := applyWindow(r.ackQuery(side, ccid, schema), "createdAt", "documentID", since, until, limit, order)
-	snaps, err := q.Documents(ctx).GetAll()
-	if err != nil {
-		return nil, fs.QueryErr(err)
-	}
-
-	acks := make([]ackDoc, 0, len(snaps))
-	ids := make([]string, 0, len(snaps))
-	for _, snap := range snaps {
-		a := ackFromMap(snap.Data())
-		acks = append(acks, a)
-		ids = append(ids, a.DocumentID)
-	}
-	commits, err := r.getCommits(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-
-	rows := make([]ucrecord.QueryRow, 0, len(acks))
-	for _, a := range acks {
-		commit, ok := commits[a.DocumentID]
-		if !ok {
-			continue
-		}
-		proof, err := commit.proof()
-		if err != nil {
-			return nil, err
-		}
-		owner := a.From
-		if side == targetSide {
-			owner = a.To
-		}
-		ccfs := concrnt.ComposeCCFSURI(owner, concrnt.CCFSTypeConcrnt, a.DocumentID)
-		rows = append(rows, ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: commit.Document, Proof: proof},
-			CreatedAt: a.CreatedAt,
-		})
-	}
-	return rows, nil
-}
-
+// GetAcknowledgeRecords lists the valid states of one side, each carrying
+// the document it is anchored to. CIP-3 §3.4: the ccfs identity of an ack
+// is held by the acker's server, of an acked by the associate owner's.
 func (r *Repository) GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAcknowledgeRecords")
 	defer span.End()
 
-	var rows []ucrecord.QueryRow
-	var err error
-	switch {
-	case from != "":
-		rows, err = r.ackRecords(ctx, ackerSide, from, schema, since, until, limit, order)
-	case to != "":
-		rows, err = r.ackRecords(ctx, targetSide, to, schema, since, until, limit, order)
-	default:
-		err = errors.New("either 'from' or 'to' must be specified")
-	}
+	side, q, err := r.sideQuery(from, to, schema)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
+	snaps, err := applyWindow(q, "createdAt", "documentID", since, until, limit, order).Documents(ctx).GetAll()
+	if err != nil {
+		span.RecordError(err)
+		return nil, fs.QueryErr(err)
+	}
+
+	rows := make([]ucrecord.QueryRow, 0, len(snaps))
+	for _, snap := range snaps {
+		a := ackFromMap(snap.Data())
+		owner := a.From
+		if side == targetSide {
+			owner = a.To
+		}
+		row, err := commitRow(owner, a.DocumentID, a.Document, a.Proof, a.CreatedAt)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
 	return rows, nil
 }
 
+// ComputeAcknowledgeCounts scans the valid states of one side projected to
+// the schema and groups them here (Firestore has no GROUP BY); only the
+// aggregate layer calls it (C2).
 func (r *Repository) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAcknowledgeCounts")
 	defer span.End()
 
-	var q firestore.Query
-	switch {
-	case from != "":
-		q = r.ackQuery(ackerSide, from, schema)
-	case to != "":
-		q = r.ackQuery(targetSide, to, schema)
-	default:
-		err := errors.New("either 'from' or 'to' must be specified")
+	_, q, err := r.sideQuery(from, to, schema)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

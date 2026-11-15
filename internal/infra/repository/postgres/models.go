@@ -23,8 +23,8 @@ import (
 //     owner filter, ordered by receipt time with id as tie-break; used by
 //     record.Repository.QueryCommitLogs.
 //   - idx_commit_logs_gc_candidate (gc_candidate) WHERE gc_candidate: marks
-//     commits for later GC scans; set by record.Repository.CreateRecord when
-//     replacing a key, MarkCommitLogGcCandidate and
+//     commits for later GC scans; set by record.Repository.ApplyRecord when
+//     replacing a key, ApplyDelete (GcCommitIDs) and
 //     MarkCommitLogsGcCandidateByOwner on unregister, read by
 //     CountGcCandidates/ListGcCandidates. Partial: almost every row is false
 //     and never looked up by this flag.
@@ -41,10 +41,10 @@ type CommitLog struct {
 // Indexes:
 //   - PRIMARY KEY (id): internal key identity; used by parent_id references and
 //     associations.target_id joins in record.Repository.GetAssociatedRecords and
-//     ComputeAssociationCounts.
+//     ComputeAssociationSummary.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
-//     record.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
-//     GetSignedDocument(s), DeleteRecordByKey, GetTimelineRemoval,
+//     record.getRecordKeyByURI, getOrCreateParentRecordKey, ApplyRecord,
+//     GetSignedDocument(s), ApplyDelete, GetTimelineRemoval,
 //     GetChunklineManifest/LookupLocalItrs/LoadLocalBody, and association target
 //     lookups. Its default collation cannot serve LIKE 'x%'.
 //   - idx_record_keys_uri_c (uri COLLATE "C"): prefix scans; used by
@@ -80,7 +80,7 @@ type RecordKey struct {
 // Indexes:
 //   - PRIMARY KEY (document_id): record payload lookup and foreign-key target;
 //     used by the record_keys-to-records joins and direct deletes in
-//     record.Repository.CreateRecord/DeleteRecordByKey/DeleteRecordByDocumentID.
+//     record.Repository.ApplyRecord/ApplyDelete.
 //   - idx_records_schema_created_at_document_id (schema, created_at, document_id):
 //     schema/time-ordered record searches; used by record.Repository
 //     QueryByPrefix and QueryByParent when schema/time filters are present.
@@ -91,11 +91,9 @@ type RecordKey struct {
 //     plus timestamp predicate support for record_keys-to-records joins that still
 //     need records.created_at.
 type Record struct {
-	DocumentID string    `json:"id" gorm:"primaryKey;type:text;index:idx_records_schema_created_at_document_id,priority:3;index:idx_records_author_created_at_document_id,priority:3;index:idx_records_document_id_created_at,priority:1"`
-	Document   CommitLog `json:"documnet" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
-	Owner      string    `json:"owner" gorm:"type:text"`
-	// document author; NULL only on rows written before the column existed
-	// (backfilled by conctl op repair-record-authors)
+	DocumentID    string         `json:"id" gorm:"primaryKey;type:text;index:idx_records_schema_created_at_document_id,priority:3;index:idx_records_author_created_at_document_id,priority:3;index:idx_records_document_id_created_at,priority:1"`
+	Document      CommitLog      `json:"documnet" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
+	Owner         string         `json:"owner" gorm:"type:text"`
 	Author        string         `json:"author" gorm:"type:text;index:idx_records_author_created_at_document_id,priority:1"`
 	Redirect      *string        `json:"redirect" gorm:"type:text"`
 	Schema        string         `json:"schema" gorm:"type:text;index:idx_records_schema_created_at_document_id,priority:1"`
@@ -111,11 +109,10 @@ type Record struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_ack_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by record.Repository.processAck and filtered by
-//     getAckRecords/getAckRecordCounts.
+//     upsert; used by record.Repository.ApplyAck.
 //   - idx_acks_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by record.Repository.getAckRecords and
-//     getAckRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     ack list/count lookup; used by record.Repository.GetAcknowledgeRecords
+//     and ComputeAcknowledgeCounts.
 //     The to side is read from ackeds and schema only narrows a from
 //     lookup, so those have no index of their own.
 type Ack struct {
@@ -136,11 +133,10 @@ type Ack struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_acked_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by record.Repository.processAcked and filtered by
-//     getAckedRecords/getAckedRecordCounts.
+//     upsert; used by record.Repository.ApplyAck.
 //   - idx_acked_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; used by record.Repository.getAckedRecords and
-//     getAckedRecordCounts (via GetAcknowledgeRecords/ComputeAcknowledgeCounts).
+//     list/count lookup; used by record.Repository.GetAcknowledgeRecords and
+//     ComputeAcknowledgeCounts.
 //     The from side is read from acks and schema only narrows a to lookup,
 //     so those have no index of their own.
 type Acked struct {
@@ -159,7 +155,7 @@ type Acked struct {
 
 // Indexes:
 //   - PRIMARY KEY (document_id): one association per commit document and
-//     commit-log foreign-key target; used by record.Repository.DeleteAssociation.
+//     commit-log foreign-key target; used by record.Repository.ApplyDelete.
 //   - idx_associations_target_id (target_id): association lookup by target record
 //     key; used by record.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_author
@@ -168,9 +164,9 @@ type Acked struct {
 //   - idx_associations_target_schema_variant_created_at
 //     (target_id, schema, variant, created_at): a target's counts by schema and
 //     variant and each variant's earliest association, read from the index
-//     alone; used by record.Repository.ComputeAssociationCounts.
+//     alone; used by record.Repository.ComputeAssociationSummary.
 //   - uni_associations_unique (unique): idempotency key for association writes;
-//     used by record.Repository.CreateAssociation.
+//     used by record.Repository.ApplyAssociation.
 type Association struct {
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
@@ -206,7 +202,7 @@ type Server struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): ccid lookup and upsert target; used by
-//     record.Repository.CreateEntity and GetEntityByCCID.
+//     record.Repository.ApplyEntity and GetEntityByCCID.
 //   - idx_entities_alias (alias): alias lookup; used by
 //     record.Repository.GetEntityByAlias.
 type Entity struct {

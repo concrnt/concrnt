@@ -148,8 +148,10 @@ func CreateSpanner(t *testing.T) (*spanner.Client, *database.DatabaseAdminClient
 		spannerDB = &spannerDatabase{client: client, admin: admin, name: db.Name}
 	})
 
-	// commit_logs takes its interleaved and foreign-keyed rows with it;
-	// record_keys keeps the placeholders, which cascade into associations
+	// commit_logs takes its interleaved rows (records, acks, ackeds,
+	// associations) and foreign-keyed rows (entities, the record_keys rows
+	// pointing at a record) with it; what is left in record_keys are the
+	// placeholders, which nothing cascades from any more
 	for _, table := range []string{"commit_logs", "record_keys", "entity_meta", "servers", "subscriptions", "abuse_reports", "aggregate_entries"} {
 		_, err := spannerDB.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
 			_, err := tx.Update(ctx, spanner.Statement{SQL: "DELETE FROM " + table + " WHERE true"})

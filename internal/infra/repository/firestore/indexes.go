@@ -46,8 +46,6 @@ var timelineOrder = []orderField{{"recordCreatedAt", true}, {"recordID", true}}
 // are served by automatic indexes and are listed so the exemption check
 // still covers their fields.
 var shapes = []queryShape{
-	// GetSignedDocument(s) / GetHierarchicalRecordPolicies by ccfs, the delete cascades
-	{Name: "record_keys.byRecordID", Collection: ColRecordKeys, Equalities: []string{"recordID"}},
 	// QueryByParent, the chunkline children scans
 	{Name: "record_keys.byParent", Collection: ColRecordKeys, Equalities: []string{"parentURI"}, Optional: []string{"schema", "author"}, Range: "recordCreatedAt", OrderBy: timelineOrder, BothDirections: true},
 	// QueryByParentOrderByKey (CIP-5 orderby=key, byte order of the uri)
@@ -58,14 +56,13 @@ var shapes = []queryShape{
 	{Name: "record_keys.subtree", Collection: ColRecordKeys, Range: "uri", OrderBy: []orderField{{"uri", false}, {"recordCreatedAt", false}}},
 	// GetAssociatedRecords
 	{Name: "associations.byTarget", Collection: ColAssociations, Equalities: []string{"targetURI"}, Optional: []string{"schema", "variant", "author"}, Range: "createdAt", OrderBy: []orderField{{"createdAt", true}, {firestore.DocumentID, true}}, BothDirections: true},
-	// Compute* and the delete cascades
-	{Name: "associations.countBySchema", Collection: ColAssociations, Equalities: []string{"targetURI"}, Optional: []string{"schema"}},
-	{Name: "associations.byUnique", Collection: ColAssociations, Equalities: []string{"unique"}},
+	// ComputeAssociationSummary
+	{Name: "associations.summary", Collection: ColAssociations, Equalities: []string{"targetURI"}},
+	// Cleanup (the associations of ended incarnations)
+	{Name: "associations.byGen", Collection: ColAssociations, Equalities: []string{"targetGen"}},
 	// GetAcknowledgeRecords / ComputeAcknowledgeCounts
 	{Name: "acks.byFrom", Collection: ColAcks, Equalities: []string{"from", "valid"}, Optional: []string{"schema"}, Range: "createdAt", OrderBy: []orderField{{"createdAt", true}, {"documentID", true}}, BothDirections: true},
-	{Name: "acks.byDocumentID", Collection: ColAcks, Equalities: []string{"documentID"}},
 	{Name: "ackeds.byTo", Collection: ColAckeds, Equalities: []string{"to", "valid"}, Optional: []string{"schema"}, Range: "createdAt", OrderBy: []orderField{{"createdAt", true}, {"documentID", true}}, BothDirections: true},
-	{Name: "ackeds.byDocumentID", Collection: ColAckeds, Equalities: []string{"documentID"}},
 	// GetAllCommitLogs
 	{Name: "commits.byOwner", Collection: ColCommits, Equalities: []string{"owner"}, OrderBy: []orderField{{"cDate", false}}},
 	// QueryCommitLogs (the replication cursor)
@@ -76,8 +73,8 @@ var shapes = []queryShape{
 	{Name: "commits.gcCandidates", Collection: ColCommits, Equalities: []string{"gcCandidate"}, OrderBy: []orderField{{firestore.DocumentID, false}}},
 	// ListCommitLogs
 	{Name: "commits.page", Collection: ColCommits, Optional: []string{"owner"}, OrderBy: []orderField{{firestore.DocumentID, false}}},
+	// GetEntityByAlias
 	{Name: "entities.byAlias", Collection: ColEntities, Equalities: []string{"alias"}},
-	{Name: "entities.byDocumentID", Collection: ColEntities, Equalities: []string{"documentID"}},
 	{Name: "servers.byCSID", Collection: ColServers, Equalities: []string{"csID"}},
 	// aggregate.Store.InvalidateDefinition
 	{Name: "aggregate_entries.byName", Collection: ColAggregateEntries, Equalities: []string{"name"}},

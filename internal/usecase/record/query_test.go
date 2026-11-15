@@ -11,7 +11,6 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/aggregate/storetest"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
-	"github.com/concrnt/concrnt/internal/utils"
 )
 
 // queryRepo serves a fixed page for the parent listings and records which
@@ -155,20 +154,18 @@ func urisOf(items []concrnt.SignedDocument) []string {
 	return uris
 }
 
-// associationListRepo counts list reads and serves fixed counts.
+// associationListRepo counts list reads and summary computations and serves
+// a fixed summary.
 type associationListRepo struct {
 	Repository
-	counts  map[string]utils.OrderedKVMap[int64]
-	authors []string
-	lists   int
+	summary   AssociationSummary
+	summaries int
+	lists     int
 }
 
-func (r *associationListRepo) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
-	return r.counts, nil
-}
-
-func (r *associationListRepo) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
-	return r.authors, nil
+func (r *associationListRepo) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (AssociationSummary, error) {
+	r.summaries++
+	return r.summary, nil
 }
 
 func (r *associationListRepo) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error) {
@@ -181,9 +178,10 @@ func (r *associationListRepo) GetAssociatedRecords(ctx context.Context, targetUR
 // without a cache every listing reads it.
 func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
 	ctx := context.Background()
-	repo := &associationListRepo{counts: map[string]utils.OrderedKVMap[int64]{
-		"like": {"": {Value: 1, Order: 1}},
-	}, authors: []string{"con1liker"}}
+	repo := &associationListRepo{summary: AssociationSummary{
+		Variants: []AssociationVariant{{Schema: "like", Count: 1, Earliest: time.Now()}},
+		Authors:  []string{"con1liker"},
+	}}
 	uc := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
 	uc.SetAggregates(aggregate.New(storetest.NewInMemory(), 0, 0))
 
@@ -200,7 +198,7 @@ func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, repo.lists, "an author with associations is listed from the repository")
 
-	repo.counts = map[string]utils.OrderedKVMap[int64]{}
+	repo.summary = AssociationSummary{}
 	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")
 	require.NoError(t, err)
 	require.Equal(t, 1, repo.lists, "a target without associations must not reach the repository")

@@ -133,7 +133,7 @@ func readAccessSubject(uri string, sd concrnt.SignedDocument) (concrnt.Document[
 	}
 
 	// Associations have no record_keys row of their own; their policy stack is
-	// rooted at the associated document (CIP-12 §5.3), same as deleteRecord.
+	// rooted at the associated document (CIP-12 §5.3), as in evalDeletePolicy.
 	policyRoot := uri
 	if doc.Associate != nil {
 		policyRoot = *doc.Associate

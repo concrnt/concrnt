@@ -1,21 +1,23 @@
 // Package repotest is the backend-agnostic contract test suite for the
 // repository interfaces. A backend (Postgres, Firestore, ...) wires its
-// repositories plus an Inspector into a Backend and runs the Run*Suite
-// functions from its own test package; every suite exercises the store only
-// through the usecase repository interfaces and reads white-box state through
-// the Inspector, so the assertions are identical across backends.
+// repositories into a Backend and runs Run from its own test package. The
+// suites are black-box: they write and read only through the contract
+// methods, so they say nothing about tables, collections or columns. The
+// Inspector is the two things no contract method can do.
 package repotest
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
@@ -42,6 +44,7 @@ func Run(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("Record", func(t *testing.T) { RunRecordSuite(t, open) })
 	t.Run("Association", func(t *testing.T) { RunAssociationSuite(t, open) })
 	t.Run("Ack", func(t *testing.T) { RunAckSuite(t, open) })
+	t.Run("Delete", func(t *testing.T) { RunDeleteSuite(t, open) })
 	t.Run("Chunkline", func(t *testing.T) { RunChunklineSuite(t, open) })
 	t.Run("Residence", func(t *testing.T) { RunResidenceSuite(t, open) })
 	t.Run("Replication", func(t *testing.T) { RunReplicationSuite(t, open) })
@@ -49,137 +52,19 @@ func Run(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("World", func(t *testing.T) { RunWorldSuite(t, open) })
 }
 
-// Inspector exposes the stored state behind the repository interfaces; each
-// backend implements it over its own store. Every lookup returns nil, nil
-// when the state is absent.
+// Inspector is what the suites need and the contract cannot give them;
+// each backend implements it over its own store, in its inspect_test.go.
 type Inspector interface {
-	// Commit returns the commit log stored under id.
-	Commit(ctx context.Context, id string) (*CommitState, error)
-	// SetCommitCDate overwrites the receive time of commit id, so suites can
-	// pin an ordering that otherwise depends on the store's clock.
+	// SetCommitCDate overwrites the receipt time of commit id, so the
+	// replication suite can pin an ordering that otherwise depends on the
+	// store's clock.
 	SetCommitCDate(ctx context.Context, id string, cDate time.Time) error
-	// Record returns the record payload stored for documentID (nil once the
-	// record has been forgotten or deleted while its commit log stays).
-	Record(ctx context.Context, documentID string) (*RecordState, error)
-	// SetRecordCreatedAt overwrites the createdAt stored with the record
-	// payload (not the key's copy of it), so suites can make the two
-	// diverge the way a backdated write does.
-	SetRecordCreatedAt(ctx context.Context, documentID string, createdAt time.Time) error
-	// RecordKey returns the key state for uri, placeholder parents included
-	// (a placeholder has RecordID == nil).
-	RecordKey(ctx context.Context, uri string) (*KeyState, error)
-	// Entity returns the entity registered under ccid.
-	Entity(ctx context.Context, ccid string) (*EntityState, error)
-	// Association returns the association stored for documentID.
-	Association(ctx context.Context, documentID string) (*AssociationState, error)
-	// AssociationCountByUnique counts the associations sharing unique.
-	AssociationCountByUnique(ctx context.Context, unique string) (int64, error)
-	// Ack returns the acker-side state of the (from, to, schema) relationship.
-	Ack(ctx context.Context, from, to, schema string) (*AckState, error)
-	// Acked returns the target-side state of the (from, to, schema) relationship.
-	Acked(ctx context.Context, from, to, schema string) (*AckState, error)
-	// AckCount counts every acker-side ack state held, valid or not.
-	AckCount(ctx context.Context) (int64, error)
-	// AbuseReportCount counts the abuse reports stored.
+	// AbuseReportCount counts the abuse reports stored (abuse.Repository
+	// is append-only and has no read).
 	AbuseReportCount(ctx context.Context) (int64, error)
 }
 
-// CommitState is one commit log entry.
-type CommitState struct {
-	IP       string
-	Document string
-	// Proof is the JSON encoding of the stored proof.
-	Proof       string
-	Owner       string
-	GcCandidate bool
-	CDate       time.Time
-}
-
-// RecordState is one record payload.
-type RecordState struct {
-	Owner         string
-	Schema        string
-	Redirect      *string
-	Distributions []string
-	CreatedAt     time.Time
-}
-
-// KeyState is one record key (URI) entry.
-type KeyState struct {
-	// RecordID is the document id the key currently points at; nil for a
-	// parent placeholder that no record has been written to.
-	RecordID *string
-	// RecordCreatedAt is the createdAt of that document; nil for a placeholder.
-	RecordCreatedAt *time.Time
-	// Redirect is the document's redirect, carried on the key (nil when the
-	// document has none or the key is a placeholder).
-	Redirect *string
-}
-
-// EntityState is one registered entity.
-type EntityState struct {
-	DocumentID string
-	Domain     string
-	CreatedAt  time.Time
-}
-
-// AssociationState is one association.
-type AssociationState struct {
-	Owner   string
-	Author  string
-	Variant *string
-	Unique  string
-}
-
-// AckState is the ack (or acked) state of one (from, to, schema) triple.
-type AckState struct {
-	DocumentID string
-	Valid      bool
-	CreatedAt  time.Time
-}
-
-// errTestRollback aborts a RunInTx closure so nothing it wrote persists.
-var errTestRollback = errors.New("test rollback")
-
-// foreignTx is a RepositoryTx of a type no backend recognises; every write
-// method must reject it.
-type foreignTx struct{}
-
-func (foreignTx) IsRepositoryTx() {}
-
-// withCommit runs fn inside a commit transaction that already holds the
-// commit log for sd, recorded under owner (the single entity every commit is
-// attributed to).
-func withCommit(t *testing.T, ctx context.Context, repo record.Repository, id string, ip string, sd concrnt.SignedDocument, owner string, fn func(tx record.RepositoryTx) error) {
-	t.Helper()
-
-	require.NoError(t, repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
-		if err := repo.CreateCommitLog(ctx, tx, id, ip, sd.Document, sd.Proof, owner); err != nil && !errors.Is(err, record.ErrAlreadyCommitted) {
-			return err
-		}
-		return fn(tx)
-	}))
-}
-
-// inTx runs fn in a transaction and commits it; fn reports failures through t.
-func inTx(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
-	t.Helper()
-	require.NoError(t, repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
-		fn(tx)
-		return nil
-	}))
-}
-
-// inTxRollback runs fn in a transaction that is always rolled back, so only
-// the values fn observed matter.
-func inTxRollback(t *testing.T, ctx context.Context, repo record.Repository, fn func(tx record.RepositoryTx)) {
-	t.Helper()
-	err := repo.RunInTx(ctx, func(tx record.RepositoryTx) error {
-		fn(tx)
-		return errTestRollback
-	})
-	require.ErrorIs(t, err, errTestRollback)
-}
+const postSchema = "https://schema.example/post.json"
 
 // ptr returns a pointer to v.
 func ptr[T any](v T) *T {
@@ -201,130 +86,183 @@ func SignedDocument(t *testing.T, doc any) concrnt.SignedDocument {
 	}
 }
 
-// createChunklineRecord commits a plain record under key, owned by con1owner,
-// with the given createdAt — the shape the chunkline suites feed on.
-func createChunklineRecord(t *testing.T, ctx context.Context, repo record.Repository, id string, key string, createdAt time.Time) {
-	t.Helper()
+// commitOf is the commit log entry of sd under id.
+func commitOf(id string, sd concrnt.SignedDocument, owner string) record.Commit {
+	return record.Commit{ID: id, IP: "127.0.0.1", Document: sd.Document, Proof: sd.Proof, Owner: owner}
+}
 
+// ownerOf is the owner of a cckv key.
+func ownerOf(t *testing.T, key string) string {
+	t.Helper()
+	parsed, err := concrnt.ParseCCURI(key)
+	require.NoError(t, err)
+	return parsed.Owner
+}
+
+// recordCommit builds the commit of a plain record at key, authored by the
+// key's owner; edit adjusts it before the document is rendered from it, so
+// the document always says what the commit does.
+func recordCommit(t *testing.T, id, key string, createdAt time.Time, edit ...func(*record.RecordCommit)) record.RecordCommit {
+	t.Helper()
+	owner := ownerOf(t, key)
+	rc := record.RecordCommit{
+		Commit:        record.Commit{ID: id, IP: "127.0.0.1", Owner: owner},
+		Key:           key,
+		Author:        owner,
+		Schema:        postSchema,
+		Distributions: []string{},
+		CreatedAt:     createdAt,
+	}
+	for _, fn := range edit {
+		fn(&rc)
+	}
+	var distributes *[]string
+	if len(rc.Distributions) > 0 {
+		distributes = &rc.Distributions
+	}
 	sd := SignedDocument(t, concrnt.Document[map[string]string]{
-		Kind:      "record",
-		Key:       key,
-		Value:     map[string]string{"body": id},
-		Author:    "con1author",
-		Schema:    "https://schema.example/post.json",
-		CreatedAt: createdAt,
+		Kind:        "record",
+		Key:         key,
+		Value:       map[string]string{"id": id},
+		Author:      rc.Author,
+		Schema:      rc.Schema,
+		CreatedAt:   createdAt,
+		OnUpdate:    rc.OnUpdate,
+		Distributes: distributes,
 	})
+	rc.Document, rc.Proof = sd.Document, sd.Proof
+	return rc
+}
 
-	withCommit(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx record.RepositoryTx) error {
-		_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
-		return err
+// putRecord applies a record that must be Applied and returns its commit
+// and outcome.
+func putRecord(t *testing.T, ctx context.Context, repo record.Repository, id, key string, createdAt time.Time, edit ...func(*record.RecordCommit)) (record.RecordCommit, record.RecordOutcome) {
+	t.Helper()
+	rc := recordCommit(t, id, key, createdAt, edit...)
+	outcome, err := repo.ApplyRecord(ctx, rc)
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, outcome.Status, "record %s must apply", id)
+	return rc, outcome
+}
+
+// putCommit records a commit that stores nothing but its log entry (a
+// delete without removals), for the suites that are about the log itself.
+func putCommit(t *testing.T, ctx context.Context, repo record.Repository, id, owner, document string) {
+	t.Helper()
+	outcome, err := repo.ApplyDelete(ctx, record.DeleteCommit{
+		Commit: &record.Commit{ID: id, IP: "127.0.0.1", Document: document, Proof: concrnt.Proof{Type: concrnt.ProofTypeNone}, Owner: owner},
 	})
-}
-
-// mustCommit fetches the commit log id and fails the test when it is absent.
-func mustCommit(t *testing.T, ctx context.Context, in Inspector, id string) CommitState {
-	t.Helper()
-	commit, err := in.Commit(ctx, id)
 	require.NoError(t, err)
-	require.NotNil(t, commit, "commit log %s must exist", id)
-	return *commit
+	require.Equal(t, record.Applied, outcome.Status, "commit %s must apply", id)
 }
 
-// commitExists reports whether the commit log id is present.
-func commitExists(t *testing.T, ctx context.Context, in Inspector, id string) bool {
+// commitEntry reads the commit log entry id; nil when the log has none.
+func commitEntry(t *testing.T, ctx context.Context, repo record.Repository, id string) *record.CommitLogEntry {
 	t.Helper()
-	commit, err := in.Commit(ctx, id)
+	entries, err := repo.ListCommitLogs(ctx, record.CommitLogPage{FromID: id, UntilID: id, Limit: 1})
 	require.NoError(t, err)
-	return commit != nil
+	if len(entries) == 0 {
+		return nil
+	}
+	require.Equal(t, id, entries[0].ID)
+	return &entries[0]
 }
 
-// mustRecord fetches the record payload for documentID and fails the test
-// when it is absent.
-func mustRecord(t *testing.T, ctx context.Context, in Inspector, documentID string) RecordState {
+// commitExists reports whether the commit log holds id.
+func commitExists(t *testing.T, ctx context.Context, repo record.Repository, id string) bool {
 	t.Helper()
-	rec, err := in.Record(ctx, documentID)
+	return commitEntry(t, ctx, repo, id) != nil
+}
+
+// gcCutoff sorts above every commit id the suites use (lowercase letters,
+// digits and hyphens, never starting with "z"), under any collation.
+const gcCutoff = "zzzzzzzzzzzzzzzz"
+
+// gcFlagged reports whether commit id is flagged for gc.
+func gcFlagged(t *testing.T, ctx context.Context, repo record.Repository, id string) bool {
+	t.Helper()
+	after := ""
+	for {
+		page, err := repo.ListGcCandidates(ctx, gcCutoff, after, 100)
+		require.NoError(t, err)
+		for _, entry := range page {
+			if entry.ID == id {
+				return true
+			}
+		}
+		if len(page) < 100 {
+			return false
+		}
+		after = page[len(page)-1].ID
+	}
+}
+
+// resolve reads uri; nil when it resolves to nothing.
+func resolve(t *testing.T, ctx context.Context, repo record.Repository, uri string) *concrnt.SignedDocument {
+	t.Helper()
+	sd, err := repo.GetSignedDocument(ctx, uri)
+	if errors.Is(err, domain.ErrNotFound) {
+		return nil
+	}
 	require.NoError(t, err)
-	require.NotNil(t, rec, "record %s must exist", documentID)
-	return *rec
+	return sd
 }
 
-// recordExists reports whether the record payload for documentID is present.
-func recordExists(t *testing.T, ctx context.Context, in Inspector, documentID string) bool {
+// ccfsOf is the ccfs URI of commit id in owner's namespace.
+func ccfsOf(owner, id string) string {
+	return concrnt.ComposeCCFSURI(owner, concrnt.CCFSTypeConcrnt, id)
+}
+
+// rowKeys are the cckv keys of listing rows, in order.
+func rowKeys(t *testing.T, rows []record.QueryRow) []string {
 	t.Helper()
-	rec, err := in.Record(ctx, documentID)
+	keys := make([]string, 0, len(rows))
+	for _, row := range rows {
+		require.NotNil(t, row.Row.CCKV)
+		keys = append(keys, *row.Row.CCKV)
+	}
+	return keys
+}
+
+// rowIDs are the commit ids of listing rows, read out of their ccfs URIs.
+func rowIDs(t *testing.T, rows []record.QueryRow) []string {
+	t.Helper()
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		require.NotNil(t, row.Row.CCFS)
+		parsed, err := concrnt.ParseCCURI(*row.Row.CCFS)
+		require.NoError(t, err)
+		ids = append(ids, parsed.CDID)
+	}
+	return ids
+}
+
+// removeKeys deletes the records at keys under a delete commit id and
+// returns the outcome.
+func removeKeys(t *testing.T, ctx context.Context, repo record.Repository, id, owner string, keys ...string) record.DeleteOutcome {
+	t.Helper()
+	removals := make([]record.Removal, len(keys))
+	for i, key := range keys {
+		removals[i] = record.Removal{Kind: record.RemoveKey, URI: key}
+	}
+	sd := SignedDocument(t, concrnt.Document[string]{Kind: "delete", Value: fmt.Sprint(keys), Author: owner})
+	commit := commitOf(id, sd, owner)
+	outcome, err := repo.ApplyDelete(ctx, record.DeleteCommit{Commit: &commit, Removals: removals})
 	require.NoError(t, err)
-	return rec != nil
+	require.Equal(t, record.Applied, outcome.Status)
+	require.Len(t, outcome.Removed, len(keys))
+	return outcome
 }
 
-// mustRecordKey fetches the key state for uri and fails the test when the
-// key is absent altogether.
-func mustRecordKey(t *testing.T, ctx context.Context, in Inspector, uri string) KeyState {
+// runCleanups runs every cleanup chain to its end.
+func runCleanups(t *testing.T, ctx context.Context, repo record.Repository, tokens []string) {
 	t.Helper()
-	key, err := in.RecordKey(ctx, uri)
-	require.NoError(t, err)
-	require.NotNil(t, key, "record key %s must exist", uri)
-	return *key
-}
-
-// keyPointsAtRecord reports whether uri currently resolves to a record (a
-// missing key and a placeholder both count as not pointing anywhere).
-func keyPointsAtRecord(t *testing.T, ctx context.Context, in Inspector, uri string) bool {
-	t.Helper()
-	key, err := in.RecordKey(ctx, uri)
-	require.NoError(t, err)
-	return key != nil && key.RecordID != nil
-}
-
-// mustEntity fetches the entity ccid and fails the test when it is absent.
-func mustEntity(t *testing.T, ctx context.Context, in Inspector, ccid string) EntityState {
-	t.Helper()
-	entity, err := in.Entity(ctx, ccid)
-	require.NoError(t, err)
-	require.NotNil(t, entity, "entity %s must exist", ccid)
-	return *entity
-}
-
-// mustAssociation fetches the association documentID and fails the test when
-// it is absent.
-func mustAssociation(t *testing.T, ctx context.Context, in Inspector, documentID string) AssociationState {
-	t.Helper()
-	assoc, err := in.Association(ctx, documentID)
-	require.NoError(t, err)
-	require.NotNil(t, assoc, "association %s must exist", documentID)
-	return *assoc
-}
-
-// associationExists reports whether the association documentID is present.
-func associationExists(t *testing.T, ctx context.Context, in Inspector, documentID string) bool {
-	t.Helper()
-	assoc, err := in.Association(ctx, documentID)
-	require.NoError(t, err)
-	return assoc != nil
-}
-
-// mustAck fetches the acker-side state of (from, to, schema) and fails the
-// test when it is absent.
-func mustAck(t *testing.T, ctx context.Context, in Inspector, from, to, schema string) AckState {
-	t.Helper()
-	ack, err := in.Ack(ctx, from, to, schema)
-	require.NoError(t, err)
-	require.NotNil(t, ack, "ack state %s -> %s (%s) must exist", from, to, schema)
-	return *ack
-}
-
-// mustAcked fetches the target-side state of (from, to, schema) and fails
-// the test when it is absent.
-func mustAcked(t *testing.T, ctx context.Context, in Inspector, from, to, schema string) AckState {
-	t.Helper()
-	acked, err := in.Acked(ctx, from, to, schema)
-	require.NoError(t, err)
-	require.NotNil(t, acked, "acked state %s -> %s (%s) must exist", from, to, schema)
-	return *acked
-}
-
-// requireCommitOwner asserts the single owner a commit log is recorded under.
-func requireCommitOwner(t *testing.T, ctx context.Context, in Inspector, commitID string, owner string) {
-	t.Helper()
-	commit := mustCommit(t, ctx, in, commitID)
-	require.Equal(t, owner, commit.Owner, "owner of commit %s", commitID)
+	for _, token := range tokens {
+		for steps := 0; token != ""; steps++ {
+			require.Less(t, steps, 10000, "a cleanup chain must end")
+			next, err := repo.Cleanup(ctx, token)
+			require.NoError(t, err)
+			token = next
+		}
+	}
 }

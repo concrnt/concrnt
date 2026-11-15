@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,6 +34,10 @@ var (
 	firestoreHost       string
 	firestoreResource   *dockertest.Resource
 	firestoreProjectSeq atomic.Int64
+	// firestoreRun tells the projects of this test process from those an
+	// earlier one left in an emulator that outlives it
+	// (CONCRNT_TEST_FIRESTORE_HOST).
+	firestoreRun = strconv.FormatInt(time.Now().UnixNano(), 36)
 )
 
 // firestoreEmulator returns the host:port of a Firestore emulator: the one
@@ -100,18 +105,19 @@ func PurgeFirestore() {
 // CreateFirestore returns a client on an empty database: every call
 // targets a fresh project id, and the emulator namespaces data per project,
 // so tests share the (slow to boot) container without cleaning up after
-// each other.
-func CreateFirestore(t *testing.T) *firestore.Client {
+// each other. Extra dial options (an interceptor counting RPCs, say) are
+// added to the connection.
+func CreateFirestore(t *testing.T, opts ...grpc.DialOption) *firestore.Client {
 	t.Helper()
 	host := firestoreEmulator(t)
 
 	// Dial options instead of FIRESTORE_EMULATOR_HOST keep the process
 	// environment untouched across packages.
-	project := fmt.Sprintf("test-%s-%d", sanitizeProject(t.Name()), firestoreProjectSeq.Add(1))
-	conn, err := grpc.NewClient(host,
+	project := fmt.Sprintf("test-%s-%s-%d", sanitizeProject(t.Name()), firestoreRun, firestoreProjectSeq.Add(1))
+	conn, err := grpc.NewClient(host, append([]grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithPerRPCCredentials(emulatorCreds{}),
-	)
+	}, opts...)...)
 	if err != nil {
 		t.Fatalf("failed to dial firestore emulator: %v", err)
 	}

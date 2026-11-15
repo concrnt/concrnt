@@ -14,77 +14,70 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) CreateEntity(
-	ctx context.Context,
-	tx ucrecord.RepositoryTx,
-	ccid string,
-	alias *string,
-	domain string,
-	documentID string,
-	createdAt time.Time,
-) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateEntity")
+// ApplyEntity is CIP-3 §3.4 accept-if-newer on the document's createdAt:
+// only a strictly newer document replaces the stored one, an equal or
+// older one is Stale. The read locks the entity row (or its absence), so
+// concurrent writers serialise and converge on the same winner.
+func (r *Repository) ApplyEntity(ctx context.Context, commit ucrecord.EntityCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyEntity")
 	defer span.End()
 
-	stx, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+	status, err := r.apply(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) (ucrecord.ApplyStatus, error) {
+		read, err := readSet[struct {
+			Duplicate bool       `spanner:"duplicate"`
+			CreatedAt *time.Time `spanner:"created_at"`
+		}](ctx, tx, spanner.Statement{
+			SQL:    "SELECT " + duplicateCommit + ", (SELECT created_at FROM entities WHERE ccid = @ccid) AS created_at",
+			Params: map[string]any{"id": commit.ID, "ccid": commit.CCID},
+		})
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if read.Duplicate {
+			return ucrecord.Duplicate, nil
+		}
+		if read.CreatedAt != nil && !commit.CreatedAt.After(*read.CreatedAt) {
+			return ucrecord.Stale, nil
+		}
 
-	// CIP-3 §3.4 accept-if-newer on the document's createdAt: only a strictly
-	// newer document replaces the stored one; an equal or older one is a
-	// no-op. The read locks the row, so concurrent writers serialise (one
-	// aborts and re-runs) and converge on the same winner.
-	old, found, err := spannerdb.QueryOne[struct {
-		CreatedAt time.Time `spanner:"created_at"`
-	}](ctx, stx, spanner.Statement{
-		SQL:    "SELECT created_at FROM entities WHERE ccid = @ccid",
-		Params: map[string]any{"ccid": ccid},
+		insert, err := insertCommit(commit.Commit, false)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		now := time.Now().UTC()
+		entity := spanner.Insert("entities",
+			[]string{"ccid", "alias", "domain", "tag", "document_id", "created_at", "c_date", "m_date"},
+			[]any{commit.CCID, commit.Alias, commit.Domain, "", commit.ID, commit.CreatedAt, now, now})
+		if read.CreatedAt != nil {
+			// tag and c_date belong to the entity, not to the document that
+			// currently registers it
+			entity = spanner.Update("entities",
+				[]string{"ccid", "alias", "domain", "document_id", "created_at", "m_date"},
+				[]any{commit.CCID, commit.Alias, commit.Domain, commit.ID, commit.CreatedAt, now})
+		}
+		return ucrecord.Applied, tx.BufferWrite([]*spanner.Mutation{insert, entity})
 	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
 	}
-	params := map[string]any{"ccid": ccid, "alias": alias, "domain": domain, "document_id": documentID, "created_at": createdAt}
-	var affected int64
-	if found {
-		if !createdAt.After(old.CreatedAt) {
-			return false, nil
-		}
-		affected, err = stx.Update(ctx, spanner.Statement{
-			SQL: `UPDATE entities SET alias = @alias, domain = @domain, document_id = @document_id, created_at = @created_at, m_date = CURRENT_TIMESTAMP()
-				WHERE ccid = @ccid`,
-			Params: params,
-		})
-	} else {
-		affected, err = stx.Update(ctx, spanner.Statement{
-			SQL: `INSERT OR IGNORE INTO entities (ccid, alias, domain, tag, document_id, created_at, c_date, m_date)
-				VALUES (@ccid, @alias, @domain, '', @document_id, @created_at, CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP())`,
-			Params: params,
-		})
-	}
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
-	return affected > 0, nil
+	return status, err
 }
 
 // MarkCommitLogsGcCandidateByOwner flags every commit log owned by the given
 // ccid as a GC candidate. Every commit has exactly one owner (an ack between
 // two local users is two commits: the ack owned by the acker and the acked
-// owned by the target), so nothing another user holds is touched. Idempotent.
+// owned by the target), so nothing another user holds is touched. The
+// statement runs as partitioned DML: an owner's log has no upper bound and
+// one transaction over it would meet the commit's mutation limit, while the
+// partitions commit separately. That is not atomic, which the contract does
+// not ask for, and the statement is idempotent as partitioned DML must be.
 func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
 	ctx, span := tracer.Start(ctx, "Repository.MarkCommitLogsGcCandidateByOwner")
 	defer span.End()
 
-	_, err := r.client.ReadWriteTransaction(ctx, func(ctx context.Context, tx *spanner.ReadWriteTransaction) error {
-		_, err := tx.Update(ctx, spanner.Statement{
-			SQL:    "UPDATE commit_logs SET gc_candidate = true WHERE owner = @owner AND NOT gc_candidate",
-			Params: map[string]any{"owner": owner},
-		})
-		return err
+	_, err := r.client.PartitionedUpdate(ctx, spanner.Statement{
+		SQL:    "UPDATE commit_logs SET gc_candidate = true WHERE owner = @owner AND NOT gc_candidate",
+		Params: map[string]any{"owner": owner},
 	})
 	if err != nil {
 		span.RecordError(err)

@@ -50,7 +50,7 @@ func (m subscriptionRow) domain() domain.NotificationSubscription {
 }
 
 // Subscribe upserts by (vendor_id, owner); a zero CDate / MDate is stamped
-// now, like the gorm hooks of the other backends.
+// now.
 func (r *NotificationRepository) Subscribe(ctx context.Context, subscription domain.NotificationSubscription) (domain.NotificationSubscription, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()

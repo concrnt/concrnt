@@ -2,6 +2,7 @@ package repotest
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -17,6 +19,7 @@ import (
 // return a fresh, isolated backend per call.
 func RunMaintenanceSuite(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("GcCandidates", func(t *testing.T) { testMaintenanceGcCandidates(t, open(t)) })
+	t.Run("DeleteCommitLogsTakesDependents", func(t *testing.T) { testMaintenanceDeleteCommitLogsTakesDependents(t, open(t)) })
 	t.Run("ListCommitLogs", func(t *testing.T) { testMaintenanceListCommitLogs(t, open(t)) })
 }
 
@@ -25,20 +28,20 @@ func RunMaintenanceSuite(t *testing.T, open func(t *testing.T) Backend) {
 func seedMaintenanceCommit(t *testing.T, ctx context.Context, repo record.Repository, owner string, n byte, createdAt time.Time) string {
 	t.Helper()
 	id := cdid.New([10]byte{n}, createdAt).String()
-	key := "cckv://" + owner + "/" + id
-	sd := SignedDocument(t, concrnt.Document[map[string]string]{
-		Kind:      "record",
-		Key:       key,
-		Value:     map[string]string{"id": id},
-		Author:    owner,
-		Schema:    "https://schema.example/post.json",
-		CreatedAt: createdAt,
-	})
-	withCommit(t, ctx, repo, id, "10.0.0."+string(rune('1'+n)), sd, owner, func(tx record.RepositoryTx) error {
-		_, err := repo.CreateRecord(ctx, tx, id, key, owner, owner, "https://schema.example/post.json", nil, nil, []string{}, nil, createdAt)
-		return err
-	})
+	rc := recordCommit(t, id, "cckv://"+owner+"/"+id, createdAt)
+	rc.IP = "10.0.0." + string(rune('1'+n))
+	outcome, err := repo.ApplyRecord(ctx, rc)
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, outcome.Status)
 	return id
+}
+
+// flagForGc flags commits the way a delete does.
+func flagForGc(t *testing.T, ctx context.Context, repo record.Repository, ids ...string) {
+	t.Helper()
+	outcome, err := repo.ApplyDelete(ctx, record.DeleteCommit{GcCommitIDs: ids})
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, outcome.Status)
 }
 
 // Only gc-flagged commits below the cutoff id are candidates; they page by
@@ -54,11 +57,7 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	old2 := seedMaintenanceCommit(t, ctx, repo, owner, 1, base.Add(time.Hour))
 	recent := seedMaintenanceCommit(t, ctx, repo, owner, 2, base.Add(3*time.Hour))
 	oldKept := seedMaintenanceCommit(t, ctx, repo, owner, 3, base.Add(30*time.Minute))
-	inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-		for _, id := range []string{old1, old2, recent} {
-			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, id))
-		}
-	})
+	flagForGc(t, ctx, repo, old1, old2, recent)
 	cutoff := cdid.New([10]byte{}, base.Add(2*time.Hour)).String()
 
 	count, err := repo.CountGcCandidates(ctx, cutoff)
@@ -87,18 +86,70 @@ func testMaintenanceGcCandidates(t *testing.T, be Backend) {
 	deleted, err := repo.DeleteCommitLogs(ctx, []string{old1, old2, "missing"})
 	require.NoError(t, err)
 	require.Equal(t, 2, deleted)
-	require.False(t, commitExists(t, ctx, be.Inspect, old1))
-	require.False(t, recordExists(t, ctx, be.Inspect, old1))
-	require.True(t, commitExists(t, ctx, be.Inspect, oldKept))
-	require.True(t, recordExists(t, ctx, be.Inspect, recent))
+	require.False(t, commitExists(t, ctx, repo, old1))
+	require.Nil(t, resolve(t, ctx, repo, "cckv://"+owner+"/"+old1), "the record went with its commit")
+	require.Nil(t, resolve(t, ctx, repo, ccfsOf(owner, old1)))
+	require.True(t, commitExists(t, ctx, repo, oldKept))
+	require.NotNil(t, resolve(t, ctx, repo, "cckv://"+owner+"/"+recent))
 
 	count, err = repo.CountGcCandidates(ctx, cutoff)
 	require.NoError(t, err)
 	require.Zero(t, count)
 
+	deleted, err = repo.DeleteCommitLogs(ctx, []string{old1})
+	require.NoError(t, err)
+	require.Zero(t, deleted, "deleting again is harmless")
+
 	deleted, err = repo.DeleteCommitLogs(ctx, nil)
 	require.NoError(t, err)
 	require.Zero(t, deleted)
+}
+
+// Everything anchored to a commit goes with it: an association, an ack
+// state, an entity, and a record with its key, which ends the key's
+// incarnation like any other removal.
+func testMaintenanceDeleteCommitLogsTakesDependents(t *testing.T, be Backend) {
+	ctx := context.Background()
+	repo := be.Record
+
+	at := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
+	like := "https://schema.example/like.json"
+	key := "cckv://con1owner/gc/post"
+	other := "cckv://con1owner/gc/other"
+	putRecord(t, ctx, repo, "gc-post", key, at)
+	putRecord(t, ctx, repo, "gc-other", other, at)
+	putAssociation(t, ctx, repo, key, associationFixture{"gc-post-like", "con1alice", like, nil, at})
+	putAssociation(t, ctx, repo, other, associationFixture{"gc-other-like-1", "con1alice", like, nil, at})
+	putAssociation(t, ctx, repo, other, associationFixture{"gc-other-like-2", "con1bob", like, nil, at.Add(time.Minute)})
+	outcome, err := repo.ApplyAck(ctx, ackCommit(t, "gc-ack", record.AckerSide, "con1alice", "con1owner", true, at))
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, outcome.Status)
+	status, err := repo.ApplyEntity(ctx, record.EntityCommit{
+		Commit: record.Commit{ID: "gc-entity", Document: "{}", Owner: "con1gone"}, CCID: "con1gone", Domain: "example.com", CreatedAt: at,
+	})
+	require.NoError(t, err)
+	require.Equal(t, record.Applied, status)
+
+	deleted, err := repo.DeleteCommitLogs(ctx, []string{"gc-post", "gc-other-like-1", "gc-ack", "gc-entity"})
+	require.NoError(t, err)
+	require.Equal(t, 4, deleted)
+
+	require.Nil(t, resolve(t, ctx, repo, key))
+	rows, err := repo.GetAssociatedRecords(ctx, other, "", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Equal(t, []string{"gc-other-like-2"}, rowIDs(t, rows))
+	rows, err = repo.GetAcknowledgeRecords(ctx, "con1alice", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Empty(t, rows)
+	_, err = repo.GetEntityByCCID(ctx, "con1gone")
+	require.True(t, errors.Is(err, domain.ErrNotFound), "expected not found, got %v", err)
+
+	// the key's incarnation ended: a record written to it starts clean
+	_, recreated := putRecord(t, ctx, repo, "gc-post-again", key, at.Add(time.Hour))
+	require.True(t, recreated.FreshKey)
+	rows, err = repo.GetAssociatedRecords(ctx, key, "", "", "", nil, nil, 0, "asc")
+	require.NoError(t, err)
+	require.Empty(t, rows)
 }
 
 // ListCommitLogs pages the whole log in id order with inclusive from/until,

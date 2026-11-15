@@ -2,6 +2,7 @@ package record
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -145,32 +146,27 @@ func TestCommitAckOwnerIsAuthor(t *testing.T) {
 				t.Fatalf("result ccfs = %v, want %s", result.CCFS, wantCCFS)
 			}
 
-			if len(repo.createdCommitLogs) != 1 || repo.createdCommitLogs[0] != id {
-				t.Fatalf("CreateCommitLog calls = %v, want exactly [%s]", repo.createdCommitLogs, id)
+			if len(repo.commitIDs) != 1 || repo.commitIDs[0] != id {
+				t.Fatalf("Apply calls = %v, want exactly [%s]", repo.commitIDs, id)
 			}
 			if repo.commitLogOwners[id] != from.ccid {
 				t.Fatalf("ack commit owner = %q, want author %s", repo.commitLogOwners[id], from.ccid)
 			}
 
-			wantMethod := "Acknowledge"
-			if kind == "unack" {
-				wantMethod = "UnAcknowledge"
+			// the acker's server moves the acker-side state only, never the
+			// target-side acked state, for its own ack
+			if len(repo.ackCommits) != 1 {
+				t.Fatalf("ack transitions = %+v, want exactly one", repo.ackCommits)
 			}
-			if len(repo.ackCalls) != 1 {
-				t.Fatalf("ack transitions = %+v, want exactly one", repo.ackCalls)
+			call := repo.ackCommits[0]
+			if call.Side != AckerSide || call.Valid != (kind == "ack") || call.ID != id || call.From != from.ccid || call.To != to.ccid || call.Schema != followSchema {
+				t.Fatalf("ack transition = %+v, want acker side, valid=%v (%s, from=%s, to=%s, schema=%s)", call, kind == "ack", id, from.ccid, to.ccid, followSchema)
 			}
-			call := repo.ackCalls[0]
-			if call.method != wantMethod || call.documentID != id || call.from != from.ccid || call.to != to.ccid || call.schema != followSchema {
-				t.Fatalf("ack transition = %+v, want %s(%s, from=%s, to=%s, schema=%s)", call, wantMethod, id, from.ccid, to.ccid, followSchema)
+			if doc, _ := sd.ParsedDocument(); !call.CreatedAt.Equal(doc.CreatedAt) {
+				t.Fatalf("transition createdAt = %v, want the document's %v", call.CreatedAt, doc.CreatedAt)
 			}
-			if doc, _ := sd.ParsedDocument(); !call.createdAt.Equal(doc.CreatedAt) {
-				t.Fatalf("transition createdAt = %v, want the document's %v", call.createdAt, doc.CreatedAt)
-			}
-			if repo.acknowledgedCalled || repo.unacknowledgedCalled {
-				t.Fatal("the acker's server must not write the target-side acked state for its own ack")
-			}
-			if len(repo.txs) != 1 || !repo.txs[0].committed {
-				t.Fatalf("expected a committed tx, got %+v", repo.txs)
+			if !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+				t.Fatalf("expected one applied write, got %v", repo.statuses)
 			}
 		})
 	}
@@ -262,11 +258,11 @@ func TestCommitAckImportDoesNotDeliverAcked(t *testing.T) {
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeLocalOnlyExecute); err != nil {
 		t.Fatalf("Commit returned error: %v", err)
 	}
-	if !repo.acknowledgeCalled {
+	if !repo.sawAck(AckerSide, true) {
 		t.Fatal("the ack state must still be applied on import")
 	}
-	if len(repo.txs) != 1 || !repo.txs[0].committed {
-		t.Fatalf("expected a committed tx, got %+v", repo.txs)
+	if !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+		t.Fatalf("expected one applied write, got %v", repo.statuses)
 	}
 	if len(delivery.jobs) != 0 {
 		t.Fatalf("an imported ack must not deliver an acked document, got %+v", delivery.jobs)
@@ -274,7 +270,7 @@ func TestCommitAckImportDoesNotDeliverAcked(t *testing.T) {
 }
 
 // A stale ack (accept-if-newer loss, CIP-10 §4) is a side-effect-free no-op:
-// no mirror is delivered and the tx (commit_log included) rolls back.
+// no mirror is delivered and nothing is stored (the one write ends Stale).
 func TestCommitStaleAckDeliversNothing(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	from := newAckParty(t, cfg.FQDN)
@@ -291,8 +287,8 @@ func TestCommitStaleAckDeliversNothing(t *testing.T) {
 	if len(delivery.jobs) != 0 {
 		t.Fatalf("a stale ack must not deliver anything, got %+v", delivery.jobs)
 	}
-	if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-		t.Fatalf("expected a single rolled-back tx, got %+v", repo.txs)
+	if !slices.Equal(repo.statuses, []ApplyStatus{Stale}) {
+		t.Fatalf("expected a single stale write, got %v", repo.statuses)
 	}
 }
 
@@ -306,7 +302,10 @@ func TestCommitAckedAppliesOnTargetServer(t *testing.T) {
 	from := newAckParty(t, "remote.example.net")
 	to := newAckParty(t, cfg.FQDN)
 
-	for _, tc := range []struct{ kind, wantMethod string }{{"ack", "Acknowledged"}, {"unack", "UnAcknowledged"}} {
+	for _, tc := range []struct {
+		kind      string
+		wantValid bool
+	}{{"ack", true}, {"unack", false}} {
 		t.Run(tc.kind, func(t *testing.T) {
 			repo := &recordingRecordRepo{}
 			delivery := &recordingDeliveryQueue{}
@@ -319,33 +318,32 @@ func TestCommitAckedAppliesOnTargetServer(t *testing.T) {
 			}
 			mirrorID := documentIDOf(t, mirror)
 
-			if len(repo.createdCommitLogs) != 1 || repo.createdCommitLogs[0] != mirrorID {
-				t.Fatalf("CreateCommitLog calls = %v, want exactly [%s]", repo.createdCommitLogs, mirrorID)
+			if len(repo.commitIDs) != 1 || repo.commitIDs[0] != mirrorID {
+				t.Fatalf("Apply calls = %v, want exactly [%s]", repo.commitIDs, mirrorID)
 			}
 			if repo.commitLogOwners[mirrorID] != to.ccid {
 				t.Fatalf("mirror commit owner = %q, want associate owner %s", repo.commitLogOwners[mirrorID], to.ccid)
 			}
-			if len(repo.ackCalls) != 1 {
-				t.Fatalf("ack transitions = %+v, want exactly one", repo.ackCalls)
+			// a mirror moves the target-side state only: it is never applied
+			// as a raw ack on the target's server
+			if len(repo.ackCommits) != 1 {
+				t.Fatalf("ack transitions = %+v, want exactly one", repo.ackCommits)
 			}
-			call := repo.ackCalls[0]
-			if call.method != tc.wantMethod || call.from != from.ccid || call.to != to.ccid || call.schema != followSchema {
-				t.Fatalf("ack transition = %+v, want %s(from=%s, to=%s, schema=%s)", call, tc.wantMethod, from.ccid, to.ccid, followSchema)
-			}
-			if repo.acknowledgeCalled || repo.unacknowledgeCalled {
-				t.Fatal("a mirror must not be applied as a raw ack on the target's server")
+			call := repo.ackCommits[0]
+			if call.Side != TargetSide || call.Valid != tc.wantValid || call.From != from.ccid || call.To != to.ccid || call.Schema != followSchema {
+				t.Fatalf("ack transition = %+v, want target side, valid=%v (from=%s, to=%s, schema=%s)", call, tc.wantValid, from.ccid, to.ccid, followSchema)
 			}
 			if len(delivery.jobs) != 0 {
 				t.Fatalf("a mirror must not be re-delivered, got %+v", delivery.jobs)
 			}
-			if len(repo.txs) != 1 || !repo.txs[0].committed {
-				t.Fatalf("expected a committed tx, got %+v", repo.txs)
+			if !slices.Equal(repo.statuses, []ApplyStatus{Applied}) {
+				t.Fatalf("expected one applied write, got %v", repo.statuses)
 			}
 			// CIP-10 §4 / §5.2: the accept-if-newer key is the document's
 			// createdAt, which the mirror inherits from the original ack, so
 			// both servers compare the same value.
-			if doc, _ := ack.ParsedDocument(); !call.createdAt.Equal(doc.CreatedAt) {
-				t.Fatalf("transition createdAt = %v, want the original ack's %v", call.createdAt, doc.CreatedAt)
+			if doc, _ := ack.ParsedDocument(); !call.CreatedAt.Equal(doc.CreatedAt) {
+				t.Fatalf("transition createdAt = %v, want the original ack's %v", call.CreatedAt, doc.CreatedAt)
 			}
 		})
 	}
@@ -370,8 +368,8 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if !repo.acknowledgedCalled {
-			t.Fatal("Acknowledged was not called for a verified mirror")
+		if !repo.sawAck(TargetSide, true) {
+			t.Fatal("the target-side state was not written for a verified mirror")
 		}
 	})
 
@@ -384,7 +382,7 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", forged, domain.CommitModeExecute); err == nil {
 			t.Fatal("a mirror whose kind does not correspond to the embedded ack must be rejected")
 		}
-		if repo.acknowledgedCalled || repo.unacknowledgedCalled {
+		if len(repo.commitIDs) != 0 {
 			t.Fatal("a forged mirror must not reach the repository")
 		}
 	})
@@ -399,7 +397,7 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", selfSigned, domain.CommitModeExecute); err == nil {
 			t.Fatal("an author-signed acked document must be rejected")
 		}
-		if repo.acknowledgedCalled {
+		if len(repo.commitIDs) != 0 {
 			t.Fatal("an author-signed acked document must not reach the repository")
 		}
 	})
@@ -443,8 +441,8 @@ func TestCommitAckedExemptions(t *testing.T) {
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", derivedAcked(t, old), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if !repo.acknowledgedCalled {
-			t.Fatal("Acknowledged was not called for a backdated mirror")
+		if !repo.sawAck(TargetSide, true) {
+			t.Fatal("the target-side state was not written for a backdated mirror")
 		}
 	})
 
@@ -456,8 +454,8 @@ func TestCommitAckedExemptions(t *testing.T) {
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if !repo.acknowledgedCalled {
-			t.Fatal("Acknowledged was not called for a mirror across a block")
+		if !repo.sawAck(TargetSide, true) {
+			t.Fatal("the target-side state was not written for a mirror across a block")
 		}
 	})
 
@@ -471,15 +469,15 @@ func TestCommitAckedExemptions(t *testing.T) {
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if !repo.acknowledgedCalled {
-			t.Fatal("Acknowledged was not called for a mirror whose author is unresolvable")
+		if !repo.sawAck(TargetSide, true) {
+			t.Fatal("the target-side state was not written for a mirror whose author is unresolvable")
 		}
 	})
 
 	t.Run("ignored when the associate owner is not local", func(t *testing.T) {
 		// a server that manages neither side has nothing to hold: the commit
-		// is a no-op success (CIP-3 §3.1), nothing is stored and the tx
-		// rolls back
+		// is a no-op success (CIP-3 §3.1) decided before any write, so the
+		// repository is not called at all
 		elsewhere := newAckParty(t, "other.example.net")
 		repo := &recordingRecordRepo{}
 		uc := newAckUsecase(cfg, repo, residenceOf(from, elsewhere), &recordingDeliveryQueue{})
@@ -488,11 +486,8 @@ func TestCommitAckedExemptions(t *testing.T) {
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
 		}
-		if repo.acknowledgedCalled {
-			t.Fatal("a mirror for an associate owner this server does not manage must not reach the repository")
-		}
-		if len(repo.txs) != 1 || repo.txs[0].committed || !repo.txs[0].rolledBack {
-			t.Fatalf("expected a single rolled-back tx, got %+v", repo.txs)
+		if len(repo.commitIDs) != 0 {
+			t.Fatalf("a mirror for an associate owner this server does not manage must not reach the repository, got %v", repo.commitIDs)
 		}
 	})
 }

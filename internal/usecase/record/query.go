@@ -9,7 +9,6 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/utils"
 )
 
@@ -17,8 +16,7 @@ import (
 // the peeked row past the window becomes next, the window head becomes prev.
 // Cursors are computed before any read-access filtering so that clients can
 // page past rows that get filtered out. The cursor is the row's sort key:
-// its cckv for orderBy "key", otherwise its CreatedAt as RFC3339Nano (the
-// same text encoding/json gave the former *time.Time cursors).
+// its cckv for orderBy "key", otherwise its CreatedAt as RFC3339Nano.
 func paginateWindow(rows []QueryRow, limit int, orderBy string) ([]concrnt.SignedDocument, *string, *string) {
 	cursor := func(row QueryRow) *string {
 		var value string
@@ -64,10 +62,11 @@ func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, sch
 	}
 	// one entry per side holds every schema; the schema filter is applied
 	// on the way out
-	counts, err := aggregate.Get(ctx, uc.agg, uc.aggs.acks, ackTarget(from, to))
+	entry, err := uc.agg.Get(ctx, uc.aggs.acks, ackTarget(from, to))
 	if err != nil {
 		return nil, err
 	}
+	counts := ackCountsOf(entry)
 	if schema == "" {
 		return counts, nil
 	}

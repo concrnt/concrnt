@@ -86,10 +86,9 @@ var gcCommitlogCmd = &cobra.Command{
 		// keeping the match strictly older-than. Hash-based ids ('x'-prefixed)
 		// sort above any realistic time prefix and are never gc candidates.
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
-		maint := op.Record
 
 		if gcCommitlogDryRun {
-			count, err := maint.CountGcCandidates(ctx, cutoff)
+			count, err := op.Record.CountGcCandidates(ctx, cutoff)
 			if err != nil {
 				return fmt.Errorf("failed to count commit logs: %w", err)
 			}
@@ -106,7 +105,7 @@ var gcCommitlogCmd = &cobra.Command{
 		if bucket == "" {
 			for {
 				// batching keeps each delete (and its cascade) bounded
-				logs, err := maint.ListGcCandidates(ctx, cutoff, "", gcCommitlogBatchSize)
+				logs, err := op.Record.ListGcCandidates(ctx, cutoff, "", gcCommitlogBatchSize)
 				if err != nil {
 					return fmt.Errorf("failed to list commit logs: %w", err)
 				}
@@ -117,7 +116,7 @@ var gcCommitlogCmd = &cobra.Command{
 				for _, cl := range logs {
 					ids = append(ids, cl.ID)
 				}
-				deleted, err := maint.DeleteCommitLogs(ctx, ids)
+				deleted, err := op.Record.DeleteCommitLogs(ctx, ids)
 				if err != nil {
 					return fmt.Errorf("failed to delete commit logs: %w", err)
 				}
@@ -147,7 +146,7 @@ var gcCommitlogCmd = &cobra.Command{
 		var ids []string
 		cursor := ""
 		for {
-			logs, err := maint.ListGcCandidates(ctx, cutoff, cursor, gcCommitlogBatchSize)
+			logs, err := op.Record.ListGcCandidates(ctx, cutoff, cursor, gcCommitlogBatchSize)
 			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}
@@ -182,7 +181,7 @@ var gcCommitlogCmd = &cobra.Command{
 		// Only now, with the backup durable, delete exactly the backed-up rows.
 		for start := 0; start < len(ids); start += gcCommitlogBatchSize {
 			batch := ids[start:min(start+gcCommitlogBatchSize, len(ids))]
-			deleted, err := maint.DeleteCommitLogs(ctx, batch)
+			deleted, err := op.Record.DeleteCommitLogs(ctx, batch)
 			if err != nil {
 				return fmt.Errorf("failed to delete commit logs: %w", err)
 			}

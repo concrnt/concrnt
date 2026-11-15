@@ -1,5 +1,7 @@
-// Package memcached keeps aggregate entries in memcached. Apply is a gets /
-// cas loop, like the WATCH / MULTI loop of the Redis store.
+// Package memcached keeps aggregate entries in memcached, one item per
+// entry. memcached has no atomic operation over several fields, so Add is a
+// gets / cas loop inside the store: the writers of one key retry here until
+// each of them has landed.
 //
 // memcached cannot list its keys, so InvalidateDefinition and InvalidateAll
 // work through generation numbers instead of deleting: every stored key
@@ -30,9 +32,9 @@ import (
 )
 
 const (
-	applyAttempts = 32
-	putAttempts   = 4
-	genCacheTTL   = 5 * time.Second
+	addAttempts = 32
+	putAttempts = 4
+	genCacheTTL = 5 * time.Second
 	// memcached reads an expiration above 30 days as a unix timestamp
 	maxRelativeExpiration = 30 * 24 * time.Hour
 )
@@ -53,25 +55,29 @@ type cachedGen struct {
 // New stores the entries in mc under keys starting with namespace (which
 // lets several stores share one memcached).
 func New(mc *memcache.Client, namespace string) *Store {
-	return &Store{mc: mc, ns: namespace + "agg:", gens: map[string]cachedGen{}}
+	// "agg2:" keeps the items apart from the differently shaped ones this
+	// store wrote under "agg:" before, which expire on their own
+	return &Store{mc: mc, ns: namespace + "agg2:", gens: map[string]cachedGen{}}
 }
 
 // envelope is the stored item. ExpiresAt is kept alongside the memcached
 // expiration because memcached only counts whole seconds and a cas has to
 // restate the expiration it keeps.
 type envelope struct {
-	Value     []byte    `json:"v"`
-	AsOf      time.Time `json:"asOf"`
-	Deltas    int       `json:"d"`
-	ExpiresAt time.Time `json:"exp"`
+	Counts    map[string]int64 `json:"c,omitempty"`
+	Minima    map[string]int64 `json:"m,omitempty"`
+	Members   []string         `json:"s,omitempty"`
+	AsOf      time.Time        `json:"asOf"`
+	Deltas    int64            `json:"d"`
+	ExpiresAt time.Time        `json:"exp"`
 }
 
 func (e envelope) live(now time.Time) bool {
 	return now.Before(e.ExpiresAt)
 }
 
-func (e envelope) entry() *aggregate.Entry {
-	return &aggregate.Entry{Value: e.Value, AsOf: e.AsOf, Deltas: e.Deltas}
+func (e envelope) counters() aggregate.Counters {
+	return aggregate.Counters{Counts: e.Counts, Minima: e.Minima, Members: e.Members, AsOf: e.AsOf, Deltas: e.Deltas}
 }
 
 func decode(raw []byte) (envelope, error) {
@@ -146,7 +152,7 @@ func (s *Store) generations(keys ...string) (map[string]string, error) {
 	return out, nil
 }
 
-func (s *Store) Get(_ context.Context, key string) (*aggregate.Entry, bool, error) {
+func (s *Store) Get(_ context.Context, key string) (*aggregate.Counters, bool, error) {
 	k, err := s.itemKey(key)
 	if err != nil {
 		return nil, false, err
@@ -165,16 +171,17 @@ func (s *Store) Get(_ context.Context, key string) (*aggregate.Entry, bool, erro
 	if !e.live(time.Now()) {
 		return nil, false, nil
 	}
-	return e.entry(), true, nil
+	out := e.counters()
+	return &out, true, nil
 }
 
-func (s *Store) PutIfAbsent(_ context.Context, key string, entry aggregate.Entry, ttl time.Duration) (bool, error) {
+func (s *Store) PutIfAbsent(_ context.Context, key string, entry aggregate.Counters, ttl time.Duration) (bool, error) {
 	k, err := s.itemKey(key)
 	if err != nil {
 		return false, err
 	}
 	now := time.Now()
-	e := envelope{Value: entry.Value, AsOf: entry.AsOf, Deltas: 0, ExpiresAt: now.Add(ttl)}
+	e := envelope{Counts: entry.Counts, Minima: entry.Minima, Members: entry.Members, AsOf: entry.AsOf, Deltas: 0, ExpiresAt: now.Add(ttl)}
 	raw, err := json.Marshal(e)
 	if err != nil {
 		return false, err
@@ -219,12 +226,12 @@ func (s *Store) PutIfAbsent(_ context.Context, key string, entry aggregate.Entry
 	return false, nil
 }
 
-func (s *Store) Apply(_ context.Context, key string, fn func(old []byte) ([]byte, error)) (*aggregate.Entry, bool, error) {
+func (s *Store) Add(_ context.Context, key string, delta aggregate.Delta) (bool, error) {
 	k, err := s.itemKey(key)
 	if err != nil {
-		return nil, false, err
+		return false, err
 	}
-	for attempt := range applyAttempts {
+	for attempt := range addAttempts {
 		if attempt > 0 {
 			// a cas loses to every concurrent writer of the key; a jittered
 			// pause spreads a burst of writers out
@@ -232,43 +239,41 @@ func (s *Store) Apply(_ context.Context, key string, fn func(old []byte) ([]byte
 		}
 		it, err := s.mc.Get(k)
 		if errors.Is(err, memcache.ErrCacheMiss) {
-			return nil, false, nil
+			return false, nil
 		}
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 		e, err := decode(it.Value)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 		now := time.Now()
 		if !e.live(now) {
-			return nil, false, nil
+			return false, nil
 		}
-		e.Value, err = fn(e.Value)
-		if err != nil {
-			return nil, false, err
-		}
-		e.Deltas++
+		folded := e.counters()
+		folded.Add(delta)
+		e.Counts, e.Minima, e.Members, e.Deltas = folded.Counts, folded.Minima, folded.Members, folded.Deltas
 		it.Value, err = json.Marshal(e)
 		if err != nil {
-			return nil, false, err
+			return false, err
 		}
 		it.Expiration = expiration(e.ExpiresAt, now)
 		err = s.mc.CompareAndSwap(it)
 		switch {
 		case err == nil:
-			return e.entry(), true, nil
+			return true, nil
 		case errors.Is(err, memcache.ErrCASConflict):
 			continue
 		case errors.Is(err, memcache.ErrNotStored):
 			// evicted or dropped since the read
-			return nil, false, nil
+			return false, nil
 		default:
-			return nil, false, err
+			return false, err
 		}
 	}
-	return nil, false, errors.New("aggregate memcached: apply lost the race too many times")
+	return false, errors.New("aggregate memcached: add lost the race too many times")
 }
 
 func (s *Store) Invalidate(_ context.Context, key string) error {

@@ -12,46 +12,34 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-// entityStoreRepo keeps entities the way the real stores do: CreateEntity
+// entityStoreRepo keeps entities the way the real stores do: ApplyEntity
 // is accept-if-newer and GetEntityByCCID returns the stored document.
 type entityStoreRepo struct {
 	Repository
 	mu        sync.Mutex
-	documents map[string]string
 	entities  map[string]*domain.Entity
 	createdAt map[string]time.Time
 	lookups   int
 }
 
 func newEntityStoreRepo() *entityStoreRepo {
-	return &entityStoreRepo{documents: map[string]string{}, entities: map[string]*domain.Entity{}, createdAt: map[string]time.Time{}}
+	return &entityStoreRepo{entities: map[string]*domain.Entity{}, createdAt: map[string]time.Time{}}
 }
 
-func (r *entityStoreRepo) RunInTx(ctx context.Context, fn func(tx RepositoryTx) error) error {
-	return fn(&recordingTx{})
-}
-
-func (r *entityStoreRepo) CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error {
+func (r *entityStoreRepo) ApplyEntity(ctx context.Context, commit EntityCommit) (ApplyStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.documents[id] = document
-	return nil
-}
-
-func (r *entityStoreRepo) CreateEntity(ctx context.Context, tx RepositoryTx, ccid string, alias *string, domainName string, documentID string, createdAt time.Time) (bool, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if stored, ok := r.createdAt[ccid]; ok && !createdAt.After(stored) {
-		return false, nil
+	if stored, ok := r.createdAt[commit.CCID]; ok && !commit.CreatedAt.After(stored) {
+		return Stale, nil
 	}
-	r.createdAt[ccid] = createdAt
-	r.entities[ccid] = &domain.Entity{
-		ID:             ccid,
-		Alias:          alias,
-		Domain:         domainName,
-		SignedDocument: &concrnt.SignedDocument{Document: r.documents[documentID]},
+	r.createdAt[commit.CCID] = commit.CreatedAt
+	r.entities[commit.CCID] = &domain.Entity{
+		ID:             commit.CCID,
+		Alias:          commit.Alias,
+		Domain:         commit.Domain,
+		SignedDocument: &concrnt.SignedDocument{Document: commit.Document},
 	}
-	return true, nil
+	return Applied, nil
 }
 
 func (r *entityStoreRepo) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {

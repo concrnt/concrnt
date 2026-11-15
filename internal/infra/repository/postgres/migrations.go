@@ -58,6 +58,15 @@ var migrations = []migration{
 		}
 		return nil
 	}},
+	// the count cache holds counters instead of an opaque value. It is a
+	// cache, so the old rows are dropped rather than converted; step 3
+	// already creates the current shape on a fresh database
+	{6, "aggregate_entries_counters", func(tx *gorm.DB) error {
+		if err := tx.Exec("DROP TABLE IF EXISTS aggregate_entries").Error; err != nil {
+			return err
+		}
+		return tx.Exec(aggpg.Schema).Error
+	}},
 }
 
 // AutoMigrateTables creates or extends every table from its model: tables,

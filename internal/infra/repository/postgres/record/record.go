@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/lib/pq"
@@ -17,121 +18,163 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) CreateRecord(
-	ctx context.Context,
-	tx ucrecord.RepositoryTx,
-	documentID string,
-	key string,
-	owner string,
-	author string,
-	schema string,
-	onUpdate *string,
-	policies *string,
-	distributions []string,
-	redirect *string,
-	createdAt time.Time,
-) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateRecord")
+func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordCommit) (ucrecord.RecordOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyRecord")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	var outcome ucrecord.RecordOutcome
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.RecordOutcome{}
+
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+
+		// Lock the RecordKey before writing anything. CIP-3 §3.4 accept-if-newer
+		// on the document's createdAt: only a strictly newer document takes the
+		// key, an equal or older one is Stale. Deciding under the row lock
+		// closes the read-then-write race between concurrent commits, same as
+		// ApplyEntity's conditional upsert.
+		var oldRecordKey postgres.RecordKey
+		err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("uri = ?", commit.Key).
+			Take(&oldRecordKey).Error
+		keyExisted := err == nil
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return ucrecord.Applied, err
+		}
+		if oldRecordKey.RecordID != nil && oldRecordKey.RecordCreatedAt != nil && !commit.CreatedAt.After(*oldRecordKey.RecordCreatedAt) {
+			return ucrecord.Stale, nil
+		}
+
+		record := postgres.Record{
+			DocumentID:    commit.ID,
+			Owner:         commit.Owner,
+			Author:        commit.Author,
+			Redirect:      commit.Redirect,
+			Schema:        commit.Schema,
+			Policies:      commit.Policies,
+			Distributions: commit.Distributions,
+			CreatedAt:     commit.CreatedAt,
+		}
+		if err := tx.Create(&record).Error; err != nil {
+			return ucrecord.Applied, err
+		}
+
+		pid, err := parentKeyID(tx, commit.Key)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		cleanOnUpdate := commit.OnUpdate == nil || *commit.OnUpdate != "retain"
+
+		// The FOR UPDATE above cannot lock a RecordKey row that does not
+		// exist yet, so two concurrent commits to a fresh key both pass it.
+		// The conditional upsert closes that window: only a strictly newer
+		// document may take the key. IS NULL keeps normal writes to parent
+		// placeholder rows (RecordID nil) working. xmax tells an insert
+		// from an update of a row that appeared after the read.
+		var upserted []struct{ Inserted bool }
+		err = tx.Raw(`INSERT INTO record_keys (uri, parent_id, record_id, record_created_at, redirect, clean_on_update)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (uri) DO UPDATE SET record_id = excluded.record_id, parent_id = excluded.parent_id,
+				record_created_at = excluded.record_created_at, redirect = excluded.redirect, clean_on_update = excluded.clean_on_update
+			WHERE record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at
+			RETURNING (xmax = 0) AS inserted`,
+			commit.Key, pid, commit.ID, commit.CreatedAt, commit.Redirect, cleanOnUpdate).
+			Scan(&upserted).Error
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if len(upserted) == 0 {
+			return ucrecord.Stale, nil
+		}
+		if !keyExisted && !upserted[0].Inserted {
+			// a concurrent commit created the key between the read and the
+			// upsert: what this write replaced is unknown, so start over
+			// with the row there to lock
+			return ucrecord.Applied, errRetryTx
+		}
+
+		outcome.FreshKey = oldRecordKey.RecordID == nil
+		if oldRecordKey.RecordID != nil {
+			outcome.PreviousID = *oldRecordKey.RecordID
+		}
+
+		// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
+		if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil {
+			if err := markGcCandidates(tx, []string{*oldRecordKey.RecordID}); err != nil {
+				return ucrecord.Applied, err
+			}
+			if err := tx.Delete(&postgres.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
+				return ucrecord.Applied, err
+			}
+		}
+
+		return ucrecord.Applied, nil
+	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.RecordOutcome{}, err
 	}
+	outcome.Status = status
+	return outcome, nil
+}
 
-	// Lock the RecordKey before writing anything. CIP-3 §3.4 accept-if-newer
-	// on the document's createdAt: only a strictly newer document takes the
-	// key, an equal or older one is a no-op. Deciding under the row lock
-	// closes the read-then-write race between concurrent commits, same as
-	// CreateEntity's conditional upsert.
-	var oldRecordKey postgres.RecordKey
-	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
-		Where("uri = ?", key).
-		Take(&oldRecordKey).Error
-	if err != nil && err != gorm.ErrRecordNotFound {
-		span.RecordError(err)
-		return false, err
-	}
-	if oldRecordKey.RecordID != nil && oldRecordKey.RecordCreatedAt != nil && !createdAt.After(*oldRecordKey.RecordCreatedAt) {
-		return false, nil
-	}
+// ApplyDelete removes rows in the order given. Deleting a record takes its
+// key row along (ON DELETE CASCADE on record_keys.record_id), and the key
+// row its associations (associations.target_id): that is the end of the
+// key's incarnation, complete inside this transaction.
+func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteCommit) (ucrecord.DeleteOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyDelete")
+	defer span.End()
 
-	record := postgres.Record{
-		DocumentID:    documentID,
-		Owner:         owner,
-		Author:        author,
-		Redirect:      redirect,
-		Schema:        schema,
-		Policies:      policies,
-		Distributions: distributions,
-		CreatedAt:     createdAt,
-	}
+	var removed []bool
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		removed = make([]bool, len(commit.Removals))
 
-	if err := db.Clauses(clause.OnConflict{
-		DoNothing: true,
-	}).Create(&record).Error; err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+		if commit.Commit != nil {
+			inserted, err := insertCommit(tx, *commit.Commit)
+			if err != nil {
+				return ucrecord.Applied, err
+			}
+			if !inserted {
+				return ucrecord.Duplicate, nil
+			}
+		}
 
-	// ParentのRecordKeyを探す
-	parentRK, err := getOrCreateParentRecordKey(ctx, db, key)
+		for i, removal := range commit.Removals {
+			var result *gorm.DB
+			switch removal.Kind {
+			case ucrecord.RemoveKey:
+				q := tx.Model(&postgres.RecordKey{}).Select("record_id").Where("uri = ?", removal.URI)
+				result = tx.Where("document_id = (?)", q).Delete(&postgres.Record{})
+			case ucrecord.RemoveVersion:
+				result = tx.Delete(&postgres.Record{}, "document_id = ?", removal.DocumentID)
+			case ucrecord.RemoveAssociation:
+				result = tx.Delete(&postgres.Association{}, "document_id = ?", removal.DocumentID)
+			default:
+				return ucrecord.Applied, fmt.Errorf("unknown removal kind %d", removal.Kind)
+			}
+			if result.Error != nil {
+				return ucrecord.Applied, result.Error
+			}
+			removed[i] = result.RowsAffected > 0
+		}
+
+		return ucrecord.Applied, markGcCandidates(tx, commit.GcCommitIDs)
+	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.DeleteOutcome{}, err
 	}
-
-	var pid *int64
-	if parentRK != nil {
-		pid = &parentRK.ID
+	if status != ucrecord.Applied {
+		return ucrecord.DeleteOutcome{Status: status}, nil
 	}
-	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
-
-	// RecordKeyを作る
-	rk := postgres.RecordKey{
-		URI:             key,
-		ParentID:        pid,
-		RecordID:        &documentID,
-		RecordCreatedAt: &createdAt,
-		Redirect:        redirect,
-		CleanOnUpdate:   cleanOnUpdate,
-	}
-
-	// The FOR UPDATE fast-path above cannot lock a RecordKey row that does not
-	// exist yet, so two concurrent commits to a fresh key both pass it. The
-	// conditional upsert closes that window the same way CreateEntity does:
-	// only a strictly newer document may take the key. IS NULL keeps normal
-	// writes to parent placeholder rows (RecordID nil) working.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{"record_id": documentID, "parent_id": pid, "record_created_at": createdAt, "redirect": redirect, "clean_on_update": cleanOnUpdate}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
-	}).Create(&rk)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
-	}
-	if result.RowsAffected == 0 {
-		return false, nil
-	}
-
-	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
-	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if err := db.Model(&postgres.CommitLog{}).
-			Where("id = ?", oldRecordKey.RecordID).
-			Update("gc_candidate", true).Error; err != nil {
-			span.RecordError(err)
-			return false, err
-		}
-		if err := db.Delete(&postgres.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
-			span.RecordError(err)
-			return false, err
-		}
-	}
-
-	return true, nil
-
+	return ucrecord.DeleteOutcome{Status: status, Removed: removed}, nil
 }
 
 func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error) {
@@ -303,33 +346,6 @@ func (r *Repository) signedDocumentsByID(ctx context.Context, ids []string) (map
 	return out, nil
 }
 
-func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	q := db.Model(&postgres.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
-	return db.Where("document_id = (?)", q).Delete(&postgres.Record{}).Error
-}
-
-func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByDocumentID")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return db.Delete(&postgres.Record{}, "document_id = ?", documentID).Error
-}
-
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
@@ -358,85 +374,47 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
-	// (which is what BodyItem.ID() returns): the redirect target for
-	// reference records, the record key URI otherwise
-	itemID := keyURI
-	if row.Redirect != nil {
-		itemID = *row.Redirect
-	}
-
-	return *row.ParentURI, itemID, nil
+	return *row.ParentURI, repoutil.ItemID(keyURI, row.Redirect), nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
-	defer span.End()
-
+// parentKeyID is the row id of the key one segment above uri, nil for a
+// top-level key. A parent that does not exist yet is created as a
+// placeholder, and so is every ancestor above it.
+func parentKeyID(tx *gorm.DB, uri string) (*int64, error) {
 	parentURI, ok, err := repoutil.ParentURI(uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if !ok {
-		return nil, nil
-	}
-
-	parentRK, err := getRecordKeyByURI(ctx, db, parentURI)
-	if err == nil {
-		return parentRK, nil
-	}
-	if !errors.Is(err, domain.ErrNotFound) {
-		span.RecordError(err)
+	if err != nil || !ok {
 		return nil, err
 	}
 
-	grandparent, err := getOrCreateParentRecordKey(ctx, db, parentURI)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	var id int64
+	found := tx.Model(&postgres.RecordKey{}).Select("id").Where("uri = ?", parentURI).Scan(&id)
+	if found.Error != nil {
+		return nil, found.Error
 	}
-	var pid *int64
-	if grandparent != nil {
-		pid = &grandparent.ID
+	if found.RowsAffected > 0 {
+		return &id, nil
+	}
+
+	grandparent, err := parentKeyID(tx, parentURI)
+	if err != nil {
+		return nil, err
 	}
 
 	// one statement for the placeholder: the insert's id, or the id of the
 	// row a concurrent transaction created first (DO NOTHING returns none).
 	// A DO UPDATE upsert would lock the parent row for the whole
 	// transaction and serialize every commit into the same timeline.
-	newRecordKey := postgres.RecordKey{URI: parentURI, ParentID: pid}
-	err = db.WithContext(ctx).Raw(`WITH ins AS (
+	created := tx.Raw(`WITH ins AS (
 		INSERT INTO record_keys (uri, parent_id, clean_on_update) VALUES (?, ?, false)
 		ON CONFLICT (uri) DO NOTHING RETURNING id
-	) SELECT id FROM ins UNION ALL SELECT id FROM record_keys WHERE uri = ? LIMIT 1`, parentURI, pid, parentURI).
-		Scan(&newRecordKey.ID).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	) SELECT id FROM ins UNION ALL SELECT id FROM record_keys WHERE uri = ? LIMIT 1`, parentURI, grandparent, parentURI).
+		Scan(&id)
+	if created.Error != nil {
+		return nil, created.Error
 	}
-	if newRecordKey.ID == 0 {
+	if created.RowsAffected == 0 {
 		// the row seen by neither branch: inserted and deleted in between
-		return getRecordKeyByURI(ctx, db, parentURI)
+		return nil, errRetryTx
 	}
-	return &newRecordKey, nil
-}
-
-func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*postgres.RecordKey, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
-	defer span.End()
-
-	var recordKey postgres.RecordKey
-	err := db.WithContext(ctx).
-		Where("uri = ?", uri).
-		Take(&recordKey).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, domain.NotFoundError{Resource: "record key"}
-	}
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	return &recordKey, nil
+	return &id, nil
 }

@@ -8,83 +8,79 @@ import (
 	"cloud.google.com/go/firestore"
 	"google.golang.org/api/iterator"
 
-	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
 	fs "github.com/concrnt/concrnt/internal/infra/repository/firestore"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
-	"github.com/concrnt/concrnt/internal/utils"
 )
 
-func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
+// ApplyAssociation reads the commit, the target key and the uniqueness
+// marker in one batch get. The association takes the gen the target key
+// carries at that moment; the marker counts as taken only when it carries
+// the same gen (one left by an ended incarnation is overwritten).
+func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAssociation")
 	defer span.End()
 
-	t, err := getRecordTx(tx)
+	entry, err := newCommit(commit.Commit, fs.ColAssociations, "")
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.Applied, err
 	}
 
-	targetRef := r.col(fs.ColRecordKeys).Doc(keyID(targetURI))
-	assocRef := r.col(fs.ColAssociations).Doc(documentID)
-	uniqueRef := r.col(fs.ColAssocUniques).Doc(uniqueID(unique))
-	states, err := t.readAll([]*firestore.DocumentRef{targetRef, assocRef, uniqueRef})
+	commitRef := r.col(fs.ColCommits).Doc(commit.ID)
+	targetRef := r.keyRef(commit.Target)
+	uniqueRef := r.uniqueRef(commit.Target, commit.Unique)
+
+	status, err := r.apply(ctx, func(tx *firestore.Transaction) (ucrecord.ApplyStatus, error) {
+		reads := newReadSet(commitRef, targetRef, uniqueRef)
+		if err := reads.loadTx(tx); err != nil {
+			return ucrecord.Applied, err
+		}
+		if _, exists := reads.data(commitRef); exists {
+			return ucrecord.Duplicate, nil
+		}
+		target, exists := reads.data(targetRef)
+		if !exists {
+			return ucrecord.Applied, domain.NotFoundError{Resource: "record key"}
+		}
+		gen := str(target, "gen")
+		// the same logical association under another document is Stale (C6)
+		if marker, exists := reads.data(uniqueRef); exists && str(marker, "targetGen") == gen {
+			return ucrecord.Stale, nil
+		}
+
+		if err := tx.Create(commitRef, entry.toMap()); err != nil {
+			return ucrecord.Applied, err
+		}
+		err := tx.Set(r.col(fs.ColAssociations).Doc(commit.ID), associationDoc{
+			TargetURI: commit.Target,
+			TargetGen: gen,
+			Owner:     commit.Owner,
+			Author:    commit.Author,
+			Schema:    commit.Schema,
+			Variant:   fs.Deref(commit.Variant),
+			Unique:    commit.Unique,
+			CreatedAt: commit.CreatedAt,
+			Document:  entry.Document,
+			Proof:     entry.Proof,
+		}.toMap())
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		return ucrecord.Applied, tx.Set(uniqueRef, uniqueMarker(commit.Target, gen, commit.ID))
+	})
 	if err != nil {
 		span.RecordError(err)
-		return false, err
 	}
-	if !states[0].exists {
-		err := domain.NotFoundError{Resource: "record key"}
-		span.RecordError(err)
-		return false, err
-	}
-	// duplicates on the document id (same document re-delivered) and on the
-	// logical unique key (same association under a new document id) are a
-	// silent success, like ON CONFLICT DO NOTHING (C6)
-	if states[1].exists || states[2].exists {
-		return false, nil
-	}
-
-	t.set(assocRef, associationDoc{
-		TargetURI: targetURI,
-		Owner:     owner,
-		Author:    author,
-		Schema:    schema,
-		Variant:   fs.Deref(variant),
-		Unique:    unique,
-		CreatedAt: createdAt,
-	}.toMap())
-	t.set(uniqueRef, map[string]any{"associationID": documentID, "unique": unique})
-	return true, nil
+	return status, err
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
-	defer span.End()
-
-	t, err := getRecordTx(tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	ref := r.col(fs.ColAssociations).Doc(documentID)
-	m, exists, err := t.read(ref)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-	if !exists {
-		return nil
-	}
-
-	t.del(ref)
-	if unique := str(m, "unique"); unique != "" {
-		t.del(r.col(fs.ColAssocUniques).Doc(uniqueID(unique)))
-	}
-	return nil
-}
-
+// GetAssociatedRecords is one query on the target's associations, run in
+// parallel with the read of the target key, whose gen tells which of them
+// are live. Normally all of them are and the page is the answer. Rows of
+// an ended incarnation only exist between the removal of a key and the end
+// of its Cleanup; when a page holds some, they are dropped and the listing
+// reads on until the page is full again.
 func (r *Repository) GetAssociatedRecords(
 	ctx context.Context,
 	targetURI, schema, variant, author string,
@@ -108,113 +104,122 @@ func (r *Repository) GetAssociatedRecords(
 	// the association's document id is its Firestore document id
 	q = applyWindow(q, "createdAt", firestore.DocumentID, since, until, limit, order)
 
-	snaps, err := q.Documents(ctx).GetAll()
-	if err != nil {
-		span.RecordError(err)
-		return nil, fs.QueryErr(err)
-	}
-
-	assocs := make([]associationDoc, 0, len(snaps))
-	ids := make([]string, 0, len(snaps))
-	for _, snap := range snaps {
-		assocs = append(assocs, associationFromMap(snap.Data()))
-		ids = append(ids, snap.Ref.ID)
-	}
-	commits, err := r.getCommits(ctx, ids)
+	var snaps []*firestore.DocumentSnapshot
+	target, err := r.withKey(ctx, targetURI, func(ctx context.Context) error {
+		var err error
+		snaps, err = q.Documents(ctx).GetAll()
+		return fs.QueryErr(err)
+	})
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
+	if target == nil {
+		return []ucrecord.QueryRow{}, nil
+	}
 
-	rows := make([]ucrecord.QueryRow, 0, len(assocs))
-	for i, a := range assocs {
-		commit, ok := commits[ids[i]]
-		if !ok {
-			continue
+	rows := make([]ucrecord.QueryRow, 0, len(snaps))
+	for {
+		for _, snap := range snaps {
+			a := associationFromMap(snap.Data())
+			if a.TargetGen != target.Gen {
+				continue
+			}
+			row, err := commitRow(a.Owner, snap.Ref.ID, a.Document, a.Proof, a.CreatedAt)
+			if err != nil {
+				span.RecordError(err)
+				return nil, err
+			}
+			rows = append(rows, row)
 		}
-		proof, err := commit.proof()
+		// an unbounded query has returned everything; a short page was the
+		// last one
+		if limit <= 0 || len(rows) >= limit || len(snaps) < limit {
+			break
+		}
+		snaps, err = q.StartAfter(snaps[len(snaps)-1]).Documents(ctx).GetAll()
 		if err != nil {
 			span.RecordError(err)
-			return nil, err
+			return nil, fs.QueryErr(err)
 		}
-		// CCFS is composed from the association's owner
-		ccfs := concrnt.ComposeCCFSURI(a.Owner, concrnt.CCFSTypeConcrnt, ids[i])
-		rows = append(rows, ucrecord.QueryRow{
-			Row:       concrnt.SignedDocument{CCFS: &ccfs, Document: commit.Document, Proof: proof},
-			CreatedAt: a.CreatedAt,
-		})
+	}
+	if limit > 0 && len(rows) > limit {
+		rows = rows[:limit]
 	}
 	return rows, nil
 }
 
-// Firestore has count() but no GROUP BY, so the grouped counts scan the
-// matching documents (projected to the grouping fields) and aggregate in
-// memory; cost is one document read per matching row, which is why only
-// the aggregate layer calls them (C2).
-
-func (r *Repository) ComputeAssociationCounts(ctx context.Context, targetURI string) (map[string]utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationCounts")
+// ComputeAssociationSummary scans the target's associations once,
+// projected to the fields it aggregates (Firestore has count() but no GROUP
+// BY), in parallel with the read of the target key whose gen tells the
+// live ones. The cost is one document read per association, which is why
+// only the aggregate layer calls it (C2).
+func (r *Repository) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (ucrecord.AssociationSummary, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationSummary")
 	defer span.End()
 
-	// the earliest association of each variant decides the variant order
-	result := make(map[string]utils.OrderedKVMap[int64])
-	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("schema", "variant", "createdAt").Documents(ctx)
-	defer it.Stop()
-	for {
-		snap, err := it.Next()
-		if errors.Is(err, iterator.Done) {
-			break
+	type scanned struct {
+		gen, schema, variant, author string
+		createdAt                    time.Time
+	}
+	var all []scanned
+	target, err := r.withKey(ctx, targetURI, func(ctx context.Context) error {
+		it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).
+			Select("targetGen", "schema", "variant", "author", "createdAt").Documents(ctx)
+		defer it.Stop()
+		for {
+			snap, err := it.Next()
+			if errors.Is(err, iterator.Done) {
+				return nil
+			}
+			if err != nil {
+				return fs.QueryErr(err)
+			}
+			m := snap.Data()
+			createdAt, _ := timeAt(m, "createdAt")
+			all = append(all, scanned{str(m, "targetGen"), str(m, "schema"), str(m, "variant"), str(m, "author"), createdAt.UTC()})
 		}
-		if err != nil {
-			span.RecordError(err)
-			return nil, fs.QueryErr(err)
+	})
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.AssociationSummary{}, err
+	}
+	if target == nil {
+		return ucrecord.AssociationSummary{}, nil
+	}
+
+	type variantKey struct{ schema, variant string }
+	variants := map[variantKey]*ucrecord.AssociationVariant{}
+	authors := map[string]bool{}
+	var summary ucrecord.AssociationSummary
+	for _, a := range all {
+		if a.gen != target.Gen {
+			continue
 		}
-		m := snap.Data()
-		schema := str(m, "schema")
-		variants, ok := result[schema]
+		k := variantKey{a.schema, a.variant}
+		v, ok := variants[k]
 		if !ok {
-			variants = make(utils.OrderedKVMap[int64])
-			result[schema] = variants
+			v = &ucrecord.AssociationVariant{Schema: a.schema, Variant: a.variant, Earliest: a.createdAt}
+			variants[k] = v
 		}
-		variant := str(m, "variant")
-		createdAt, _ := timeAt(m, "createdAt")
-		order := createdAt.UnixNano()
-		c, ok := variants[variant]
-		if !ok || order < c.Order {
-			c.Order = order
+		v.Count++
+		if a.createdAt.Before(v.Earliest) {
+			v.Earliest = a.createdAt
 		}
-		c.Value++
-		variants[variant] = c
-	}
-	return result, nil
-}
-
-// ListAssociationAuthors has no DISTINCT to lean on: the author field of
-// the target's associations is read, bounded at a multiple of limit, and
-// deduplicated here. The caller only asks for small limits on targets with
-// few associations (the count is known first), so the scan stays short.
-func (r *Repository) ListAssociationAuthors(ctx context.Context, targetURI string, limit int) ([]string, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.ListAssociationAuthors")
-	defer span.End()
-
-	seen := map[string]bool{}
-	authors := []string{}
-	it := r.col(fs.ColAssociations).Where("targetURI", "==", targetURI).Select("author").Limit(limit * 4).Documents(ctx)
-	defer it.Stop()
-	for len(authors) < limit {
-		snap, err := it.Next()
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			span.RecordError(err)
-			return nil, fs.QueryErr(err)
-		}
-		author := str(snap.Data(), "author")
-		if !seen[author] {
-			seen[author] = true
-			authors = append(authors, author)
+		// one author past the bound is all an overflow needs to know
+		if !authors[a.author] && len(authors) <= maxAuthors {
+			authors[a.author] = true
 		}
 	}
-	return authors, nil
+	for _, v := range variants {
+		summary.Variants = append(summary.Variants, *v)
+	}
+	if len(authors) > maxAuthors {
+		summary.AuthorsOverflow = true
+		return summary, nil
+	}
+	for author := range authors {
+		summary.Authors = append(summary.Authors, author)
+	}
+	return summary, nil
 }

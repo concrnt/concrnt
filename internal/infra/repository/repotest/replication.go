@@ -32,17 +32,7 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 	// clock: a-1 < b-1 == a-2 < unowned, the tie leaving only the id to decide
 	seed := func(id, owner string, received time.Time) {
 		t.Helper()
-		sd := SignedDocument(t, concrnt.Document[map[string]string]{
-			Kind:      "record",
-			Key:       "cckv://" + owner + "/" + id,
-			Value:     map[string]string{"id": id},
-			Author:    owner,
-			Schema:    "https://schema.example/post.json",
-			CreatedAt: received,
-		})
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.CreateCommitLog(ctx, tx, id, "127.0.0.1", sd.Document, sd.Proof, owner))
-		})
+		putCommit(t, ctx, repo, id, owner, `{"value":{"id":"`+id+`"}}`)
 		require.NoError(t, be.Inspect.SetCommitCDate(ctx, id, received))
 	}
 	seed("a-1", userA, base)
@@ -52,7 +42,9 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 
 	cdate := func(id string) time.Time {
 		t.Helper()
-		return mustCommit(t, ctx, be.Inspect, id).CDate
+		entry := commitEntry(t, ctx, repo, id)
+		require.NotNil(t, entry)
+		return entry.CDate
 	}
 	// ids reads each row's id back out of its ccfs URI; the ownerless row has
 	// no ccfs, so it is identified by the value the seed stored instead.
@@ -85,7 +77,8 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 			}
 		}
 		require.Equal(t, "ccfs://"+userA+"/concrnt/a-1", *rows[0].Row.CCFS)
-		require.True(t, cdate("a-1").Equal(rows[0].CreatedAt), "CreatedAt must carry the receipt time")
+		require.True(t, base.Equal(rows[0].CreatedAt), "CreatedAt must carry the receipt time")
+		require.True(t, cdate("a-1").Equal(rows[0].CreatedAt))
 		require.Contains(t, rows[0].Row.Document, `"id":"a-1"`)
 		require.Equal(t, concrnt.ProofTypeNone, rows[0].Row.Proof.Type)
 
@@ -123,12 +116,15 @@ func testQueryCommitLogs(t *testing.T, be Backend) {
 	})
 
 	t.Run("gc candidates are still replicated", func(t *testing.T) {
-		inTx(t, ctx, repo, func(tx record.RepositoryTx) {
-			require.NoError(t, repo.MarkCommitLogGcCandidate(ctx, tx, "a-1"))
-		})
-		require.True(t, mustCommit(t, ctx, be.Inspect, "a-1").GcCandidate)
+		flagForGc(t, ctx, repo, "a-1")
+		require.True(t, gcFlagged(t, ctx, repo, "a-1"))
 		rows, err := repo.QueryCommitLogs(ctx, userA, nil, nil, 10, "asc")
 		require.NoError(t, err)
 		require.Equal(t, []string{"a-1", "a-2"}, ids(rows))
+	})
+
+	t.Run("a new commit is received now", func(t *testing.T) {
+		putCommit(t, ctx, repo, "a-3", userA, "{}")
+		require.WithinDuration(t, time.Now(), cdate("a-3"), time.Minute, "the backend stamps the receipt time itself")
 	})
 }
