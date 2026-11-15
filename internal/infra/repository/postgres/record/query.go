@@ -26,6 +26,7 @@ func (r *Repository) QueryByPrefix(
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id").
 		Where("uri LIKE ?", prefix+"%")
 
 	if schema != "" {
@@ -51,7 +52,7 @@ func (r *Repository) QueryByPrefix(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -74,7 +75,8 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
@@ -84,7 +86,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	}
 
 	var rks []models.RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Order("uri ASC").Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -125,7 +127,8 @@ func (r *Repository) QueryByParent(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -164,7 +167,7 @@ func (r *Repository) QueryByParent(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -191,7 +194,8 @@ func (r *Repository) QueryByParentOrderByKey(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("LEFT JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -227,7 +231,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
