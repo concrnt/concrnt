@@ -499,6 +499,62 @@ func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map
 	return out, nil
 }
 
+func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteCommit) (ucrecord.DeleteOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyDelete")
+	defer span.End()
+
+	var removed []bool
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		removed = make([]bool, len(commit.Removals))
+
+		if commit.Commit != nil {
+			inserted, err := insertCommit(tx, *commit.Commit)
+			if err != nil {
+				return ucrecord.Applied, err
+			}
+			if !inserted {
+				return ucrecord.Duplicate, nil
+			}
+		}
+
+		// No statement for the dependents: deleting a record takes its key
+		// row along and the key row its associations (ON DELETE CASCADE).
+		for i, removal := range commit.Removals {
+			var result *gorm.DB
+			switch removal.Kind {
+			case ucrecord.RemoveKey:
+				q := tx.Model(&models.RecordKey{}).Select("record_id").Where("uri = ?", removal.URI)
+				result = tx.Where("document_id = (?)", q).Delete(&models.Record{})
+			case ucrecord.RemoveVersion:
+				result = tx.Delete(&models.Record{}, "document_id = ?", removal.DocumentID)
+			case ucrecord.RemoveAssociation:
+				result = tx.Delete(&models.Association{}, "document_id = ?", removal.DocumentID)
+			default:
+				return ucrecord.Applied, fmt.Errorf("unknown removal kind %d", removal.Kind)
+			}
+			if result.Error != nil {
+				return ucrecord.Applied, result.Error
+			}
+			removed[i] = result.RowsAffected > 0
+		}
+
+		if len(commit.GcCommitIDs) == 0 {
+			return ucrecord.Applied, nil
+		}
+		return ucrecord.Applied, tx.Model(&models.CommitLog{}).
+			Where("id IN ?", commit.GcCommitIDs).
+			Update("gc_candidate", true).Error
+	})
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.DeleteOutcome{}, err
+	}
+	if status != ucrecord.Applied {
+		return ucrecord.DeleteOutcome{Status: status}, nil
+	}
+	return ucrecord.DeleteOutcome{Status: status, Removed: removed}, nil
+}
+
 func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
 	defer span.End()

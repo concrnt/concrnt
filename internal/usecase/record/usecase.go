@@ -54,6 +54,34 @@ type Repository interface {
 	// and the target side for its own targets.
 	ApplyAck(ctx context.Context, commit AckCommit) (AckOutcome, error)
 
+	// ApplyDelete performs one page of a delete: it records Commit when
+	// one is given (Duplicate when its id is already in the log, and then
+	// nothing else happens), removes what Removals name, and flags
+	// GcCommitIDs for gc (unknown ids are ignored). Removing something that
+	// is already gone is not an error; Removed tells the two apart. A call
+	// without a Commit (the continuation pages of a range delete, whose
+	// commit the first page recorded) is always Applied and idempotent.
+	// There is no Stale. The caller keeps one call to at most
+	// rangeDeleteSyncLimit removals.
+	//
+	// Removing a key ends its incarnation: in this same operation every
+	// association on it stops being returned by GetAssociatedRecords and
+	// ComputeAssociationSummary and stops counting for uniqueness, and a
+	// record written to the key later starts with none. Whatever physical
+	// removal the backend left for later is handed back as Cleanups.
+	ApplyDelete(ctx context.Context, commit DeleteCommit) (DeleteOutcome, error)
+
+	// Cleanup runs one bounded step of the deferred physical removal a
+	// token from DeleteOutcome.Cleanups (or from a previous Cleanup call)
+	// names, and returns the token of the next step, "" when nothing is
+	// left. It changes nothing a read can observe. Idempotent: running a
+	// token again, or one whose work is done, is harmless. Tokens are
+	// opaque strings, valid on the backend that issued them, small enough
+	// for a job payload, and never expire. A backend that removes
+	// everything inside ApplyDelete issues none and treats any token as
+	// done.
+	Cleanup(ctx context.Context, token string) (next string, err error)
+
 	// Utilities
 	BeginTx(ctx context.Context) (RepositoryTx, error)
 
@@ -252,6 +280,59 @@ type AckOutcome struct {
 	Status   ApplyStatus
 	WasValid bool
 	IsValid  bool
+}
+
+// RemovalKind says what a Removal removes.
+type RemovalKind int
+
+const (
+	// RemoveKey removes the cckv key URI together with the record it
+	// points at. The key's incarnation ends: its associations are gone
+	// with it. A key that does not exist or holds no record is left as it
+	// is. DocumentID is unused.
+	RemoveKey RemovalKind = iota
+	// RemoveVersion removes the record version with DocumentID; URI is the
+	// cckv key that version was written to. When the key still points at
+	// that version this is RemoveKey; a version the key has moved on from
+	// (kept by onUpdate "retain") is forgotten and the key stays.
+	RemoveVersion
+	// RemoveAssociation removes the association with DocumentID; URI is
+	// the cckv key it is attached to.
+	RemoveAssociation
+)
+
+// Removal is one thing ApplyDelete removes. The commit of what is removed
+// stays in the log (DeleteCommit.GcCommitIDs decides its fate).
+type Removal struct {
+	Kind       RemovalKind
+	URI        string
+	DocumentID string
+}
+
+// DeleteCommit is one page of a delete (ApplyDelete).
+type DeleteCommit struct {
+	// Commit is the delete document; nil on the continuation pages of a
+	// range delete.
+	Commit *Commit
+	// Removals are applied in order.
+	Removals []Removal
+	// GcCommitIDs are the commits to flag for gc: those of the removed
+	// documents that did not ask to be retained, and the delete commit
+	// itself once nothing retained needs it.
+	GcCommitIDs []string
+}
+
+// DeleteOutcome is the result of ApplyDelete.
+type DeleteOutcome struct {
+	Status ApplyStatus
+	// Removed is parallel to DeleteCommit.Removals: whether each removal
+	// found something to remove, that is, something a read still returned
+	// (an association of an incarnation that has ended is not, whatever is
+	// left of it physically). Empty unless Applied.
+	Removed []bool
+	// Cleanups are the tokens of the physical removal left to do, one
+	// Cleanup chain each. Empty when the backend removed everything.
+	Cleanups []string
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.

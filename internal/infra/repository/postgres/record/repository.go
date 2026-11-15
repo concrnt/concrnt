@@ -136,6 +136,12 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 	return status, err
 }
 
+// Cleanup has nothing to do: ApplyDelete removes dependents itself (ON
+// DELETE CASCADE) and issues no token.
+func (r *Repository) Cleanup(ctx context.Context, token string) (string, error) {
+	return "", nil
+}
+
 func getRecordTx(ctx context.Context, tx ucrecord.RepositoryTx) (*gorm.DB, error) {
 	recordTx, ok := tx.(*recordTx)
 	if !ok || recordTx == nil || recordTx.tx == nil {
