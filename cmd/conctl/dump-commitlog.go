@@ -11,8 +11,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
-	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 var (
@@ -107,20 +106,12 @@ var dumpCommitlogCmd = &cobra.Command{
 		// Entity metas carry local-entity registration state (inviter/info) that
 		// is not part of the commit log, and import must restore them before
 		// replaying entity commits. Time filters don't apply to meta; --owner does.
-		var metas []models.EntityMeta
-		mq := op.DB.WithContext(ctx)
-		if dumpCommitlogOwner != "" {
-			mq = mq.Where("id = ?", dumpCommitlogOwner)
-		}
-		if err := mq.Find(&metas).Error; err != nil {
+		metas, err := op.EntityMeta.ListMetas(ctx, dumpCommitlogOwner)
+		if err != nil {
 			return fmt.Errorf("failed to query entity meta: %w", err)
 		}
 		for _, m := range metas {
-			line, err := json.Marshal(domain.EntityMeta{
-				ID:      m.ID,
-				Inviter: m.Inviter,
-				Info:    m.Info,
-			})
+			line, err := json.Marshal(m)
 			if err != nil {
 				return fmt.Errorf("failed to marshal entity meta %s: %w", m.ID, err)
 			}
@@ -132,30 +123,25 @@ var dumpCommitlogCmd = &cobra.Command{
 			return fmt.Errorf("failed to flush metas file: %w", err)
 		}
 
-		// Page through commit logs by id. Order/paginate/filter by the id
-		// column's own collation so the primary-key index backs the range scan
-		// (forcing COLLATE "C" would defeat the index and full-scan the table on
-		// every page). This is correct because time-kind CDIDs are fixed-length
-		// lowercase base32 whose byte order encodes the embedded timestamp, and
-		// every standard collation orders that alphabet identically to byte order.
+		// Page through commit logs by id (time-kind CDIDs order by their
+		// embedded timestamp).
+		recordRepo := op.Record
 		cursor := lowerBound
 		first := true
 		total := 0
 		for {
-			var logs []models.CommitLog
-			q := op.DB.WithContext(ctx).Order("commit_logs.id ASC").Limit(dumpCommitlogPageSize)
+			page := record.CommitLogPage{
+				UntilID: upperBound,
+				Owner:   dumpCommitlogOwner,
+				Limit:   dumpCommitlogPageSize,
+			}
 			if first {
-				q = q.Where("commit_logs.id >= ?", cursor)
+				page.FromID = cursor
 			} else {
-				q = q.Where("commit_logs.id > ?", cursor)
+				page.AfterID = cursor
 			}
-			if upperBound != "" {
-				q = q.Where("commit_logs.id <= ?", upperBound)
-			}
-			if dumpCommitlogOwner != "" {
-				q = q.Where("commit_logs.owner = ?", dumpCommitlogOwner)
-			}
-			if err := q.Find(&logs).Error; err != nil {
+			logs, err := recordRepo.ListCommitLogs(ctx, page)
+			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}
 			if len(logs) == 0 {
@@ -163,13 +149,9 @@ var dumpCommitlogCmd = &cobra.Command{
 			}
 
 			for _, cl := range logs {
-				var proof concrnt.Proof
-				if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
-					return fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
-				}
 				line, err := json.Marshal(concrnt.SignedDocument{
 					Document: cl.Document,
-					Proof:    proof,
+					Proof:    cl.Proof,
 				})
 				if err != nil {
 					return fmt.Errorf("failed to marshal commit %s: %w", cl.ID, err)
