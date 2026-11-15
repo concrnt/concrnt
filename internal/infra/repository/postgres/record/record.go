@@ -355,10 +355,15 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
 
-	var recordKey models.RecordKey
+	var recordKey struct {
+		models.RecordKey
+		ParentURI *string
+	}
 	err := r.db.WithContext(ctx).
-		Preload("Record").
-		Where("uri = ?", keyURI).
+		Model(&models.RecordKey{}).
+		Select("record_keys.*, parent.uri AS parent_uri").
+		Joins("LEFT JOIN record_keys parent ON parent.id = record_keys.parent_id").
+		Where("record_keys.uri = ?", keyURI).
 		Take(&recordKey).Error
 	if err != nil {
 		span.RecordError(err)
@@ -366,28 +371,19 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	}
 
 	// only rows with a parent and a record_created_at appear in chunkline bodies
-	if recordKey.ParentID == nil || recordKey.RecordCreatedAt == nil {
+	if recordKey.ParentURI == nil || recordKey.RecordCreatedAt == nil {
 		return "", "", nil
-	}
-
-	var parent models.RecordKey
-	err = r.db.WithContext(ctx).
-		Where("id = ?", *recordKey.ParentID).
-		Take(&parent).Error
-	if err != nil {
-		span.RecordError(err)
-		return "", "", err
 	}
 
 	// derive the item ID exactly the way LoadLocalBody derives BodyItem.Href
 	// (which is what BodyItem.ID() returns): the redirect target for
 	// reference records, the record key URI otherwise
 	itemID := recordKey.URI
-	if recordKey.Record.Redirect != nil {
-		itemID = *recordKey.Record.Redirect
+	if recordKey.Redirect != nil {
+		itemID = *recordKey.Redirect
 	}
 
-	return parent.URI, itemID, nil
+	return *recordKey.ParentURI, itemID, nil
 }
 
 func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
