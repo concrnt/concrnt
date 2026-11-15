@@ -328,9 +328,18 @@ type PolicyService interface {
 }
 
 type commitApplyResult struct {
-	result        *concrnt.SignedDocument
+	// result is returned once the write is Applied, unapplied when it was
+	// Stale (or the commit a noop).
+	result    *concrnt.SignedDocument
+	unapplied *concrnt.SignedDocument
+	// postProcesses run after an Applied write, in order.
 	postProcesses []PostProcessAction
-	noop          bool
+	// noop marks a commit that concerns nothing this server stores or acts
+	// on; nothing is written.
+	noop bool
+	// apply is the commit's single repository write. nil when the commit
+	// only has post-commit actions.
+	apply func(ctx context.Context) (ApplyStatus, error)
 }
 
 type Usecase struct {

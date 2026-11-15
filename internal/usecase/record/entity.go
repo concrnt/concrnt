@@ -15,7 +15,7 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, sd concrnt.SignedDocument) (*commitApplyResult, error) {
+func (uc *Usecase) saveEntity(ctx context.Context, ip string, sd concrnt.SignedDocument) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.SaveEntity")
 	defer span.End()
 
@@ -86,22 +86,21 @@ func (uc *Usecase) saveEntity(ctx context.Context, tx RepositoryTx, ip string, s
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, entity.Author); err != nil {
-		span.RecordError(err)
-		return nil, err
+	commit := EntityCommit{
+		Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: entity.Author},
+		CCID:      entity.Author,
+		Alias:     entity.Value.Alias,
+		Domain:    entity.Value.Domain,
+		CreatedAt: entity.CreatedAt,
 	}
 
-	applied, err := uc.repo.CreateEntity(ctx, tx, entity.Author, entity.Value.Alias, entity.Value.Domain, documentID, entity.CreatedAt)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	if !applied {
-		return &commitApplyResult{result: &sd, noop: true}, nil
-	}
-
-	return &commitApplyResult{result: &sd}, nil
+	return &commitApplyResult{
+		apply: func(ctx context.Context) (ApplyStatus, error) {
+			return uc.repo.ApplyEntity(ctx, commit)
+		},
+		result:    &sd,
+		unapplied: &sd,
+	}, nil
 }
 
 func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, error) {

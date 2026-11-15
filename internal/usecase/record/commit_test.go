@@ -124,9 +124,26 @@ func (r *recordingRecordRepo) MarkCommitLogGcCandidate(ctx context.Context, tx R
 	r.gcFlagged = append(r.gcFlagged, documentID)
 	return nil
 }
-func (r *recordingRecordRepo) CreateEntity(ctx context.Context, tx RepositoryTx, ccid string, alias *string, domain string, documentID string, createdAt time.Time) (bool, error) {
+
+// apply records an Apply* call as the transaction it stands for: the commit
+// log entry it carries and a transaction that is committed when the write
+// was applied and rolled back when it lost accept-if-newer.
+func (r *recordingRecordRepo) apply(commit Commit, applied bool) ApplyStatus {
+	if r.commitLogs[commit.ID] {
+		return Duplicate
+	}
+	tx, _ := r.BeginTx(context.Background())
+	_ = r.CreateCommitLog(context.Background(), tx, commit.ID, commit.IP, commit.Document, commit.Proof, commit.Owner)
+	if !applied {
+		_ = tx.Rollback(context.Background())
+		return Stale
+	}
+	_ = tx.Commit(context.Background())
+	return Applied
+}
+func (r *recordingRecordRepo) ApplyEntity(ctx context.Context, commit EntityCommit) (ApplyStatus, error) {
 	r.createEntityCalled = true
-	return r.storedCreatedAt.IsZero() || createdAt.After(r.storedCreatedAt), nil
+	return r.apply(commit.Commit, r.storedCreatedAt.IsZero() || commit.CreatedAt.After(r.storedCreatedAt)), nil
 }
 func (r *recordingRecordRepo) CreateRecord(ctx context.Context, tx RepositoryTx, documentID string, key string, owner string, author string, schema string, onUpdate *string, policies *string, distributions []string, redirect *string, createdAt time.Time) (bool, error) {
 	r.createRecordCalled = true
