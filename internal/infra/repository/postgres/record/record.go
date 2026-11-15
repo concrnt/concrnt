@@ -24,6 +24,8 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 
 	var outcome ucrecord.RecordOutcome
 	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.RecordOutcome{}
+
 		inserted, err := insertCommit(tx, commit.Commit)
 		if err != nil {
 			return ucrecord.Applied, err

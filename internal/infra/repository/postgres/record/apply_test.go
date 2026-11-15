@@ -200,3 +200,57 @@ func TestApplyRecordReportsVersionCreatedConcurrently(t *testing.T) {
 
 	require.Equal(t, ucrecord.RecordOutcome{Status: ucrecord.Applied, PreviousID: "race-old"}, <-second)
 }
+
+// An ack state moves only to a newer document and reports the validity it
+// had and has; an unack that comes first is a state of its own, and the
+// two sides of a relationship do not see each other.
+func TestApplyAck(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := &Repository{db: db}
+
+	from := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+	to := "con1pppppppppppppppppppppppppppppppppppppppp"
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	ack := func(id string, side ucrecord.AckSide, valid bool, createdAt time.Time) ucrecord.AckCommit {
+		owner := from
+		if side == ucrecord.TargetSide {
+			owner = to
+		}
+		return ucrecord.AckCommit{Commit: testCommit(id, owner), Side: side, From: from, To: to, Schema: "https://schema.example.com/follow.json", Valid: valid, CreatedAt: createdAt}
+	}
+
+	outcome, err := repo.ApplyAck(ctx, ack("unack-1", ucrecord.AckerSide, false, at.Add(time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Applied}, outcome)
+
+	outcome, err = repo.ApplyAck(ctx, ack("ack-0", ucrecord.AckerSide, true, at))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Stale}, outcome)
+	requireCommitLogged(t, repo, "ack-0", false)
+
+	outcome, err = repo.ApplyAck(ctx, ack("ack-2", ucrecord.AckerSide, true, at.Add(2*time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Applied, IsValid: true}, outcome)
+
+	outcome, err = repo.ApplyAck(ctx, ack("ack-2", ucrecord.AckerSide, true, at.Add(3*time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Duplicate}, outcome)
+
+	outcome, err = repo.ApplyAck(ctx, ack("unack-3", ucrecord.AckerSide, false, at.Add(3*time.Hour)))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Applied, WasValid: true}, outcome)
+
+	outcome, err = repo.ApplyAck(ctx, ack("acked-1", ucrecord.TargetSide, true, at))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.AckOutcome{Status: ucrecord.Applied, IsValid: true}, outcome)
+
+	rows, err := repo.GetAcknowledgeRecords(ctx, from, "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Empty(t, rows)
+	rows, err = repo.GetAcknowledgeRecords(ctx, "", to, "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+}

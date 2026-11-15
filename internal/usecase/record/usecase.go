@@ -45,6 +45,15 @@ type Repository interface {
 	// incarnation of the target key that exists at the time of the call.
 	ApplyAssociation(ctx context.Context, commit AssociationCommit) (ApplyStatus, error)
 
+	// ApplyAck moves one side's state of the (From, To, Schema)
+	// relationship (CIP-10 §4): the commit log entry and the state, which
+	// from then on is anchored to this commit. Accept-if-newer on CreatedAt
+	// alone (never the document id, so both servers of a relationship reach
+	// the same decision): equal or older is Stale. The two sides are
+	// independent states; a server holds the acker side for its own ackers
+	// and the target side for its own targets.
+	ApplyAck(ctx context.Context, commit AckCommit) (AckOutcome, error)
+
 	// Utilities
 	BeginTx(ctx context.Context) (RepositoryTx, error)
 
@@ -215,6 +224,42 @@ type AssociationCommit struct {
 	// same value on the same incarnation of the target is Stale.
 	Unique    string
 	CreatedAt time.Time
+}
+
+// AckSide names the two states an ack relationship has.
+type AckSide int
+
+const (
+	// AckerSide is the state the acker's server holds (ack / unack
+	// documents), recorded under From.
+	AckerSide AckSide = iota
+	// TargetSide is the state the target's server holds (acked / unacked
+	// documents), recorded under To.
+	TargetSide
+)
+
+// AckCommit is an ack-kind document to store (ApplyAck).
+type AckCommit struct {
+	Commit
+	Side   AckSide
+	From   string
+	To     string
+	Schema string
+	// Valid is the state the document asks for: true for ack / acked,
+	// false for unack / unacked.
+	Valid     bool
+	CreatedAt time.Time
+}
+
+// AckOutcome is the result of ApplyAck. When Status is Applied, WasValid
+// is the validity of the state before the call (false when there was none)
+// and IsValid the one stored, so a caller can tell a validity flip from a
+// state that merely moved to a newer document. When Stale, both are the
+// stored state's validity.
+type AckOutcome struct {
+	Status   ApplyStatus
+	WasValid bool
+	IsValid  bool
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.

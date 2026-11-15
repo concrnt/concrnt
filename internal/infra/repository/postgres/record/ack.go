@@ -14,96 +14,181 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
+func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAck")
+	defer span.End()
+
+	var outcome ucrecord.AckOutcome
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		outcome = ucrecord.AckOutcome{}
+
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+		if commit.Side == ucrecord.TargetSide {
+			outcome, err = processAcked(ctx, tx, commit)
+		} else {
+			outcome, err = processAck(ctx, tx, commit)
+		}
+		return outcome.Status, err
+	})
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
+	}
+	outcome.Status = status
+	return outcome, nil
+}
+
+func (r *Repository) legacyAck(ctx context.Context, tx ucrecord.RepositoryTx, commit ucrecord.AckCommit) (bool, error) {
+	db, err := getRecordTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	process := processAck
+	if commit.Side == ucrecord.TargetSide {
+		process = processAcked
+	}
+	outcome, err := process(ctx, db, commit)
+	return outcome.Status == ucrecord.Applied, err
+}
+
+func processAck(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-
-	ack := models.Ack{
-		From:       from,
-		To:         to,
-		Schema:     schema,
-		DocumentID: documentID,
-		Valid:      valid,
-		CreatedAt:  createdAt,
-	}
+	db = db.WithContext(ctx)
 
 	// CIP-10 §4: only a document with a strictly newer createdAt may move
-	// the (from, to, schema) state; an equal or older one is a no-op
-	// (RowsAffected 0). The key is createdAt alone — never the document id —
+	// the (from, to, schema) state; an equal or older one is a no-op.
+	// The key is createdAt alone — never the document id —
 	// so the acker's and the associate owner's servers, which hold different
 	// documents with the same createdAt, reach the same decision.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
-		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": createdAt}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("acks.created_at < excluded.created_at")}},
-	}).Create(&ack)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	// Not a conditional upsert: it cannot tell which validity it replaced.
+	var state models.Ack
+	found := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+		Limit(1).
+		Find(&state)
+	if found.Error != nil {
+		span.RecordError(found.Error)
+		return ucrecord.AckOutcome{}, found.Error
 	}
 
-	return result.RowsAffected > 0, nil
+	if found.RowsAffected == 0 {
+		// Not the model: gorm would swap a false valid for the column
+		// default, and an unack may be the first state.
+		result := db.Model(&models.Ack{}).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
+			DoNothing: true,
+		}).Create(map[string]any{
+			"from": commit.From, "to": commit.To, "schema": commit.Schema,
+			"document_id": commit.ID, "valid": commit.Valid, "created_at": commit.CreatedAt,
+		})
+		if result.Error != nil {
+			span.RecordError(result.Error)
+			return ucrecord.AckOutcome{}, result.Error
+		}
+		if result.RowsAffected == 0 {
+			// a concurrent writer created the state first: start over
+			// with the row there to lock
+			return ucrecord.AckOutcome{}, errRetryTx
+		}
+		return ucrecord.AckOutcome{Status: ucrecord.Applied, IsValid: commit.Valid}, nil
+	}
 
+	if !commit.CreatedAt.After(state.CreatedAt) {
+		return ucrecord.AckOutcome{Status: ucrecord.Stale, WasValid: state.Valid, IsValid: state.Valid}, nil
+	}
+
+	err := db.Model(&models.Ack{}).
+		Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+		Updates(map[string]any{"valid": commit.Valid, "document_id": commit.ID, "created_at": commit.CreatedAt}).Error
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
+	}
+
+	return ucrecord.AckOutcome{Status: ucrecord.Applied, WasValid: state.Valid, IsValid: commit.Valid}, nil
 }
 
 func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, true)
-
+	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.AckerSide, From: from, To: to, Schema: schema, Valid: true, CreatedAt: createdAt})
 }
 
 func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAck(ctx, tx, documentID, from, to, schema, createdAt, false)
+	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.AckerSide, From: from, To: to, Schema: schema, Valid: false, CreatedAt: createdAt})
 }
 
-func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
+func processAcked(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-
-	ack := models.Acked{
-		From:       from,
-		To:         to,
-		Schema:     schema,
-		DocumentID: documentID,
-		Valid:      valid,
-		CreatedAt:  createdAt,
-	}
+	db = db.WithContext(ctx)
 
 	// CIP-10 §4: only a document with a strictly newer createdAt may move
-	// the (from, to, schema) state; an equal or older one is a no-op
-	// (RowsAffected 0). The key is createdAt alone — never the document id —
+	// the (from, to, schema) state; an equal or older one is a no-op.
+	// The key is createdAt alone — never the document id —
 	// so the acker's and the associate owner's servers, which hold different
 	// documents with the same createdAt, reach the same decision.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
-		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": createdAt}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("ackeds.created_at < excluded.created_at")}},
-	}).Create(&ack)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	// Not a conditional upsert: it cannot tell which validity it replaced.
+	var state models.Acked
+	found := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+		Limit(1).
+		Find(&state)
+	if found.Error != nil {
+		span.RecordError(found.Error)
+		return ucrecord.AckOutcome{}, found.Error
 	}
 
-	return result.RowsAffected > 0, nil
+	if found.RowsAffected == 0 {
+		// Not the model: gorm would swap a false valid for the column
+		// default, and an unack may be the first state.
+		result := db.Model(&models.Acked{}).Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
+			DoNothing: true,
+		}).Create(map[string]any{
+			"from": commit.From, "to": commit.To, "schema": commit.Schema,
+			"document_id": commit.ID, "valid": commit.Valid, "created_at": commit.CreatedAt,
+		})
+		if result.Error != nil {
+			span.RecordError(result.Error)
+			return ucrecord.AckOutcome{}, result.Error
+		}
+		if result.RowsAffected == 0 {
+			// a concurrent writer created the state first: start over
+			// with the row there to lock
+			return ucrecord.AckOutcome{}, errRetryTx
+		}
+		return ucrecord.AckOutcome{Status: ucrecord.Applied, IsValid: commit.Valid}, nil
+	}
 
+	if !commit.CreatedAt.After(state.CreatedAt) {
+		return ucrecord.AckOutcome{Status: ucrecord.Stale, WasValid: state.Valid, IsValid: state.Valid}, nil
+	}
+
+	err := db.Model(&models.Acked{}).
+		Where(`"from" = ? AND "to" = ? AND schema = ?`, commit.From, commit.To, commit.Schema).
+		Updates(map[string]any{"valid": commit.Valid, "document_id": commit.ID, "created_at": commit.CreatedAt}).Error
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.AckOutcome{}, err
+	}
+
+	return ucrecord.AckOutcome{Status: ucrecord.Applied, WasValid: state.Valid, IsValid: commit.Valid}, nil
 }
 
 func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, true)
-
+	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.TargetSide, From: from, To: to, Schema: schema, Valid: true, CreatedAt: createdAt})
 }
 
 func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.processAcked(ctx, tx, documentID, from, to, schema, createdAt, false)
+	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.TargetSide, From: from, To: to, Schema: schema, Valid: false, CreatedAt: createdAt})
 }
 
 func (r *Repository) getAckRecords(ctx context.Context, from, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {
