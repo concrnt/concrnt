@@ -250,8 +250,8 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 	case "cckv":
 		var recordKey models.RecordKey
 		err = r.db.WithContext(ctx).
-			Preload("Record").
-			Preload("Record.Document").
+			Joins("Record").
+			Joins("Record.Document").
 			Where("uri = ?", uri).
 			Take(&recordKey).Error
 		if err != nil {
