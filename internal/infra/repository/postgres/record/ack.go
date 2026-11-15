@@ -113,7 +113,7 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 	var acks []models.Ack
 	query := r.db.WithContext(ctx).
 		Model(&models.Ack{}).
-		Preload("Document").
+		Joins("Document").
 		Where("acks.from = ?", from).
 		Where("acks.valid = ?", true)
 
@@ -175,7 +175,7 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 	var acked []models.Acked
 	query := r.db.WithContext(ctx).
 		Model(&models.Acked{}).
-		Preload("Document").
+		Joins("Document").
 		Where("ackeds.to = ?", to).
 		Where("ackeds.valid = ?", true)
 
