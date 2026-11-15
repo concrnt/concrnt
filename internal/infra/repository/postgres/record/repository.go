@@ -66,6 +66,34 @@ func (tx *recordTx) Rollback(ctx context.Context) error {
 	return tx.tx.WithContext(ctx).Rollback().Error
 }
 
+// errNotStored rolls back a transaction whose write ended Stale or
+// Duplicate: neither leaves a trace, not even the commit log entry.
+var errNotStored = errors.New("not stored")
+
+// apply runs fn as one transaction and returns its status. Anything but
+// Applied rolls the transaction back.
+func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.ApplyStatus, error)) (ucrecord.ApplyStatus, error) {
+	select {
+	case txSlots <- struct{}{}:
+		defer func() { <-txSlots }()
+	case <-ctx.Done():
+		return ucrecord.Applied, ctx.Err()
+	}
+	status := ucrecord.Applied
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var err error
+		status, err = fn(tx)
+		if err == nil && status != ucrecord.Applied {
+			return errNotStored
+		}
+		return err
+	})
+	if errors.Is(err, errNotStored) {
+		return status, nil
+	}
+	return status, err
+}
+
 func getRecordTx(ctx context.Context, tx ucrecord.RepositoryTx) (*gorm.DB, error) {
 	recordTx, ok := tx.(*recordTx)
 	if !ok || recordTx == nil || recordTx.tx == nil {

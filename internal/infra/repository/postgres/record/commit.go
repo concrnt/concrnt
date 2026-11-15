@@ -69,6 +69,31 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 	return nil
 }
 
+// insertCommit writes the commit log entry; false when the id is already
+// in the log, which is left as first written (Duplicate).
+func insertCommit(tx *gorm.DB, commit ucrecord.Commit) (bool, error) {
+	proofBytes, err := json.Marshal(commit.Proof)
+	if err != nil {
+		return false, err
+	}
+
+	commitLog := models.CommitLog{
+		ID:       commit.ID,
+		IP:       commit.IP,
+		Document: commit.Document,
+		Owner:    commit.Owner,
+		Proof:    string(proofBytes),
+	}
+
+	result := tx.Clauses(clause.OnConflict{
+		DoNothing: true,
+	}).Create(&commitLog)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected > 0, nil
+}
+
 func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
 	defer span.End()

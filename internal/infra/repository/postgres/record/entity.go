@@ -15,6 +15,26 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
+func (r *Repository) ApplyEntity(ctx context.Context, commit ucrecord.EntityCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyEntity")
+	defer span.End()
+
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+		return createEntity(ctx, tx, commit)
+	})
+	if err != nil {
+		span.RecordError(err)
+	}
+	return status, err
+}
+
 func (r *Repository) CreateEntity(
 	ctx context.Context,
 	tx ucrecord.RepositoryTx,
@@ -24,21 +44,32 @@ func (r *Repository) CreateEntity(
 	documentID string,
 	createdAt time.Time,
 ) (bool, error) {
+	db, err := getRecordTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	status, err := createEntity(ctx, db, ucrecord.EntityCommit{
+		Commit:    ucrecord.Commit{ID: documentID, Owner: ccid},
+		CCID:      ccid,
+		Alias:     alias,
+		Domain:    domain,
+		CreatedAt: createdAt,
+	})
+	return status == ucrecord.Applied, err
+}
+
+func createEntity(ctx context.Context, db *gorm.DB, commit ucrecord.EntityCommit) (ucrecord.ApplyStatus, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateEntity")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+	db = db.WithContext(ctx)
 
 	modelEntity := models.Entity{
-		ID:         ccid,
-		Alias:      alias,
-		Domain:     domain,
-		DocumentID: documentID,
-		CreatedAt:  createdAt,
+		ID:         commit.CCID,
+		Alias:      commit.Alias,
+		Domain:     commit.Domain,
+		DocumentID: commit.ID,
+		CreatedAt:  commit.CreatedAt,
 	}
 
 	// CIP-3 §3.4 accept-if-newer on the document's createdAt: only a strictly
@@ -51,10 +82,13 @@ func (r *Repository) CreateEntity(
 		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("entities.created_at < excluded.created_at")}},
 	}).Create(&modelEntity)
 	if result.Error != nil {
-		return false, result.Error
+		return ucrecord.Applied, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ucrecord.Stale, nil
 	}
 
-	return result.RowsAffected > 0, nil
+	return ucrecord.Applied, nil
 }
 
 // MarkCommitLogsGcCandidateByOwner flags every commit log owned by the given

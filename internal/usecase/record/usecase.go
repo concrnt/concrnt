@@ -18,6 +18,14 @@ import (
 )
 
 type Repository interface {
+	// ApplyEntity stores an entity document: the commit log entry and the
+	// entity (ccid, alias, domain) it registers. Accept-if-newer on
+	// CreatedAt per ccid (CIP-3 §3.4): only a strictly newer document
+	// replaces the stored one, an equal or older one is Stale. The commit
+	// of a replaced entity document is kept as it is (CIP-0 §8.4: entities
+	// are exempt from onUpdate).
+	ApplyEntity(ctx context.Context, commit EntityCommit) (ApplyStatus, error)
+
 	// Utilities
 	BeginTx(ctx context.Context) (RepositoryTx, error)
 
@@ -89,6 +97,56 @@ type Repository interface {
 	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
 	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
 	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
+}
+
+// Commit is the commit log entry every write carries.
+type Commit struct {
+	// ID is the CDID of the signed document.
+	ID       string
+	IP       string
+	Document string
+	Proof    concrnt.Proof
+	// Owner is the one entity the commit is recorded under (CIP-3 §3.1); it
+	// is also the namespace the ccfs URI of what the commit stores is
+	// composed in.
+	Owner string
+}
+
+// ApplyStatus is how an Apply* call ended.
+type ApplyStatus int
+
+const (
+	// Applied: everything the operation describes is stored.
+	Applied ApplyStatus = iota
+	// Stale: the write lost accept-if-newer or uniqueness. Nothing is
+	// stored, not even the commit log entry, so a later delivery of the
+	// same document is judged afresh.
+	Stale
+	// Duplicate: the commit id is already in the log (a redelivery).
+	// Nothing changed.
+	Duplicate
+)
+
+func (s ApplyStatus) String() string {
+	switch s {
+	case Applied:
+		return "applied"
+	case Stale:
+		return "stale"
+	case Duplicate:
+		return "duplicate"
+	default:
+		return "unknown"
+	}
+}
+
+// EntityCommit is an entity document to store (ApplyEntity).
+type EntityCommit struct {
+	Commit
+	CCID      string
+	Alias     *string
+	Domain    string
+	CreatedAt time.Time
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.
