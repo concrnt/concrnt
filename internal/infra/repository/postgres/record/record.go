@@ -324,6 +324,95 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 	}
 }
 
+func (r *Repository) GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.GetSignedDocuments")
+	defer span.End()
+
+	cckvs := []string{}
+	ids := []string{}
+	idOf := map[string]string{}
+	for _, uri := range uris {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		switch parsed.Scheme {
+		case "cckv":
+			cckvs = append(cckvs, uri)
+		case "ccfs":
+			if parsed.Type == concrnt.CCFSTypeConcrnt {
+				ids = append(ids, parsed.CDID)
+				idOf[uri] = parsed.CDID
+			}
+		default:
+			err := fmt.Errorf("unsupported uri scheme: %s", parsed.Scheme)
+			span.RecordError(err)
+			return nil, err
+		}
+	}
+
+	out := make(map[string]*concrnt.SignedDocument, len(uris))
+
+	if len(cckvs) > 0 {
+		var rks []models.RecordKey
+		err := r.db.WithContext(ctx).
+			Model(&models.RecordKey{}).
+			Joins("JOIN records r ON r.document_id = record_keys.record_id").
+			Joins("JOIN commit_logs c ON c.id = record_keys.record_id").
+			Where("record_keys.uri IN ?", cckvs).
+			Select(recordKeySelect).
+			Find(&rks).Error
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		rows, err := recordKeysToQueryRows(rks, span)
+		if err != nil {
+			return nil, err
+		}
+		for i := range rows {
+			out[*rows[i].Row.CCKV] = &rows[i].Row
+		}
+	}
+
+	if len(ids) > 0 {
+		var commits []struct {
+			ID       string
+			Document string
+			Proof    string
+			URI      *string
+		}
+		err := r.db.WithContext(ctx).
+			Model(&models.CommitLog{}).
+			Select("commit_logs.id AS id, commit_logs.document AS document, commit_logs.proof AS proof, rk.uri AS uri").
+			Joins("LEFT JOIN record_keys rk ON rk.record_id = commit_logs.id").
+			Where("commit_logs.id IN ?", ids).
+			Scan(&commits).Error
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		byID := make(map[string]concrnt.SignedDocument, len(commits))
+		for _, commit := range commits {
+			var proof concrnt.Proof
+			if err := json.Unmarshal([]byte(commit.Proof), &proof); err != nil {
+				span.RecordError(errors.Join(errors.New("failed to unmarshal proof from commitlog"), err))
+				return nil, err
+			}
+			byID[commit.ID] = concrnt.SignedDocument{CCKV: commit.URI, Document: commit.Document, Proof: proof}
+		}
+		for uri, id := range idOf {
+			if sd, ok := byID[id]; ok {
+				sd.CCFS = &uri
+				out[uri] = &sd
+			}
+		}
+	}
+
+	return out, nil
+}
+
 func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
 	defer span.End()

@@ -34,6 +34,9 @@ type Repository interface {
 	// Read
 	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
+	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
+	// that resolves to nothing is absent from the map, not an error.
+	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)

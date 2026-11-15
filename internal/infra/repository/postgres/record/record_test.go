@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1293,4 +1294,71 @@ func TestRecordQueryByParentOrderByKey(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []string{parent + "/b", parent + "/a"}, urisOfRows(rows), "placeholders stay out of the createdAt listing")
 	})
+}
+
+// A mixed batch of cckv and ccfs URIs resolves like the single lookups;
+// misses (unknown keys and ids, placeholder keys, non-concrnt ccfs types) are
+// absent, and an empty batch is an empty map.
+func TestGetSignedDocuments(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := New(db)
+
+	createdAt := time.Date(2026, 5, 2, 0, 0, 0, 0, time.UTC)
+	sds := map[string]concrnt.SignedDocument{}
+	for id, key := range map[string]string{"multi-1": "cckv://con1owner/posts/p1", "multi-2": "cckv://con1owner/posts/p2"} {
+		sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"body": key},
+			Author:    "con1owner",
+			Schema:    "https://schema.example/item.json",
+			CreatedAt: createdAt,
+		})
+		sds[id] = sd
+		withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx ucrecord.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt)
+			return err
+		})
+	}
+	withRepositoryTx(t, ctx, repo, "multi-keyless", "127.0.0.1", concrnt.SignedDocument{Document: "{}"}, "con1owner", func(tx ucrecord.RepositoryTx) error {
+		return nil
+	})
+
+	ccfs2 := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-2")
+	keyless := concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-keyless")
+	got, err := repo.GetSignedDocuments(ctx, []string{
+		"cckv://con1owner/posts/p1",
+		ccfs2,
+		keyless,
+		"cckv://con1owner/posts/none",
+		"cckv://con1owner/posts", // placeholder
+		concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-none"),
+		"ccfs://con1owner/" + concrnt.CCFSTypeBlob + "/" + strings.Repeat("0", 64),
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+
+	p1 := got["cckv://con1owner/posts/p1"]
+	require.NotNil(t, p1)
+	require.Equal(t, sds["multi-1"].Document, p1.Document)
+	require.Equal(t, "cckv://con1owner/posts/p1", *p1.CCKV)
+	require.Equal(t, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "multi-1"), *p1.CCFS)
+
+	kl := got[keyless]
+	require.NotNil(t, kl)
+	require.Equal(t, "{}", kl.Document)
+	require.Nil(t, kl.CCKV)
+
+	for _, uri := range []string{"cckv://con1owner/posts/p1", ccfs2} {
+		single, err := repo.GetSignedDocument(ctx, uri)
+		require.NoError(t, err)
+		require.Equal(t, single, got[uri], "the batch result equals the single lookup")
+	}
+
+	got, err = repo.GetSignedDocuments(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, got)
 }
