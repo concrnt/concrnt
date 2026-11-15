@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -106,4 +107,45 @@ func TestApplyRecord(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, candidates, 1)
 	require.Equal(t, "record-1", candidates[0].ID)
+}
+
+// An association needs its target key to exist, and a second one with the
+// same unique value stores nothing.
+func TestApplyAssociation(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+	repo := &Repository{db: db}
+
+	owner := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+	target := "cckv://" + owner + "/posts/a"
+	at := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	association := func(id, unique string) ucrecord.AssociationCommit {
+		return ucrecord.AssociationCommit{Commit: testCommit(id, owner), Target: target, Author: owner, Schema: "https://schema.example.com/like.json", Unique: unique, CreatedAt: at}
+	}
+
+	_, err := repo.ApplyAssociation(ctx, association("association-1", "u1"))
+	require.ErrorIs(t, err, domain.ErrNotFound)
+	requireCommitLogged(t, repo, "association-1", false)
+
+	_, err = repo.ApplyRecord(ctx, ucrecord.RecordCommit{Commit: testCommit("record-1", owner), Key: target, Author: owner, CreatedAt: at})
+	require.NoError(t, err)
+
+	status, err := repo.ApplyAssociation(ctx, association("association-1", "u1"))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.Applied, status)
+
+	status, err = repo.ApplyAssociation(ctx, association("association-1", "u1"))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.Duplicate, status)
+
+	status, err = repo.ApplyAssociation(ctx, association("association-2", "u1"))
+	require.NoError(t, err)
+	require.Equal(t, ucrecord.Stale, status)
+	requireCommitLogged(t, repo, "association-2", false)
+
+	rows, err := repo.GetAssociatedRecords(ctx, target, "", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
 }

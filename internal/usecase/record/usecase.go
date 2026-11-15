@@ -37,6 +37,14 @@ type Repository interface {
 	// associations (the incarnation continues, see ApplyDelete).
 	ApplyRecord(ctx context.Context, commit RecordCommit) (RecordOutcome, error)
 
+	// ApplyAssociation stores an association on Target: the commit log
+	// entry and the association. Stale when an association with the same
+	// Unique already exists on the target's current incarnation (C6);
+	// domain.NotFoundError when the target key does not exist (a
+	// placeholder key counts as existing). The association belongs to the
+	// incarnation of the target key that exists at the time of the call.
+	ApplyAssociation(ctx context.Context, commit AssociationCommit) (ApplyStatus, error)
+
 	// Utilities
 	BeginTx(ctx context.Context) (RepositoryTx, error)
 
@@ -191,6 +199,22 @@ type RecordOutcome struct {
 	// PreviousID is the id of the document the key pointed at before, ""
 	// when FreshKey.
 	PreviousID string
+}
+
+// AssociationCommit is an association document to store
+// (ApplyAssociation). The association is owned by Commit.Owner, the owner
+// of Target.
+type AssociationCommit struct {
+	Commit
+	// Target is the cckv key the association is attached to.
+	Target  string
+	Author  string
+	Schema  string
+	Variant *string
+	// Unique identifies the logical association: a second one with the
+	// same value on the same incarnation of the target is Stale.
+	Unique    string
+	CreatedAt time.Time
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
@@ -13,32 +14,65 @@ import (
 	"github.com/concrnt/concrnt/internal/utils"
 )
 
+func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ApplyAssociation")
+	defer span.End()
+
+	status, err := r.apply(ctx, func(tx *gorm.DB) (ucrecord.ApplyStatus, error) {
+		inserted, err := insertCommit(tx, commit.Commit)
+		if err != nil {
+			return ucrecord.Applied, err
+		}
+		if !inserted {
+			return ucrecord.Duplicate, nil
+		}
+		return createAssociation(ctx, tx, commit)
+	})
+	if err != nil {
+		span.RecordError(err)
+	}
+	return status, err
+}
+
 func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
+	db, err := getRecordTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	status, err := createAssociation(ctx, db, ucrecord.AssociationCommit{
+		Commit:    ucrecord.Commit{ID: documentID, Owner: owner},
+		Target:    targetURI,
+		Author:    author,
+		Schema:    schema,
+		Variant:   variant,
+		Unique:    unique,
+		CreatedAt: createdAt,
+	})
+	return status == ucrecord.Applied, err
+}
+
+func createAssociation(ctx context.Context, db *gorm.DB, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return false, err
-	}
+	db = db.WithContext(ctx)
 
-	targetRK, err := getRecordKeyByURI(ctx, db, targetURI)
+	targetRK, err := getRecordKeyByURI(ctx, db, commit.Target)
 	if err != nil {
 		span.RecordError(err)
-		return false, err
+		return ucrecord.Applied, err
 	}
 
 	association := models.Association{
 		TargetID:   targetRK.ID,
-		DocumentID: documentID,
-		Unique:     unique,
+		DocumentID: commit.ID,
+		Unique:     commit.Unique,
 
-		Owner:     owner,
-		Author:    author,
-		Variant:   variant,
-		Schema:    schema,
-		CreatedAt: createdAt,
+		Owner:     commit.Owner,
+		Author:    commit.Author,
+		Variant:   commit.Variant,
+		Schema:    commit.Schema,
+		CreatedAt: commit.CreatedAt,
 	}
 
 	// A targetless ON CONFLICT DO NOTHING suppresses duplicates on both the
@@ -50,10 +84,13 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	}).Create(&association)
 	if result.Error != nil {
 		span.RecordError(result.Error)
-		return false, result.Error
+		return ucrecord.Applied, result.Error
+	}
+	if result.RowsAffected == 0 {
+		return ucrecord.Stale, nil
 	}
 
-	return result.RowsAffected > 0, nil
+	return ucrecord.Applied, nil
 }
 
 func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
