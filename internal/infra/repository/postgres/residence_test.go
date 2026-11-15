@@ -19,7 +19,7 @@ func TestResidenceUpdateMetaInfo(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := &ResidenceRepository{db: db}
+	repo := &EntityMetaRepository{db: db}
 
 	ccid := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"
