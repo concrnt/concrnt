@@ -214,6 +214,36 @@ func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, e
 	return int(res.RowsAffected), res.Error
 }
 
+// ListCommitLogs orders, paginates and filters on the id column's own
+// collation so the primary-key index backs the range scan (forcing COLLATE
+// "C" would defeat the index and full-scan the table on every page). This is
+// correct because time-kind CDIDs are fixed-length lowercase base32 whose byte
+// order encodes the embedded timestamp, and every standard collation orders
+// that alphabet identically to byte order.
+func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLogPage) ([]ucrecord.CommitLogEntry, error) {
+	q := r.db.WithContext(ctx).Order("commit_logs.id ASC")
+	if page.Limit > 0 {
+		q = q.Limit(page.Limit)
+	}
+	if page.AfterID != "" {
+		q = q.Where("commit_logs.id > ?", page.AfterID)
+	} else if page.FromID != "" {
+		q = q.Where("commit_logs.id >= ?", page.FromID)
+	}
+	if page.UntilID != "" {
+		q = q.Where("commit_logs.id <= ?", page.UntilID)
+	}
+	if page.Owner != "" {
+		q = q.Where("commit_logs.owner = ?", page.Owner)
+	}
+
+	var logs []models.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return commitLogEntries(logs)
+}
+
 func commitLogEntries(logs []models.CommitLog) ([]ucrecord.CommitLogEntry, error) {
 	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
 	for _, cl := range logs {

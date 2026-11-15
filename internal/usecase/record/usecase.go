@@ -74,10 +74,11 @@ type Repository interface {
 	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
 	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
 
-	// Offline tooling (conctl gc-commitlog)
+	// Offline tooling (conctl gc-commitlog / dump-commitlog)
 	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
 	ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]CommitLogEntry, error)
 	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
+	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
 
 	// Entities
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
@@ -98,6 +99,20 @@ type CommitLogEntry struct {
 	Proof    concrnt.Proof
 	Owner    string
 	CDate    time.Time
+}
+
+// CommitLogPage selects a page of commit logs ordered by id ascending. Commit
+// log ids are time-prefixed CDIDs, so id bounds are time bounds.
+type CommitLogPage struct {
+	// FromID is an inclusive lower bound; "" means none. Ignored when AfterID is set.
+	FromID string
+	// AfterID is an exclusive lower bound (the last id of the previous page).
+	AfterID string
+	// UntilID is an inclusive upper bound; "" means none.
+	UntilID string
+	// Owner restricts to commits owned by this ccid; "" means all.
+	Owner string
+	Limit int
 }
 
 // QueryRow is a raw list-query result row paired with its effective sort key
