@@ -56,7 +56,7 @@ var gcCommitlogCmd = &cobra.Command{
 		"request IPs) the erase path removes: treat the bucket as personal data — restrict\n" +
 		"access, set an expiration lifecycle (and one aborting incomplete multipart uploads),\n" +
 		"or use --no-backup when erasure must be final.\n" +
-		"Reads and writes Postgres directly; safe to run against a live server. Re-running is a no-op.",
+		"Reads and writes the database directly; safe to run against a live server. Re-running is a no-op.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
 		ctx := cmd.Context()
