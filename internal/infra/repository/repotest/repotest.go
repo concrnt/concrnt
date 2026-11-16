@@ -47,6 +47,7 @@ func Run(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("Delete", func(t *testing.T) { RunDeleteSuite(t, open) })
 	t.Run("Chunkline", func(t *testing.T) { RunChunklineSuite(t, open) })
 	t.Run("Residence", func(t *testing.T) { RunResidenceSuite(t, open) })
+	t.Run("Replication", func(t *testing.T) { RunReplicationSuite(t, open) })
 	t.Run("Maintenance", func(t *testing.T) { RunMaintenanceSuite(t, open) })
 	t.Run("World", func(t *testing.T) { RunWorldSuite(t, open) })
 }
