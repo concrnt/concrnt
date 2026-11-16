@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -25,6 +26,9 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
+	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	"github.com/concrnt/concrnt/internal/infra/cluster"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
@@ -40,6 +44,7 @@ import (
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -260,8 +265,22 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	entityMetaRepo := postgres.NewEntityMetaRepository(db)
+	var aggregateStore aggregate.Store
+	switch name := cmp.Or(conf.Backends.Aggregate.Store, "postgres"); name {
+	case "postgres":
+		aggregateStore = aggpostgres.New(db)
+	case "redis":
+		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
+	default:
+		panic("unknown backends.aggregate.store " + name + " (postgres, redis, memcached)")
+	}
+	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
+
 	recordRepo := pgrecord.New(db)
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	recordUC.SetAggregates(aggregateUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
