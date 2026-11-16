@@ -27,6 +27,7 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/impl/interop"
+	"github.com/concrnt/concrnt/internal/domain"
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
@@ -296,6 +297,11 @@ func main() {
 		}
 		// like the resolve endpoint, read without a requester
 		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if errors.Is(err, domain.ErrNotFound) {
+			// this server is the owner's home: the HTTP path would ask this
+			// same server and 404 (a new user's subkey before its enact)
+			return concrnt.SignedDocument{}, false, client.ErrNotFound
+		}
 		if err != nil {
 			// redirects (reference records) and denied reads keep the HTTP path
 			return concrnt.SignedDocument{}, false, nil

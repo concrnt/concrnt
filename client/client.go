@@ -51,11 +51,18 @@ type Client struct {
 	localResolver   LocalResolver
 }
 
+// ErrNotFound is returned by GetResource when the resource is known not to
+// exist. A LocalResolver returns it for a document the owner's home server
+// (this server) does not have: fetching it over HTTP would hit this same
+// server and 404.
+var ErrNotFound = errors.New("resource not found")
+
 // LocalResolver answers a cckv URI from the store of the server this client
 // runs in: the signed document and true when the owner lives on this server,
-// false when the URI has to be fetched over HTTP. It lets a server read its
-// own documents (the auth middleware's subkey documents, routing lookups)
-// without calling its own resolve endpoint.
+// false when the URI has to be fetched over HTTP, ErrNotFound when this server
+// is the authority and has no such document. It lets a server read its own
+// documents (the auth middleware's subkey documents, routing lookups) without
+// calling its own resolve endpoint.
 type LocalResolver func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error)
 
 func (c *Client) SetLocalResolver(fn LocalResolver) {
@@ -583,6 +590,11 @@ func (c *Client) GetResource(ctx context.Context, uri string, accept string, opt
 	// server's copy (e.g. the entity recheck by hint), not the local one
 	if c.localResolver != nil && parsed.Scheme == "cckv" && accept == "application/json" && (opts.Resolver == "" || opts.Resolver == c.defaultResolver) {
 		sd, found, err := c.localResolver(ctx, uri)
+		if errors.Is(err, ErrNotFound) {
+			localResolves.WithLabelValues("notfound").Inc()
+			span.RecordError(err)
+			return err
+		}
 		if err != nil {
 			span.RecordError(fmt.Errorf("local resolver for %s: %w", uri, err))
 		}
