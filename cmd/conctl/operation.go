@@ -2,6 +2,7 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"os"
 
@@ -13,10 +14,13 @@ import (
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	spannerrecord "github.com/concrnt/concrnt/internal/infra/repository/spanner/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -115,8 +119,22 @@ func newOperationContext() (*operationContext, error) {
 		op.Server = sqlite.NewServerRepository(lite.DB, cl)
 		op.Notification = sqlite.NewNotificationRepository(lite.DB)
 		op.close = lite.Close
+	case "spanner":
+		sp, admin, err := database.NewSpanner(context.Background(), conf.Backends)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect database: %w", err)
+		}
+		op.Record = spannerrecord.New(sp)
+		op.EntityMeta = spannerrepo.NewEntityMetaRepository(sp)
+		op.Server = spannerrepo.NewServerRepository(sp, cl)
+		op.Notification = spannerrepo.NewNotificationRepository(sp)
+		databaseAggregate, databaseAggregateName = aggspanner.New(sp), "spanner"
+		op.close = func() error {
+			sp.Close()
+			return admin.Close()
+		}
 	default:
-		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite)", conf.Backends.Database)
+		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite, spanner)", conf.Backends.Database)
 	}
 
 	// the same aggregate store selection as cmd/concrnt/main.go
@@ -126,7 +144,7 @@ func newOperationContext() (*operationContext, error) {
 	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
-	case "postgres":
+	case "postgres", "spanner":
 		if name != databaseAggregateName {
 			op.Close()
 			return nil, fmt.Errorf("backends.aggregate.store %s needs backends.database %s", name, name)
@@ -138,7 +156,7 @@ func newOperationContext() (*operationContext, error) {
 		aggregateStore = aggmemcached.New(database.NewMemcached(conf.Backends.MemcachedAddr), "")
 	default:
 		op.Close()
-		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, redis, memcached)", name)
+		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, redis, memcached)", name)
 	}
 	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 	return op, nil

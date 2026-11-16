@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	gspanner "cloud.google.com/go/spanner"
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
@@ -31,6 +32,7 @@ import (
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/cluster"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
@@ -42,6 +44,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/push"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	spannerrecord "github.com/concrnt/concrnt/internal/infra/repository/spanner/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
 	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/present/rest"
@@ -275,8 +279,29 @@ func main() {
 		serverRepo = sqlite.NewServerRepository(lite.DB, cl)
 		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
 		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
+	case "spanner":
+		sp, admin, err := database.NewSpanner(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer sp.Close()
+		defer admin.Close()
+		if err := spannerrepo.Migrate(ctx, admin, sp); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+
+		databaseReady = func(ctx context.Context) error {
+			_, err := sp.Single().Query(ctx, gspanner.Statement{SQL: "SELECT 1"}).Next()
+			return err
+		}
+		recordRepo = spannerrecord.New(sp)
+		entityMetaRepo = spannerrepo.NewEntityMetaRepository(sp)
+		serverRepo = spannerrepo.NewServerRepository(sp, cl)
+		notificationRepo = spannerrepo.NewNotificationRepository(sp)
+		abuseRepo = spannerrepo.NewAbuseRepository(sp)
+		databaseAggregate, databaseAggregateName = aggspanner.New(sp), "spanner"
 	default:
-		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite)")
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -294,7 +319,7 @@ func main() {
 	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
-	case "postgres":
+	case "postgres", "spanner":
 		if name != databaseAggregateName {
 			panic("backends.aggregate.store " + name + " needs backends.database " + name)
 		}
@@ -304,7 +329,7 @@ func main() {
 	case "memcached":
 		aggregateStore = aggmemcached.New(mc, "")
 	default:
-		panic("unknown backends.aggregate.store " + name + " (postgres, redis, memcached)")
+		panic("unknown backends.aggregate.store " + name + " (postgres, spanner, redis, memcached)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
