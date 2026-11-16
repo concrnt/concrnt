@@ -174,7 +174,12 @@ func (uc *Usecase) createRecord(ctx context.Context, ip string, requester domain
 		if outcome.FreshKey {
 			return uc.associationCountsSeededEmpty(parsed.Key)(ctx)
 		}
-		return nil
+		var previous *string
+		if outcome.PreviousID != "" {
+			ccfs := concrnt.ComposeCCFSURI(parsedKey.Owner, concrnt.CCFSTypeConcrnt, outcome.PreviousID)
+			previous = &ccfs
+		}
+		return uc.documentCacheInvalidated(&parsed.Key, previous)(ctx)
 	})
 
 	if mode == domain.CommitModeExecute {

@@ -37,7 +37,7 @@ func (uc *Usecase) GetSigned(ctx context.Context, uri string) (*concrnt.SignedDo
 			return nil, err
 		}
 
-		sd, err := uc.repo.GetSignedDocument(ctx, uri)
+		sd, err := uc.signedDocumentCached(ctx, uri)
 		if err != nil {
 			return nil, err
 		}

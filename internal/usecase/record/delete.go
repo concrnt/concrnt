@@ -319,6 +319,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 		var removedTimeline, removedItemID string
 
 		if authoritative {
+			plan.postProcesses = append(plan.postProcesses, uc.documentCacheInvalidated(&targetURI, targetSD.CCKV, targetSD.CCFS))
 			switch targetDoc.Kind {
 			case "record":
 
@@ -503,7 +504,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 			}
 
 			plan.removals = append(plan.removals, Removal{Kind: RemoveKey, URI: refKey})
-			plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(refKey))
+			plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
