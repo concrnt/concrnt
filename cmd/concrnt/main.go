@@ -284,6 +284,7 @@ func main() {
 	recordRepo := pgrecord.New(db)
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
+	recordUC.SetSharedCache(mc)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
