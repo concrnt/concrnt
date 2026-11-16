@@ -43,6 +43,8 @@ var conformanceTests = []conformanceTest{
 	{name: "association/counts", run: testAssociationCounts},
 	{name: "association/listing-survives-sibling-delete", run: testAssociationListingSurvivesSiblingDelete},
 	{name: "association/delete-then-recreate", run: testDeleteThenRecreate},
+	{name: "ack/state-machine", run: testAckStateMachine},
+	{name: "ack/import", run: testAckImport},
 	{name: "query/by-parent", run: testQueryByParent},
 	{name: "query/by-prefix", run: testQueryByPrefix},
 	{name: "query/by-key", run: testQueryByKey},
