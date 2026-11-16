@@ -180,11 +180,16 @@ func unmarshalTargets(targets []concrnt.SignedDocument) ([]concrnt.Document[any]
 }
 
 // evalDeletePolicy evaluates the delete policy of one authoritative target;
-// an association is governed by the policy of what it is attached to.
+// an association is governed by the policy of what it is attached to, and a
+// record by the stack of its key however the delete addressed it (a version
+// its key has moved on from has no key pointing at it to look the stack up
+// by).
 func (uc *Usecase) evalDeletePolicy(ctx context.Context, requester domain.Entity, targetDoc concrnt.Document[any], targetURI string) error {
 	policyRoot := targetURI
 	if targetDoc.Associate != nil {
 		policyRoot = *targetDoc.Associate
+	} else if targetDoc.Kind == "record" && targetDoc.Key != "" {
+		policyRoot = targetDoc.Key
 	}
 	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
 	if err != nil {
