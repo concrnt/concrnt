@@ -42,6 +42,7 @@ type Backend struct {
 // test.
 func Run(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("Record", func(t *testing.T) { RunRecordSuite(t, open) })
+	t.Run("Association", func(t *testing.T) { RunAssociationSuite(t, open) })
 }
 
 // Inspector is what the suites need and the contract cannot give them;
