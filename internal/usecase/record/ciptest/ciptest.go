@@ -65,6 +65,7 @@ var conformanceTests = []conformanceTest{
 	{name: "chunkline/manifest", run: testChunklineManifest},
 	{name: "chunkline/itr", run: testChunklineItr},
 	{name: "chunkline/body", run: testChunklineBody},
+	{name: "replication/feed", run: testReplicationFeed},
 }
 
 // Run runs every CIP conformance test against the backend open returns; open
