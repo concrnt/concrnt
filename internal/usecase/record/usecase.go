@@ -12,6 +12,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/policy"
@@ -449,6 +450,10 @@ type Usecase struct {
 	jobs   usecase.JobQueue
 	kvs    usecase.KVS
 	cache  *cache.Cache
+	// agg is the count cache; nil (offline tooling, tests) reads counts
+	// straight from repo.Compute*
+	agg  *aggregate.Usecase
+	aggs aggregates
 }
 
 func New(
@@ -474,6 +479,7 @@ func New(
 		kvs:    kvs,
 		cache:  cache.New(10*time.Minute, 15*time.Minute),
 	}
+	uc.aggs = newAggregates(repo)
 
 	// this usecase owns the delivery job type: it both enqueues DeliveryJobs
 	// and interprets them, so the queue itself stays agnostic
@@ -502,6 +508,12 @@ func New(
 	}
 
 	return uc
+}
+
+// SetAggregates routes the count reads and writes through the aggregate
+// cache agg.
+func (uc *Usecase) SetAggregates(agg *aggregate.Usecase) {
+	uc.agg = agg
 }
 
 // resolver returns uc.client as a DocumentResolver, or a nil interface when
