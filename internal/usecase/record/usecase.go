@@ -17,6 +17,25 @@ import (
 	"github.com/concrnt/concrnt/policy"
 )
 
+// Repository is the record store (CONTRACT.md). It has two halves.
+//
+// Writes: every commit is exactly one Apply* call. The usecase has read
+// and evaluated everything beforehand (committed state, no transaction), so
+// an Apply* method gets a complete description of the write and its read
+// set and write set follow from the arguments alone: no closure, no
+// transaction handle, no data-dependent fan-out. Each call is atomic (it
+// stores everything it describes or nothing), retries backend contention
+// internally (serialization failure, busy, aborted) and returns only a
+// final result, and is idempotent on the commit id: a call whose commit id
+// is already in the log changes nothing and reports Duplicate.
+//
+// Reads: every read returns committed state and complete rows (the signed
+// document included). The budget of each is noted as "round trips": the
+// sequential steps it may take against the store, whatever the page size.
+// A list read is one query, a point read one get; requests a backend
+// issues in parallel count as one step (a backend without joins reads the
+// key that qualifies a query beside the query). Where a backend cannot
+// hold the budget in every case, the method says so.
 type Repository interface {
 	// ApplyEntity stores an entity document: the commit log entry and the
 	// entity (ccid, alias, domain) it registers. Accept-if-newer on
@@ -82,12 +101,34 @@ type Repository interface {
 	// done.
 	Cleanup(ctx context.Context, token string) (next string, err error)
 
+	// GetSignedDocument resolves a cckv key to the record it holds, or a
+	// concrnt ccfs URI to the commit of that id (whatever kind, flagged for
+	// gc or not), filling both CCKV and CCFS when a key points at the
+	// document. domain.NotFoundError for a key holding no record (a
+	// placeholder included), an unknown id and a ccfs URI of another type.
+	// Round trips: 1 by cckv, 2 by ccfs (the commit, then its key).
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
 	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
-	// that resolves to nothing is absent from the map, not an error.
+	// that resolves to nothing is absent from the map, not an error. Round
+	// trips: 1 for the cckv URIs plus 2 for the ccfs ones, whatever their
+	// number.
 	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
+	// GetAcknowledgeRecords lists the valid states of the side given:
+	// from lists the acker side of that ccid, to the target side; exactly
+	// one of them is set. Optional schema filter, inclusive createdAt
+	// window, ordered by (createdAt, id), "desc" or ascending. Each row is
+	// the commit the state is anchored to, its CCFS composed in the side
+	// owner's namespace. Round trips: 1.
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
+	// GetAssociatedRecords lists the associations on the current
+	// incarnation of targetURI. Optional schema, variant and author
+	// filters, inclusive createdAt window, ordered by (createdAt, id). Each
+	// row's CCFS is composed in the target owner's namespace. Round trips: 1
+	// (a backend without joins reads the target key, which names the
+	// current incarnation, in parallel; while associations of an ended
+	// incarnation of the key still await Cleanup it may have to read
+	// further pages to fill one).
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 
 	// Compute* recount from the primary data (C2). They are the aggregate
@@ -106,13 +147,23 @@ type Repository interface {
 	// target key in parallel).
 	ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (AssociationSummary, error)
 
+	// QueryByPrefix lists the records whose key starts with the literal
+	// prefix (no wildcard in it means anything). Optional schema and author
+	// filters, inclusive createdAt window, ordered by (createdAt, id).
+	// QueryRow.CreatedAt is the createdAt the record was stored with (a
+	// reference record carries its target's). Round trips: 1; a backend that
+	// cannot index a prefix ending inside a path segment filters such a
+	// prefix from an overfetched page and may read further pages.
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
+	// QueryByParent is QueryByPrefix for the direct children of parent that
+	// hold a record; the owner root (cckv://<owner>) is a valid parent.
+	// Round trips: 1.
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	// QueryByParentOrderByKey lists parent's direct children in cckv order
-	// (CIP-5 orderby=key). Intermediate keys without a document are returned
-	// as key-only rows (Row.CCKV set, Document empty) unless schema or author
-	// filters them out; since/until are inclusive key bounds and QueryRow.CreatedAt
-	// is unused.
+	// (CIP-5 orderby=key; byte order of the key). Intermediate keys without
+	// a document are returned as key-only rows (Row.CCKV set, Document
+	// empty) unless schema or author filters them out; since/until are
+	// inclusive key bounds and QueryRow.CreatedAt is unused. Round trips: 1.
 	QueryByParentOrderByKey(ctx context.Context, parent, schema, author string, since, until *string, limit int, order string) ([]QueryRow, error)
 
 	// QueryRecordSubtree lists the live records under base (base itself too
@@ -121,31 +172,83 @@ type Repository interface {
 	// by path hierarchy, never by string prefix. Round trips: 1 (a backend
 	// without a disjunction reads base itself in parallel with its subtree).
 	QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error)
+	// GetTimelineRemoval tells which chunkline item a key occupies: its
+	// parent key and the item id LoadLocalBody serves for it (the redirect
+	// of a reference record, the key otherwise). Both are empty for a key
+	// that appears in no chunkline body (a placeholder, a top-level key);
+	// domain.NotFoundError for a key that does not exist. Round trips: 1.
 	GetTimelineRemoval(ctx context.Context, keyURI string) (timeline string, itemID string, err error)
+	// GetHierarchicalRecordPolicies builds the CIP-12 §5.3 policy stack of
+	// uri: one layer for every key on its ancestor chain (root first, uri
+	// itself last) whose record carries a policy or distributions. A ccfs
+	// URI is mapped to the key pointing at it first (domain.NotFoundError
+	// when none does). Round trips: 1 by cckv, 2 by ccfs.
 	GetHierarchicalRecordPolicies(ctx context.Context, uri string) ([]concrnt.Policy, error)
 	// GetHierarchicalRecordPoliciesMulti is GetHierarchicalRecordPolicies
-	// for several cckv URIs at once; every input URI has an entry.
+	// for several cckv URIs at once (one fetch of the union of their
+	// ancestor chains); every input URI has an entry. Round trips: 1.
 	GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error)
+	// GetAllCommitLogs dumps the commits recorded under owner in receipt
+	// order. Round trips: 1.
 	GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error)
 	// QueryCommitLogs pages the commit log by server receipt time (c_date,
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
-	// that c_date. owner "" means no owner filter.
+	// that c_date. owner "" means no owner filter. Commits flagged for gc
+	// are included; an ownerless commit has no CCFS. Round trips: 1.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 
 	// Offline tooling (conctl gc-commitlog / dump-commitlog)
+
+	// CountGcCandidates counts gc-flagged commit logs whose id sorts below
+	// cutoffID (i.e. whose document is older than the cutoff).
 	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
+	// ListGcCandidates returns up to limit gc-flagged commit logs below
+	// cutoffID in id order, starting after afterID ("" starts from the first).
 	ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]CommitLogEntry, error)
+	// DeleteCommitLogs removes the given commit logs together with
+	// everything anchored to them (record and its key, ack state,
+	// association, entity); a key removed this way ends its incarnation
+	// like a RemoveKey. Missing ids are ignored; the count of commit logs
+	// actually removed is returned. Offline only: not atomic over the list
+	// (a backend may work in batches) and idempotent, so a partial run is
+	// finished by running it again.
 	DeleteCommitLogs(ctx context.Context, ids []string) (int, error)
+	// ListCommitLogs returns one page of commit logs ordered by id ascending.
 	ListCommitLogs(ctx context.Context, page CommitLogPage) ([]CommitLogEntry, error)
 
 	// Entities
+
+	// GetEntityByCCID returns the entity registered under ccid with the
+	// signed document that registered it; domain.NotFoundError when
+	// unknown. Round trips: 1.
 	GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error)
+	// GetEntityByAlias is GetEntityByCCID by alias. Round trips: 1.
 	GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error)
+	// MarkCommitLogsGcCandidateByOwner flags every commit recorded under
+	// owner for gc (unregister). Idempotent; not atomic over the owner's
+	// commits.
 	MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error
 
-	// Chunkline views over record keys
+	// Chunkline views over record keys (CIP-11). An item is a direct child
+	// of the timeline key holding a record; its time is the createdAt the
+	// record was stored with and its id the record's redirect, or its key.
+
+	// GetChunklineManifest returns the manifest of the timeline at uri,
+	// FirstChunk being the chunk of its earliest item (nil without items);
+	// domain.NotFoundError when the key does not exist. Round trips: 1 (a
+	// backend without joins reads the key in parallel with the item query).
 	GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error)
+	// LookupLocalItrs maps each timeline that has an item at or before
+	// chunkID to the chunk of its latest such item. Round trips: 1; a backend
+	// without joins issues one bounded query per timeline and one batch get
+	// of the timeline keys, in parallel.
 	LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error)
+	// LoadLocalBody returns the items of chunkID and the chunk before it,
+	// newest first, and at least a page of items when the timeline has
+	// older ones; domain.NotFoundError when the key does not exist. Round
+	// trips: 1 (a backend without joins reads the key in parallel), and a
+	// second one on such a backend when the two chunks hold more than a
+	// page of items.
 	LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error)
 }
 
