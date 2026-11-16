@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
 
+	aggpg "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
@@ -120,6 +121,9 @@ var migrations = []migration{
 			}
 		}
 		return nil
+	}},
+	{6, "aggregate_entries", func(tx *gorm.DB) error {
+		return tx.Exec(aggpg.Schema).Error
 	}},
 }
 

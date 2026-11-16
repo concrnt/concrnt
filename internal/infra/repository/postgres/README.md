@@ -35,6 +35,9 @@ Two things this schema does that the contract does not ask for:
   the chunkline views of that parent until they are written again (an
   overwrite sets `parent_id` anew).
 
+Migration step 6 (`aggregate_entries`) creates the count cache table
+(`internal/infra/aggregate/postgres`).
+
 ## Prefix scans on record_keys.uri
 
 `record_keys.uri` has the database's default collation (en_US.utf8 on the

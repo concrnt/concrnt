@@ -66,6 +66,7 @@ var expectedIndexes = []indexRow{
 	{"acks", "acks_pkey", "CREATE UNIQUE INDEX acks_pkey ON public.acks USING btree (document_id)"},
 	{"acks", "idx_ack_from_to_schema", "CREATE UNIQUE INDEX idx_ack_from_to_schema ON public.acks USING btree (\"from\", \"to\", schema)"},
 	{"acks", "idx_acks_from_valid_created_at", "CREATE INDEX idx_acks_from_valid_created_at ON public.acks USING btree (\"from\", valid, created_at)"},
+	{"aggregate_entries", "aggregate_entries_pkey", "CREATE UNIQUE INDEX aggregate_entries_pkey ON public.aggregate_entries USING btree (key)"},
 	{"associations", "associations_pkey", "CREATE UNIQUE INDEX associations_pkey ON public.associations USING btree (document_id)"},
 	{"associations", "idx_associations_target_id", "CREATE INDEX idx_associations_target_id ON public.associations USING btree (target_id)"},
 	{"associations", "idx_associations_target_schema_variant_author", "CREATE INDEX idx_associations_target_schema_variant_author ON public.associations USING btree (target_id, schema, variant, author)"},
