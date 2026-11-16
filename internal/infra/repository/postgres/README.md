@@ -18,8 +18,11 @@ pool is unbounded). A transaction holds its connection for five or more
 round trips and a read for one, and `database/sql` gives a freed
 connection to any waiter, so without the bound a burst of commits (a seed,
 an import, a delivery backlog) takes every connection and each read waits
-among them. A transaction waiting for a slot holds no connection; the wait
-is the histogram `concrnt_record_tx_slot_wait_seconds`.
+among them: with 128 writers on a pool of 64 and a 2 ms round trip, the
+reads beside them took p95 95 ms without the bound and p95 4 ms with it
+(`record/loadshape_test.go`, scenario `writers`). A transaction waiting
+for a slot holds no connection; the wait is the histogram
+`concrnt_record_tx_slot_wait_seconds`.
 
 Dependents go by `ON DELETE CASCADE` inside the same transaction
 (`record_keys.record_id` → `records`, `associations.target_id` →
