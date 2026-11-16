@@ -49,6 +49,9 @@ var conformanceTests = []conformanceTest{
 	{name: "query/by-prefix", run: testQueryByPrefix},
 	{name: "query/by-key", run: testQueryByKey},
 	{name: "query/owner-root", run: testQueryOwnerRoot},
+	{name: "chunkline/manifest", run: testChunklineManifest},
+	{name: "chunkline/itr", run: testChunklineItr},
+	{name: "chunkline/body", run: testChunklineBody},
 }
 
 // Run runs every CIP conformance test against the backend open returns; open
