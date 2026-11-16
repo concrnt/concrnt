@@ -260,7 +260,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 
 	var err error
 	plan := &deletePagePlan{outcome: &DeleteOutcome{}}
-	plan.postProcesses = []PostProcessAction{}
+	plan.postProcesses = []PostProcessAction{uc.cleanupsScheduled(plan.outcome)}
 
 	// History is only kept for what asked for it: a deleted document with
 	// onUpdate=retain keeps its commit and, with it, this delete's (the

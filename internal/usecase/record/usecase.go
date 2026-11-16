@@ -467,6 +467,13 @@ func New(
 			}
 			return uc.Deliver(ctx, job)
 		})
+		jobs.RegisterHandler(JobTypeRecordCleanup, func(ctx context.Context, payload json.RawMessage) error {
+			job, err := usecase.ParseJobPayload[CleanupJob](payload)
+			if err != nil {
+				return err
+			}
+			return uc.ContinueCleanup(ctx, job)
+		})
 	}
 
 	return uc
