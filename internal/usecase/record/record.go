@@ -17,7 +17,7 @@ func (uc *Usecase) createRecord(ctx context.Context, ip string, requester domain
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateRecord")
 	defer span.End()
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, parsed.Key)
+	stack, err := uc.policyStack(ctx, parsed.Key)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -163,6 +163,12 @@ func (uc *Usecase) createRecord(ctx context.Context, ip string, requester domain
 
 	resultURI := parsed.Key
 	postProcesses := []PostProcessAction{}
+
+	// the stored record is a layer of its subtree's stacks when it carries a
+	// policy or distributions, and the one it replaced may have been
+	if parsed.Policy != nil || parsed.Distributes != nil || policyLayerAt(stack, parsed.Key) {
+		postProcesses = append(postProcesses, uc.policyStacksInvalidated(parsedKey.Owner))
+	}
 
 	postProcesses = append(postProcesses, func(ctx context.Context) error {
 		if outcome.FreshKey {

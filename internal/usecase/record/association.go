@@ -30,7 +30,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, ip string, requester d
 		return nil, err
 	}
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, *parsed.Associate)
+	stack, err := uc.policyStack(ctx, *parsed.Associate)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
