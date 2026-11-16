@@ -36,6 +36,10 @@ type Repository struct {
 	client *firestore.Client
 }
 
+func New(client *firestore.Client) ucrecord.Repository {
+	return &Repository{client: client}
+}
+
 var tracer = otel.Tracer("repository")
 
 func (r *Repository) col(name string) *firestore.CollectionRef {
