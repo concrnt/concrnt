@@ -55,7 +55,27 @@ func (uc *Usecase) GetAcknowledgeRecords(ctx context.Context, from, to, schema s
 }
 
 func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	return uc.repo.ComputeAcknowledgeCounts(ctx, from, to, schema)
+	if uc.agg == nil {
+		return uc.repo.ComputeAcknowledgeCounts(ctx, from, to, schema)
+	}
+	if from == "" && to == "" {
+		return nil, errors.New("either 'from' or 'to' must be specified")
+	}
+	// one entry per side holds every schema; the schema filter is applied
+	// on the way out
+	entry, err := uc.agg.Get(ctx, uc.aggs.acks, ackTarget(from, to))
+	if err != nil {
+		return nil, err
+	}
+	counts := ackCountsOf(entry)
+	if schema == "" {
+		return counts, nil
+	}
+	filtered := map[string]int64{}
+	if n, ok := counts[schema]; ok {
+		filtered[schema] = n
+	}
+	return filtered, nil
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {
@@ -68,11 +88,19 @@ func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, 
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	return uc.repo.GetAssociatedRecordCountsBySchema(ctx, targetURI)
+	counts, err := uc.associationCounts(ctx, targetURI)
+	if err != nil {
+		return nil, err
+	}
+	return counts.bySchema(), nil
 }
 
 func (uc *Usecase) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	return uc.repo.GetAssociatedRecordCountsByVariant(ctx, targetURI, schema)
+	counts, err := uc.associationCounts(ctx, targetURI)
+	if err != nil {
+		return nil, err
+	}
+	return counts.Schemas[schema].ordered(), nil
 }
 
 // Query lists records by prefix or parent (CIP-5). orderby=key is a
