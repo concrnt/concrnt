@@ -36,6 +36,10 @@ type Repository struct {
 	client *spanner.Client
 }
 
+func New(client *spanner.Client) ucrecord.Repository {
+	return &Repository{client: client}
+}
+
 var tracer = otel.Tracer("repository")
 
 // mutationCountKey is the span attribute carrying the mutation count
