@@ -17,6 +17,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/database"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
@@ -77,7 +79,7 @@ func newOperationContext() (*operationContext, error) {
 
 	op := &operationContext{Config: conf, GlobalConfig: globalConfig, Client: cl}
 	// the count cache table in the record database, under its
-	// backends.aggregate.store name
+	// backends.aggregate.store name; nil on sqlite, which has none
 	var (
 		databaseAggregate     aggregate.Store
 		databaseAggregateName string
@@ -103,12 +105,25 @@ func newOperationContext() (*operationContext, error) {
 			}
 			return sqlDB.Close()
 		}
+	case "sqlite":
+		lite, err := sqlite.Open(conf.Backends.SQLitePath())
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database: %w", err)
+		}
+		op.Record = sqliterecord.New(lite.DB)
+		op.EntityMeta = sqlite.NewEntityMetaRepository(lite.DB)
+		op.Server = sqlite.NewServerRepository(lite.DB, cl)
+		op.Notification = sqlite.NewNotificationRepository(lite.DB)
+		op.close = lite.Close
 	default:
-		return nil, fmt.Errorf("unknown backends.database %q (postgres)", conf.Backends.Database)
+		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite)", conf.Backends.Database)
 	}
 
 	// the same aggregate store selection as cmd/concrnt/main.go
-	aggregateName := cmp.Or(conf.Backends.Aggregate.Store, databaseAggregateName)
+	aggregateName := conf.Backends.Aggregate.Store
+	if aggregateName == "" {
+		aggregateName = cmp.Or(databaseAggregateName, "redis")
+	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
 	case "postgres":

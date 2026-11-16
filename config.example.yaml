@@ -28,7 +28,9 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
-  # database is the record store: postgres (the default).
+  # database is the record store: postgres (the default) or sqlite.
+  # sqlite keeps everything in one file (sqlite.path, default ./concrnt.db)
+  # and needs no database server; redis and memcached are still required.
   database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # postgres sizes the connection pool of each replica. replicas x
@@ -37,14 +39,17 @@ backends:
   # one transaction.
   # postgres:
   #   maxOpenConns: 64      # default 64
+  # sqlite:
+  #   path: /var/lib/concrnt/concrnt.db
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
   # aggregate is the cache of counts (association counts, ack counts).
-  # store: postgres (a table in the record database, the default), redis
-  # or memcached. memcached shares memcachedAddr with the timeline chunk
-  # cache, and `aggregate-invalidate` there reaches the other replicas
-  # within 5s.
+  # store: postgres (a table in the record database), redis or memcached;
+  # the default is the record database when it is postgres, redis
+  # otherwise.
+  # memcached shares memcachedAddr with the timeline chunk cache, and
+  # `aggregate-invalidate` there reaches the other replicas within 5s.
   # the cache is never the source of truth: `conctl op aggregate-invalidate
   # --all` drops it and every count is recomputed on its next read.
   # ttl is how long a computed entry is served; maxDeltas how many writes

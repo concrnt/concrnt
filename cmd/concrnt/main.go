@@ -42,6 +42,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/push"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -216,7 +218,7 @@ func main() {
 		abuseRepo        abuse.Repository
 		databaseReady    health.Check
 		// the count cache table in the record database, under its
-		// backends.aggregate.store name
+		// backends.aggregate.store name; nil on sqlite, which has none
 		databaseAggregate     aggregate.Store
 		databaseAggregateName string
 		// logged as one line once the job queue is sized
@@ -256,8 +258,25 @@ func main() {
 		notificationRepo = postgres.NewNotificationRepository(pg)
 		abuseRepo = postgres.NewAbuseRepository(pg)
 		databaseAggregate, databaseAggregateName = aggpostgres.New(pg), "postgres"
+	case "sqlite":
+		lite, err := sqlite.Open(conf.Backends.SQLitePath())
+		if err != nil {
+			panic("failed to open database: " + err.Error())
+		}
+		defer lite.Close()
+		if err := sqlite.Migrate(ctx, lite); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.SQL(), "concrnt"))
+
+		databaseReady = lite.Ready
+		recordRepo = sqliterecord.New(lite.DB)
+		entityMetaRepo = sqlite.NewEntityMetaRepository(lite.DB)
+		serverRepo = sqlite.NewServerRepository(lite.DB, cl)
+		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
+		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
 	default:
-		panic("unknown backends.database " + conf.Backends.Database + " (postgres)")
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -267,9 +286,12 @@ func main() {
 	redis := database.NewRedisServing(conf.Backends.RedisAddr, "", conf.Backends.RedisDB, jobQueueConcurrency)
 
 	// the count cache store, built here like the repositories: "" keeps
-	// the counts in the record database, and a database store must be the
-	// record database itself
-	aggregateName := cmp.Or(conf.Backends.Aggregate.Store, databaseAggregateName)
+	// the counts in the record database (redis on sqlite), and a database
+	// store must be the record database itself
+	aggregateName := conf.Backends.Aggregate.Store
+	if aggregateName == "" {
+		aggregateName = cmp.Or(databaseAggregateName, "redis")
+	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
 	case "postgres":
