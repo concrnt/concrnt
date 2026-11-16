@@ -91,13 +91,14 @@ type Cluster struct {
 }
 
 type Backends struct {
-	// Database selects the record store: "postgres" (default), "sqlite" or
-	// "spanner".
+	// Database selects the record store: "postgres" (default), "sqlite",
+	// "spanner" or "firestore".
 	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
 	Postgres      Postgres  `yaml:"postgres"`
 	SQLite        SQLite    `yaml:"sqlite"`
 	Spanner       Spanner   `yaml:"spanner"`
+	Firestore     Firestore `yaml:"firestore"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
 	RedisAddr     string    `yaml:"redisAddr"`
 	RedisDB       int       `yaml:"redisDB"`
@@ -173,6 +174,18 @@ type Spanner struct {
 	Database string `yaml:"database"`
 }
 
+// Firestore configures the firestore record store.
+type Firestore struct {
+	// ProjectID is the Google Cloud project; empty means detect it from the
+	// environment (metadata server, ADC).
+	ProjectID string `yaml:"projectID"`
+	// DatabaseID is the Firestore database (default "(default)").
+	DatabaseID string `yaml:"databaseID"`
+	// EmulatorHost is the host:port of a Firestore emulator; it sets
+	// FIRESTORE_EMULATOR_HOST (which can also be set directly).
+	EmulatorHost string `yaml:"emulatorHost"`
+}
+
 // SpannerDatabasePath is the full database resource name.
 func (b Backends) SpannerDatabasePath() string {
 	project, instance, db := b.Spanner.Project, b.Spanner.Instance, b.Spanner.Database
@@ -190,9 +203,9 @@ func (b Backends) SpannerDatabasePath() string {
 
 // Aggregate configures the count cache (internal/usecase/aggregate).
 type Aggregate struct {
-	// Store is "postgres" (a table in the record database), "spanner"
-	// (same), "redis" or "memcached" (backends.memcachedAddr); empty means
-	// the store matching the record database.
+	// Store is "postgres" (a table in the record database), "spanner" or
+	// "firestore" (same), "redis" or "memcached" (backends.memcachedAddr);
+	// empty means the store matching the record database.
 	Store string `yaml:"store"`
 	// TTL is how long a computed value is served before it is recomputed
 	// (default 24h); MaxDeltas how many writes an entry absorbs before it is

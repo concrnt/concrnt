@@ -3,6 +3,7 @@ module github.com/concrnt/concrnt
 go 1.26.5
 
 require (
+	cloud.google.com/go/firestore v1.29.2
 	cloud.google.com/go/spanner v1.96.1
 	github.com/SherClockHolmes/webpush-go v1.4.0
 	github.com/XSAM/otelsql v0.44.0
