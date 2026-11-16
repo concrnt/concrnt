@@ -63,6 +63,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 		if repairAnchoredAcksDryRun {
 			fmt.Fprintln(os.Stderr, "schema migration (ackeds table, entities.created_at, acks foreign key) is applied by the real run")
 		}
+		if !repairAnchoredAcksDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
+		}
 		return nil
 	}),
 }
