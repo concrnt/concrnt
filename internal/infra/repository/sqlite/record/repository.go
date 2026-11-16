@@ -35,6 +35,10 @@ type Repository struct {
 	writer chan struct{}
 }
 
+func New(db *gorm.DB) ucrecord.Repository {
+	return &Repository{db: db, writer: make(chan struct{}, 1)}
+}
+
 var tracer = otel.Tracer("repository")
 
 // errNotStored rolls back a transaction whose write ended Stale or
