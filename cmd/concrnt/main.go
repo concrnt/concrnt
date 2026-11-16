@@ -26,6 +26,7 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/impl/interop"
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
@@ -285,6 +286,22 @@ func main() {
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
 	recordUC.SetSharedCache(mc)
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		if local, err := recordUC.IsLocalEntityByCCID(ctx, parsed.Owner); err != nil || !local {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		// like the resolve endpoint, read without a requester
+		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if err != nil {
+			// redirects (reference records) and denied reads keep the HTTP path
+			return concrnt.SignedDocument{}, false, nil
+		}
+		return *sd, true, nil
+	})
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
