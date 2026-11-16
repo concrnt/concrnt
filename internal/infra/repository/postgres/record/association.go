@@ -11,7 +11,6 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
-	"github.com/concrnt/concrnt/internal/utils"
 )
 
 func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
@@ -146,71 +145,6 @@ func (r *Repository) GetAssociatedRecords(
 	}
 
 	return rows, nil
-}
-
-func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsBySchema")
-	defer span.End()
-
-	var counts []struct {
-		Schema string
-		Count  int64
-	}
-
-	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
-		Select("schema, COUNT(*) AS count").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Group("schema").
-		Scan(&counts).Error
-
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	result := make(map[string]int64)
-	for _, c := range counts {
-		result[c.Schema] = c.Count
-	}
-
-	return result, nil
-}
-
-func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsByVariant")
-	defer span.End()
-
-	var counts []struct {
-		Variant  string
-		Count    int64
-		MinCDate time.Time
-	}
-
-	err := r.db.WithContext(ctx).
-		Model(&models.Association{}).
-		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Where("associations.schema = ?", schema).
-		Group("variant").
-		Order("min_created_at ASC").
-		Scan(&counts).Error
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	result := make(utils.OrderedKVMap[int64])
-	for _, c := range counts {
-		result[c.Variant] = utils.OrderedKV[int64]{
-			Value: c.Count,
-			Order: c.MinCDate.UnixNano(),
-		}
-	}
-
-	return &result, nil
 }
 
 // ComputeAssociationSummary reads a target's associations once: the CTE is

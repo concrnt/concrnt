@@ -14,7 +14,6 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/server"
-	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/policy"
 )
 
@@ -90,8 +89,6 @@ type Repository interface {
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
-	GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
 
 	// Compute* recount from the primary data (C2). They are the aggregate
 	// layer's cache miss path and the verification tool's reference; request
