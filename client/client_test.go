@@ -788,6 +788,29 @@ func TestTimeoutMarksDomainOffline(t *testing.T) {
 	}
 }
 
+func TestOwnDomainNeverMarkedOffline(t *testing.T) {
+	t.Parallel()
+
+	const self = "self.example.test"
+	cl := &Client{
+		lastFailed:      make(map[string]time.Time),
+		failCount:       make(map[string]int),
+		defaultResolver: self,
+	}
+
+	cl.markOfflineIfTimeout(self, "testing", timeoutError{})
+	cl.markOffline(self)
+
+	if !cl.IsOnline(self) {
+		t.Fatal("this server's own domain went offline")
+	}
+
+	cl.markOfflineIfTimeout("peer.example.test", "testing", timeoutError{})
+	if cl.IsOnline("peer.example.test") {
+		t.Fatal("a peer stays online after a timeout")
+	}
+}
+
 func serveTestBatch(t *testing.T, handler http.Handler, w http.ResponseWriter, r *http.Request) {
 	t.Helper()
 
@@ -1012,7 +1035,7 @@ func TestGetServerServerErrorMarksOffline(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cl := New(domain)
+	cl := New("self.example.test")
 	cl.AddHostRemapping(domain, server.URL)
 
 	_, err := cl.GetServer(context.Background(), domain, nil)
@@ -1088,7 +1111,7 @@ func TestHealthCheckRecoversNonConcrntHost(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	cl := New(domain)
+	cl := New("self.example.test")
 	cl.AddHostRemapping(domain, server.URL)
 	cl.markOffline(domain)
 	if cl.IsOnline(domain) {

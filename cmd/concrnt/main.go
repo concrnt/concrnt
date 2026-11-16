@@ -348,6 +348,7 @@ func main() {
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
 	chunklineUC := chunkline.New(recordRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineGateway.SetLocal(domainConfig.FQDN, chunklineUC)
 
 	go func() {
 		if err := jobQueue.Run(ctx); err != nil {
