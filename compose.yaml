@@ -45,6 +45,21 @@ services:
       - internal
       - external
 
+  # Firestore emulator, the local target of backends.database: firestore
+  # (profile firestore). Data lives in the emulator's memory only; the
+  # composite indexes are not enforced here, deploy/firestore has them.
+  firestore-emulator:
+    restart: always
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    profiles:
+      - firestore
+    command: ["gcloud", "emulators", "firestore", "start", "--host-port=0.0.0.0:8080"]
+    ports:
+      - "8080:8080"
+    networks:
+      - internal
+      - external
+
   web:
     restart: always
     image: ghcr.io/concrnt/concrnt-web:main

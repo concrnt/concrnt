@@ -11,12 +11,15 @@ import (
 
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
+	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
 	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
+	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
@@ -133,8 +136,19 @@ func newOperationContext() (*operationContext, error) {
 			sp.Close()
 			return admin.Close()
 		}
+	case "firestore":
+		fsc, err := database.NewFirestore(context.Background(), conf.Backends)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect database: %w", err)
+		}
+		op.Record = fsrecord.New(fsc)
+		op.EntityMeta = fsrepo.NewEntityMetaRepository(fsc)
+		op.Server = fsrepo.NewServerRepository(fsc, cl)
+		op.Notification = fsrepo.NewNotificationRepository(fsc)
+		databaseAggregate, databaseAggregateName = aggfirestore.New(fsc), "firestore"
+		op.close = fsc.Close
 	default:
-		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite, spanner)", conf.Backends.Database)
+		return nil, fmt.Errorf("unknown backends.database %q (postgres, sqlite, spanner, firestore)", conf.Backends.Database)
 	}
 
 	// the same aggregate store selection as cmd/concrnt/main.go
@@ -144,7 +158,7 @@ func newOperationContext() (*operationContext, error) {
 	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
-	case "postgres", "spanner":
+	case "postgres", "spanner", "firestore":
 		if name != databaseAggregateName {
 			op.Close()
 			return nil, fmt.Errorf("backends.aggregate.store %s needs backends.database %s", name, name)
@@ -156,7 +170,7 @@ func newOperationContext() (*operationContext, error) {
 		aggregateStore = aggmemcached.New(database.NewMemcached(conf.Backends.MemcachedAddr), "")
 	default:
 		op.Close()
-		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, redis, memcached)", name)
+		return nil, fmt.Errorf("unknown backends.aggregate.store %q (postgres, spanner, firestore, redis, memcached)", name)
 	}
 	op.Aggregate = aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 	return op, nil

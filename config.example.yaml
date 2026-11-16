@@ -28,7 +28,8 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
-  # database is the record store: postgres (the default), sqlite or spanner.
+  # database is the record store: postgres (the default), sqlite, spanner or
+  # firestore.
   # sqlite keeps everything in one file (sqlite.path, default ./concrnt.db)
   # and needs no database server; redis and memcached are still required.
   database: postgres
@@ -51,13 +52,21 @@ backends:
   #   project: default      # omni fixes project and instance to "default"
   #   instance: default
   #   database: concrnt
+  # firestore reaches Cloud Firestore (Native mode) with the ambient
+  # credentials, or the emulator at emulatorHost (`docker compose --profile
+  # firestore up` runs one). deploy the composite indexes of
+  # deploy/firestore/firestore.indexes.json before switching traffic.
+  # firestore:
+  #   projectID: my-project    # optional on GCP (detected from the metadata server)
+  #   databaseID: concrnt      # optional, "(default)" when omitted
+  #   emulatorHost: firestore-emulator:8080
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
   # aggregate is the cache of counts (association counts, ack counts).
-  # store: postgres or spanner (a table in the record database), redis or
-  # memcached; the default is the record database when it is postgres or
-  # spanner, redis otherwise.
+  # store: postgres, spanner or firestore (a table / collection in the
+  # record database), redis or memcached; the default is the record
+  # database when it is postgres, spanner or firestore, redis otherwise.
   # memcached shares memcachedAddr with the timeline chunk cache, and
   # `aggregate-invalidate` there reaches the other replicas within 5s.
   # the cache is never the source of truth: `conctl op aggregate-invalidate
@@ -70,7 +79,7 @@ backends:
   #   maxDeltas: 10000
   # jobqueue runs the background jobs (federation delivery, realtime
   # events, the later pages of a range delete, the cleanup after a deleted
-  # key on spanner); concurrency is the consumer goroutines
+  # key on spanner / firestore); concurrency is the consumer goroutines
   # per replica.
   # jobqueue:
   #   concurrency: 16       # default 16

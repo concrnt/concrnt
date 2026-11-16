@@ -29,6 +29,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
 	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
 	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
@@ -42,6 +43,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
+	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
@@ -63,6 +66,12 @@ import (
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/internal/worker"
 )
+
+// firestoreCheckInterval is how often a healthy Firestore is checked for
+// readiness. Each check is a billed document read, so it runs less often
+// than the other backends' (health.DefaultCheckInterval); a failed check
+// is retried on the watcher's short retry interval all the same.
+const firestoreCheckInterval = 15 * time.Second
 
 var (
 	version      = "unknown"
@@ -221,6 +230,8 @@ func main() {
 		notificationRepo notification.Repository
 		abuseRepo        abuse.Repository
 		databaseReady    health.Check
+		// how often databaseReady runs while it succeeds
+		databaseCheckInterval = health.DefaultCheckInterval
 		// the count cache table in the record database, under its
 		// backends.aggregate.store name; nil on sqlite, which has none
 		databaseAggregate     aggregate.Store
@@ -300,8 +311,28 @@ func main() {
 		notificationRepo = spannerrepo.NewNotificationRepository(sp)
 		abuseRepo = spannerrepo.NewAbuseRepository(sp)
 		databaseAggregate, databaseAggregateName = aggspanner.New(sp), "spanner"
+	case "firestore":
+		fsc, err := database.NewFirestore(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer fsc.Close()
+		// Firestore has no schema to migrate; the composite indexes are
+		// deployed from deploy/firestore and probed here, off the startup
+		// path, so a missing one shows up in the log before users hit it
+		go fsrepo.VerifyIndexes(context.WithoutCancel(ctx), fsc)
+		prometheus.MustRegister(fsrepo.Collectors()...)
+
+		databaseReady = func(ctx context.Context) error { return fsrepo.Ping(ctx, fsc) }
+		databaseCheckInterval = firestoreCheckInterval
+		recordRepo = fsrecord.New(fsc)
+		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
+		serverRepo = fsrepo.NewServerRepository(fsc, cl)
+		notificationRepo = fsrepo.NewNotificationRepository(fsc)
+		abuseRepo = fsrepo.NewAbuseRepository(fsc)
+		databaseAggregate, databaseAggregateName = aggfirestore.New(fsc), "firestore"
 	default:
-		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner)")
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner, firestore)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -319,7 +350,7 @@ func main() {
 	}
 	var aggregateStore aggregate.Store
 	switch name := aggregateName; name {
-	case "postgres", "spanner":
+	case "postgres", "spanner", "firestore":
 		if name != databaseAggregateName {
 			panic("backends.aggregate.store " + name + " needs backends.database " + name)
 		}
@@ -329,7 +360,7 @@ func main() {
 	case "memcached":
 		aggregateStore = aggmemcached.New(mc, "")
 	default:
-		panic("unknown backends.aggregate.store " + name + " (postgres, spanner, redis, memcached)")
+		panic("unknown backends.aggregate.store " + name + " (postgres, spanner, firestore, redis, memcached)")
 	}
 	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
@@ -558,7 +589,7 @@ func main() {
 	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 	defer redisProbe.Close()
 	readiness := health.NewReadiness(health.DefaultReadinessPolicy)
-	readiness.Add("database", health.DefaultCheckInterval, databaseReady)
+	readiness.Add("database", databaseCheckInterval, databaseReady)
 	readiness.Add("redis", health.DefaultCheckInterval, func(ctx context.Context) error {
 		return redisProbe.Ping(ctx).Err()
 	})
