@@ -343,6 +343,8 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 				switch parsedURI.Scheme {
 				case "cckv":
 					plan.removals = append(plan.removals, Removal{Kind: RemoveKey, URI: targetURI})
+					// the key's associations go with it
+					plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(targetURI))
 				case "ccfs":
 					if parsedURI.Type != concrnt.CCFSTypeConcrnt {
 						err := errors.New("unsupported ccfs type for delete record: " + parsedURI.Type)
@@ -378,6 +380,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 				removal := Removal{Kind: RemoveAssociation, DocumentID: parsedURI.CDID}
 				if targetDoc.Associate != nil {
 					removal.URI = *targetDoc.Associate
+					plan.postProcesses = append(plan.postProcesses, uc.associationCountsRemoved(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, plan.outcome, len(plan.removals), mode))
 				}
 				plan.removals = append(plan.removals, removal)
 
@@ -493,6 +496,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 			}
 
 			plan.removals = append(plan.removals, Removal{Kind: RemoveKey, URI: refKey})
+			plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(refKey))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
