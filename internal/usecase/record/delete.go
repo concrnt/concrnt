@@ -18,6 +18,13 @@ import (
 	"github.com/concrnt/concrnt/schemas"
 )
 
+// rangeDeleteSyncLimit bounds how many targets one ApplyDelete call removes
+// (a write stays bounded: on Spanner every deleted row and index entry
+// counts against the commit's mutation limit, on Firestore against the
+// commit size). A range delete removes that many with its commit; the rest
+// of the subtree is deleted page by page by RecordRangeDelete jobs.
+const rangeDeleteSyncLimit = 500
+
 func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain.Entity, sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Delete")
 	defer span.End()
@@ -47,9 +54,18 @@ func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain
 
 	var targets []concrnt.SignedDocument
 	var targetURIs []string // per-target address (cckv/ccfs URI) deletion and policy key on
+	// deferred is set when the subtree is larger than one write removes:
+	// the first page goes with the commit, the rest to RecordRangeDelete jobs
+	deferred := false
 	if authoritative {
 		if isRange {
-			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf, "", 0)
+			// without a job queue (offline tooling) the whole subtree is
+			// removed here
+			limit := 0
+			if uc.jobs != nil {
+				limit = rangeDeleteSyncLimit + 1
+			}
+			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf, "", limit)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err
@@ -58,6 +74,10 @@ func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain
 				err := domain.NotFoundError{Resource: rawTarget}
 				span.RecordError(err)
 				return nil, err
+			}
+			if limit > 0 && len(targets) > rangeDeleteSyncLimit {
+				targets = targets[:rangeDeleteSyncLimit]
+				deferred = true
 			}
 			for _, target := range targets {
 				targetURIs = append(targetURIs, *target.CCKV)
@@ -151,7 +171,18 @@ func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain
 		return &commitApplyResult{noop: true, unapplied: &sd}, nil
 	}
 
-	if !pagePlan.retained {
+	postProcesses := pagePlan.postProcesses
+	if deferred {
+		// the pages to come decide the fate of the delete commit (a retained
+		// target in any page keeps it)
+		job := RangeDeleteJob{
+			IP: ip, Requester: requester.ID, Delete: sd, Base: rangeBase, IncludeSelf: includeSelf,
+			AfterURI: targetURIs[len(targetURIs)-1], Retained: pagePlan.retained,
+		}
+		postProcesses = append(postProcesses, func(ctx context.Context) error {
+			return uc.jobs.Enqueue(ctx, JobTypeRecordRangeDelete, job)
+		})
+	} else if !pagePlan.retained {
 		pagePlan.gcCommitIDs = append(pagePlan.gcCommitIDs, documentID)
 	}
 
@@ -165,7 +196,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain
 		},
 		result:        &targets[0],
 		unapplied:     &sd,
-		postProcesses: pagePlan.postProcesses,
+		postProcesses: postProcesses,
 	}, nil
 }
 
