@@ -530,7 +530,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 			plan.postProcesses = append(
 				plan.postProcesses,
 				func(ctx context.Context) error {
-					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+					return uc.enqueueEventDelivery(ctx, DeliveryJob{
 						ResolveURI: dest,
 						Payload:    remoteSD,
 						Local:      DeliveryLocalPublish,
@@ -591,7 +591,7 @@ func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*del
 				}
 				plan.postProcesses = append(plan.postProcesses,
 					func(ctx context.Context) error {
-						return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+						return uc.enqueueEventDelivery(ctx, DeliveryJob{
 							ResolveURI: dest,
 							Payload:    remoteSD,
 							Local:      DeliveryLocalPublish,

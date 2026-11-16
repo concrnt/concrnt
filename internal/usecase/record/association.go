@@ -195,7 +195,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, ip string, requester d
 							ccfs: sd,
 						},
 					})
-					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+					return uc.enqueueEventDelivery(ctx, DeliveryJob{
 						ResolveURI: channel,
 						Payload:    remoteSD,
 						Local:      DeliveryLocalPublish,
