@@ -1,6 +1,8 @@
 package database
 
 import (
+	"database/sql"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -13,13 +15,13 @@ import (
 	"gorm.io/gorm/logger"
 	"gorm.io/plugin/opentelemetry/tracing"
 
+	aggpg "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
-
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections
+// (config.Postgres.MaxOpenConnsOrDefault).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -52,13 +54,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// A transaction holds one connection while the reads issued inside it
-	// (through the repository's plain db handle) take another one from this
-	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (postgres.MaxConcurrentTx); otherwise that many
-	// concurrent commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 
@@ -82,29 +79,122 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 	return db, nil
 }
 
+// NewPostgresProbe opens a single connection for the readiness check alone.
+// A ping through the serving pool queues behind the requests when every
+// connection is in use (database/sql serves its waiters in random order),
+// so under a burst it times out although the database is answering; this
+// connection is never handed to a request. It is untraced: a ping every
+// few seconds is noise in the spans.
+func NewPostgresProbe(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
+}
+
+// A schema change is a new step, never an edit of an applied one: a step
+// runs once per database.
+type migration struct {
+	Version int
+	Name    string
+	Up      func(tx *gorm.DB) error
+}
+
+var migrations = []migration{
+	{1, "baseline_tables", autoMigrateTables},
+	// AutoMigrate does not rebuild an existing index whose collation changed
+	{2, "rebuild_parent_key_index_in_byte_order", func(tx *gorm.DB) error {
+		return tx.Exec("DROP INDEX IF EXISTS idx_record_keys_parent_id_uri").Error
+	}},
+	{4, "record_keys_redirect", func(tx *gorm.DB) error {
+		for _, stmt := range []string{
+			`ALTER TABLE record_keys ADD COLUMN IF NOT EXISTS redirect text`,
+			`UPDATE record_keys rk SET redirect = r.redirect FROM records r WHERE rk.record_id = r.document_id AND r.redirect IS NOT NULL AND rk.redirect IS NULL`,
+			`UPDATE record_keys rk SET record_created_at = r.created_at FROM records r WHERE rk.record_id = r.document_id AND rk.record_created_at IS NULL`,
+		} {
+			if err := tx.Exec(stmt).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
+	{5, "drop_unused_ack_indexes_and_partial_gc_index", func(tx *gorm.DB) error {
+		for _, name := range []string{
+			"idx_acks_to_valid_created_at", "idx_acks_schema_valid_created_at",
+			"idx_acked_from_valid_created_at", "idx_acked_schema_valid_created_at",
+			"idx_commit_logs_gc_candidate",
+		} {
+			if err := tx.Exec("DROP INDEX IF EXISTS " + name).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}},
+	{6, "aggregate_entries", func(tx *gorm.DB) error {
+		return tx.Exec(aggpg.Schema).Error
+	}},
+}
+
+// Not a numbered step alone: AutoMigrate only adds, so it also runs at every
+// start and a new column or index needs nothing but its tag. Changing an
+// existing index needs a step that drops it by name first.
+func autoMigrateTables(db *gorm.DB) error {
+	return db.AutoMigrate(
+		&models.CommitLog{},
+		&models.Record{},
+		&models.RecordKey{},
+		&models.Association{},
+		&models.Ack{},
+		&models.Acked{},
+		&models.Server{},
+		&models.Entity{},
+		&models.EntityMeta{},
+		&models.Subscription{},
+		&models.AbuseReport{},
+	)
+}
+
 // migrationLockID serializes AutoMigrate across replicas starting simultaneously.
 const migrationLockID int64 = 0x636f6e63726e74 // "concrnt"
 
+// Not a session-level advisory lock around the steps: without a transaction
+// a failed step would leave the database half migrated.
 func MigratePostgres(db *gorm.DB) error {
-	// session-level advisory lock must be taken and released on the same connection
-	return db.Connection(func(conn *gorm.DB) error {
-		if err := conn.Exec("SELECT pg_advisory_lock(?)", migrationLockID).Error; err != nil {
+	return db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Exec("SELECT pg_advisory_xact_lock(?)", migrationLockID).Error; err != nil {
 			return err
 		}
-		defer conn.Exec("SELECT pg_advisory_unlock(?)", migrationLockID)
+		if err := tx.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+			version integer PRIMARY KEY,
+			name text NOT NULL,
+			applied_at timestamp with time zone NOT NULL DEFAULT now()
+		)`).Error; err != nil {
+			return err
+		}
 
-		return conn.AutoMigrate(
-			&models.CommitLog{},
-			&models.Record{},
-			&models.RecordKey{},
-			&models.Association{},
-			&models.Ack{},
-			&models.Acked{},
-			&models.Server{},
-			&models.Entity{},
-			&models.EntityMeta{},
-			&models.Subscription{},
-			&models.AbuseReport{},
-		)
+		var versions []int
+		if err := tx.Raw("SELECT version FROM schema_migrations").Scan(&versions).Error; err != nil {
+			return err
+		}
+		applied := make(map[int]bool, len(versions))
+		for _, v := range versions {
+			applied[v] = true
+		}
+
+		for _, m := range migrations {
+			if applied[m.Version] {
+				continue
+			}
+			if err := m.Up(tx); err != nil {
+				return fmt.Errorf("migration %d (%s): %w", m.Version, m.Name, err)
+			}
+			if err := tx.Exec("INSERT INTO schema_migrations (version, name) VALUES (?, ?)", m.Version, m.Name).Error; err != nil {
+				return err
+			}
+		}
+		return autoMigrateTables(tx)
 	})
 }

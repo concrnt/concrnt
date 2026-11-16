@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	gspanner "cloud.google.com/go/spanner"
 	"github.com/SherClockHolmes/webpush-go"
 	"github.com/labstack/echo-contrib/echoprometheus"
 	"github.com/labstack/echo/v4"
@@ -25,6 +27,13 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
+	"github.com/concrnt/concrnt/impl/interop"
+	"github.com/concrnt/concrnt/internal/domain"
+	aggfirestore "github.com/concrnt/concrnt/internal/infra/aggregate/firestore"
+	aggmemcached "github.com/concrnt/concrnt/internal/infra/aggregate/memcached"
+	aggpostgres "github.com/concrnt/concrnt/internal/infra/aggregate/postgres"
+	aggredis "github.com/concrnt/concrnt/internal/infra/aggregate/redis"
+	aggspanner "github.com/concrnt/concrnt/internal/infra/aggregate/spanner"
 	"github.com/concrnt/concrnt/internal/infra/cluster"
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/infra/database"
@@ -34,12 +43,20 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
+	fsrepo "github.com/concrnt/concrnt/internal/infra/repository/firestore"
+	fsrecord "github.com/concrnt/concrnt/internal/infra/repository/firestore/record"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	spannerrepo "github.com/concrnt/concrnt/internal/infra/repository/spanner"
+	spannerrecord "github.com/concrnt/concrnt/internal/infra/repository/spanner/record"
+	"github.com/concrnt/concrnt/internal/infra/repository/sqlite"
+	sqliterecord "github.com/concrnt/concrnt/internal/infra/repository/sqlite/record"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 	"github.com/concrnt/concrnt/internal/usecase/record"
@@ -50,10 +67,11 @@ import (
 	"github.com/concrnt/concrnt/internal/worker"
 )
 
-// readinessTimeout bounds one /ready sweep. The kubelet gives a probe one
-// second by default, so a backend that has not answered by then must
-// already be reported as down inside that window.
-const readinessTimeout = 800 * time.Millisecond
+// firestoreCheckInterval is how often a healthy Firestore is checked for
+// readiness. Each check is a billed document read, so it runs less often
+// than the other backends' (health.DefaultCheckInterval); a failed check
+// is retried on the watcher's short retry interval all the same.
+const firestoreCheckInterval = 15 * time.Second
 
 var (
 	version      = "unknown"
@@ -197,20 +215,154 @@ func main() {
 	buildInfo.Set(1)
 	prometheus.MustRegister(buildInfo)
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
-	if err != nil {
-		panic("failed to connect database")
+	cl := client.New(domainConfig.FQDN)
+	if conf.Backends.GatewayAddr != "" {
+		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
 	}
+	cl.SetUserAgent("concrnt", version)
 
-	err = database.MigratePostgres(db)
-	if err != nil {
-		panic("failed to migrate database")
+	// the record store backend: every repository of one backend is built
+	// here, by hand, from that backend's package (CONTRACT.md)
+	var (
+		recordRepo       record.Repository
+		entityMetaRepo   usecase.EntityMetaRepository
+		serverRepo       server.Repository
+		notificationRepo notification.Repository
+		abuseRepo        abuse.Repository
+		databaseReady    health.Check
+		// how often databaseReady runs while it succeeds
+		databaseCheckInterval = health.DefaultCheckInterval
+		// the count cache table in the record database, under its
+		// backends.aggregate.store name; nil on sqlite, which has none
+		databaseAggregate     aggregate.Store
+		databaseAggregateName string
+		// logged as one line once the job queue is sized
+		concurrencySettings []any
+	)
+	switch conf.Backends.Database {
+	case "", "postgres":
+		maxOpenConns := conf.Backends.Postgres.MaxOpenConnsOrDefault()
+		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", maxOpenConns))
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, maxOpenConns)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		if err := database.MigratePostgres(pg); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		sqlDB, err := pg.DB()
+		if err != nil {
+			panic("failed to get sql.DB: " + err.Error())
+		}
+		defer sqlDB.Close()
+		// connection pool usage (go_sql_*): the pool is small, so saturation
+		// and wait time are the first thing to check when everything gets slow
+		prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
+
+		// readiness pings through a connection of its own: the pool above
+		// is what a burst saturates
+		pgProbe, err := database.NewPostgresProbe(conf.Backends.PostgresDsn)
+		if err != nil {
+			panic("failed to open the database readiness connection: " + err.Error())
+		}
+		defer pgProbe.Close()
+		databaseReady = pgProbe.PingContext
+		recordRepo = pgrecord.New(pg)
+		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
+		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
+		notificationRepo = postgres.NewNotificationRepository(pg)
+		abuseRepo = postgres.NewAbuseRepository(pg)
+		databaseAggregate, databaseAggregateName = aggpostgres.New(pg), "postgres"
+	case "sqlite":
+		lite, err := sqlite.Open(conf.Backends.SQLitePath())
+		if err != nil {
+			panic("failed to open database: " + err.Error())
+		}
+		defer lite.Close()
+		if err := sqlite.Migrate(ctx, lite); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		prometheus.MustRegister(collectors.NewDBStatsCollector(lite.SQL(), "concrnt"))
+
+		databaseReady = lite.Ready
+		recordRepo = sqliterecord.New(lite.DB)
+		entityMetaRepo = sqlite.NewEntityMetaRepository(lite.DB)
+		serverRepo = sqlite.NewServerRepository(lite.DB, cl)
+		notificationRepo = sqlite.NewNotificationRepository(lite.DB)
+		abuseRepo = sqlite.NewAbuseRepository(lite.DB)
+	case "spanner":
+		sp, admin, err := database.NewSpanner(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer sp.Close()
+		defer admin.Close()
+		if err := spannerrepo.Migrate(ctx, admin, sp); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+
+		databaseReady = func(ctx context.Context) error {
+			_, err := sp.Single().Query(ctx, gspanner.Statement{SQL: "SELECT 1"}).Next()
+			return err
+		}
+		recordRepo = spannerrecord.New(sp)
+		entityMetaRepo = spannerrepo.NewEntityMetaRepository(sp)
+		serverRepo = spannerrepo.NewServerRepository(sp, cl)
+		notificationRepo = spannerrepo.NewNotificationRepository(sp)
+		abuseRepo = spannerrepo.NewAbuseRepository(sp)
+		databaseAggregate, databaseAggregateName = aggspanner.New(sp), "spanner"
+	case "firestore":
+		fsc, err := database.NewFirestore(ctx, conf.Backends)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		defer fsc.Close()
+		// Firestore has no schema to migrate; the composite indexes are
+		// deployed from deploy/firestore and probed here, off the startup
+		// path, so a missing one shows up in the log before users hit it
+		go fsrepo.VerifyIndexes(context.WithoutCancel(ctx), fsc)
+		prometheus.MustRegister(fsrepo.Collectors()...)
+
+		databaseReady = func(ctx context.Context) error { return fsrepo.Ping(ctx, fsc) }
+		databaseCheckInterval = firestoreCheckInterval
+		recordRepo = fsrecord.New(fsc)
+		entityMetaRepo = fsrepo.NewEntityMetaRepository(fsc)
+		serverRepo = fsrepo.NewServerRepository(fsc, cl)
+		notificationRepo = fsrepo.NewNotificationRepository(fsc)
+		abuseRepo = fsrepo.NewAbuseRepository(fsc)
+		databaseAggregate, databaseAggregateName = aggfirestore.New(fsc), "firestore"
+	default:
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres, sqlite, spanner, firestore)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
 
-	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	redis := database.NewRedisServing(conf.Backends.RedisAddr, "", conf.Backends.RedisDB, jobQueueConcurrency)
+
+	// the count cache store, built here like the repositories: "" keeps
+	// the counts in the record database (redis on sqlite), and a database
+	// store must be the record database itself
+	aggregateName := conf.Backends.Aggregate.Store
+	if aggregateName == "" {
+		aggregateName = cmp.Or(databaseAggregateName, "redis")
+	}
+	var aggregateStore aggregate.Store
+	switch name := aggregateName; name {
+	case "postgres", "spanner", "firestore":
+		if name != databaseAggregateName {
+			panic("backends.aggregate.store " + name + " needs backends.database " + name)
+		}
+		aggregateStore = databaseAggregate
+	case "redis":
+		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
+	default:
+		panic("unknown backends.aggregate.store " + name + " (postgres, spanner, firestore, redis, memcached)")
+	}
+	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
@@ -237,17 +389,12 @@ func main() {
 		elector = cluster.AlwaysLeader{}
 	}
 
-	cl := client.New(domainConfig.FQDN)
-	if conf.Backends.GatewayAddr != "" {
-		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
-	}
-	cl.SetUserAgent("concrnt", version)
-
 	moduleManager := service.NewModuleManager(rest.Endpoints, conf.Services)
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog))
+	slog.Info("concurrency settings", append(concurrencySettings, slog.Int("jobQueueConsumers", jobQueueConcurrency))...)
+	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
 		service.GlobalParameters{
@@ -256,15 +403,33 @@ func main() {
 		cl,
 	)
 
-	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
-	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
-	recordRepo := pgrecord.New(db)
-	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
-
-	chunklineRepo := pgrecord.NewChunklineRepository(db)
+	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	recordUC.SetAggregates(aggregateUC)
+	recordUC.SetSharedCache(mc)
+	cl.SetLocalResolver(func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error) {
+		parsed, err := concrnt.ParseCCURI(uri)
+		if err != nil {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		if local, err := recordUC.IsLocalEntityByCCID(ctx, parsed.Owner); err != nil || !local {
+			return concrnt.SignedDocument{}, false, nil
+		}
+		// like the resolve endpoint, read without a requester
+		sd, err := recordUC.GetSigned(context.WithValue(ctx, interop.RequesterCtxKey, nil), uri)
+		if errors.Is(err, domain.ErrNotFound) {
+			// this server is the owner's home: the HTTP path would ask this
+			// same server and 404 (a new user's subkey before its enact)
+			return concrnt.SignedDocument{}, false, client.ErrNotFound
+		}
+		if err != nil {
+			// redirects (reference records) and denied reads keep the HTTP path
+			return concrnt.SignedDocument{}, false, nil
+		}
+		return *sd, true, nil
+	})
+	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	// web push is gated on VAPID keys; without them neither the reactor nor
 	// the out-of-band counter-reset push exist
@@ -290,7 +455,6 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := postgres.NewNotificationRepository(db)
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
@@ -327,7 +491,8 @@ func main() {
 	}))
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
-	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineUC := chunkline.New(recordRepo, chunklineGateway, redisKVS, recordUC)
+	chunklineGateway.SetLocal(domainConfig.FQDN, chunklineUC)
 
 	go func() {
 		if err := jobQueue.Run(ctx); err != nil {
@@ -335,7 +500,6 @@ func main() {
 		}
 	}()
 
-	abuseRepo := postgres.NewAbuseRepository(db)
 	abuseUC := abuse.New(abuseRepo)
 
 	var notificationReactor *worker.NotificationReactor
@@ -387,7 +551,7 @@ func main() {
 		abuseUC,
 		subscriptionUC,
 	)
-	api := e.Group("", authMiddleware.IdentifyIdentity, authMiddleware.IdentifyIdentity)
+	api := e.Group("", authMiddleware.IdentifyIdentity)
 
 	if conf.Integrations.CaptchaSecret != "" {
 		validator, err := recaptcha.NewWithSecert(conf.Integrations.CaptchaSecret)
@@ -417,28 +581,24 @@ func main() {
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
-	}
-
-	// connection pool usage (go_sql_*): the pool is small, so saturation
-	// and wait time are the first thing to check when everything gets slow
-	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
-
-	// every backend the public API needs gates readiness: postgres holds
-	// the data, redis carries delivery jobs and realtime events, memcached
-	// serves the timeline chunks. the sweep stays under the kubelet's probe
-	// timeout so a hung backend reads as "down" rather than as a timed-out
-	// probe with no body
-	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("postgres", sqlDB.PingContext)
-	readiness.Add("redis", func(ctx context.Context) error {
-		return redis.Ping(ctx).Err()
+	// every backend the public API needs gates readiness: the database
+	// holds the data, redis carries delivery jobs and realtime events,
+	// memcached serves the timeline chunks. they are watched in the
+	// background and /ready reads the verdict, so the probe answers at once
+	// however busy the process and its connection pools are
+	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	defer redisProbe.Close()
+	readiness := health.NewReadiness(health.DefaultReadinessPolicy)
+	readiness.Add("database", databaseCheckInterval, databaseReady)
+	readiness.Add("redis", health.DefaultCheckInterval, func(ctx context.Context) error {
+		return redisProbe.Ping(ctx).Err()
 	})
-	readiness.Add("memcached", func(ctx context.Context) error {
+	// gomemcache dials past its idle connections instead of queueing, so
+	// the serving client is already independent of the load
+	readiness.Add("memcached", health.DefaultCheckInterval, func(ctx context.Context) error {
 		return mc.Ping()
 	})
+	readiness.Start(ctx)
 
 	probes := rest.NewProbeHandler(watchdog, readiness)
 	probes.RegisterRoutes(internal)

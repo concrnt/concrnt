@@ -50,6 +50,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 		"is a no-op. Reads and writes Postgres directly.",
 	Args: cobra.NoArgs,
 	RunE: withOperationContext(func(cmd *cobra.Command, args []string, op *operationContext) error {
+		if err := op.RequirePostgres(); err != nil {
+			return err
+		}
 		stats, err := repairAnchoredAcks(cmd.Context(), op.DB, op.GlobalConfig.FQDN, repairAnchoredAcksDryRun)
 		if err != nil {
 			return err
@@ -62,6 +65,9 @@ var repairAnchoredAcksCmd = &cobra.Command{
 			verb, stats.Holdings, stats.RestoredAcks, stats.RemovedRows, stats.Orphans, stats.StaleMirrors, stats.NullOwners)
 		if repairAnchoredAcksDryRun {
 			fmt.Fprintln(os.Stderr, "schema migration (ackeds table, entities.created_at, acks foreign key) is applied by the real run")
+		}
+		if !repairAnchoredAcksDryRun {
+			fmt.Fprintln(os.Stderr, "note: cached counts may now be stale; run `conctl op aggregate-invalidate --all`")
 		}
 		return nil
 	}),

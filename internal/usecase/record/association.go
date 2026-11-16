@@ -14,7 +14,7 @@ import (
 	"github.com/concrnt/concrnt/policy"
 )
 
-func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+func (uc *Usecase) createAssociation(ctx context.Context, ip string, requester domain.Entity, parsed concrnt.Document[any], sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.CreateAssociation")
 	defer span.End()
 
@@ -30,7 +30,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		return nil, err
 	}
 
-	stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, *parsed.Associate)
+	stack, err := uc.policyStack(ctx, *parsed.Associate)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -83,6 +83,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 	}
 
 	postProcesses := []PostProcessAction{}
+	unapplied := sd
 
 	requesterSD, err := uc.GetSigned(ctx, requester.CCKVWithHint())
 	if err != nil {
@@ -90,6 +91,9 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		return nil, err
 	}
 
+	// the association is stored where its target lives; on any other server
+	// the commit only fans the event out
+	var apply func(ctx context.Context) (ApplyStatus, error)
 	if isLocal {
 		uniqueKey := *parsed.Associate + parsed.Author + parsed.Schema
 		if parsed.AssociationVariant != nil {
@@ -105,20 +109,20 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		uniqueKey += string(bodyBytes)
 		uniqueHash := xxh3.HashString(uniqueKey)
 
-		if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, targetURI.Owner); err != nil {
-			span.RecordError(err)
-			return nil, err
+		commit := AssociationCommit{
+			Commit:    Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: targetURI.Owner},
+			Target:    *parsed.Associate,
+			Author:    parsed.Author,
+			Schema:    parsed.Schema,
+			Variant:   parsed.AssociationVariant,
+			Unique:    fmt.Sprintf("%x", uniqueHash),
+			CreatedAt: parsed.CreatedAt,
+		}
+		apply = func(ctx context.Context) (ApplyStatus, error) {
+			return uc.repo.ApplyAssociation(ctx, commit)
 		}
 
-		applied, err := uc.repo.CreateAssociation(ctx, tx, documentID, *parsed.Associate, targetURI.Owner, parsed.Author, parsed.Schema, parsed.AssociationVariant, fmt.Sprintf("%x", uniqueHash), parsed.CreatedAt)
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-
-		if !applied {
-			return &commitApplyResult{result: &sd, noop: true}, nil
-		}
+		postProcesses = append(postProcesses, uc.associationCountsTouched(*parsed.Associate, parsed.Schema, parsed.AssociationVariant, parsed.Author, parsed.CreatedAt, mode))
 
 		if mode == domain.CommitModeExecute {
 			actions, err := uc.createReferenceDistributionActions(ctx, ip, parsed.Author, ccfs, requester, sd, distributionsFromPtr(parsed.Distributes), mode)
@@ -150,23 +154,16 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 				span.RecordError(err)
 				return nil, errors.Join(errors.New("target document failed signature verification"), err)
 			}
-
-			var targetDoc concrnt.Document[any]
-			err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
-		} else { // あるとき
-			dists, err := uc.repo.GetDistributions(ctx, target)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-			distributions = append(distributions, dists...)
 		}
+
+		var targetDoc concrnt.Document[any]
+		err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+
+		distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
 
 		// 各タイムラインを購読しているクライアントに、そのタイムラインにassociationが追加されたことを通知するために、
 		// association本体をリモートサーバーに転送し、eventの発生を促す。
@@ -198,7 +195,7 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 							ccfs: sd,
 						},
 					})
-					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+					return uc.enqueueEventDelivery(ctx, DeliveryJob{
 						ResolveURI: channel,
 						Payload:    remoteSD,
 						Local:      DeliveryLocalPublish,
@@ -212,5 +209,5 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 
 	sd.CCFS = &ccfs
 
-	return &commitApplyResult{result: &sd, postProcesses: postProcesses}, nil
+	return &commitApplyResult{apply: apply, result: &sd, unapplied: &unapplied, postProcesses: postProcesses}, nil
 }

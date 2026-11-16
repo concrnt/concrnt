@@ -3,7 +3,7 @@ package record
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"time"
 
 	"gorm.io/gorm"
@@ -14,78 +14,29 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
-	defer span.End()
-
-	var commitLog models.CommitLog
-	err := r.db.WithContext(ctx).
-		Select("id").
-		Where("id = ?", id).
-		Take(&commitLog).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return false, nil
-	}
+// insertCommit writes the commit log entry; false when the id is already
+// in the log, which is left as first written (Duplicate).
+func insertCommit(tx *gorm.DB, commit ucrecord.Commit) (bool, error) {
+	proofBytes, err := json.Marshal(commit.Proof)
 	if err != nil {
-		span.RecordError(err)
 		return false, err
 	}
 
-	return true, nil
-}
-
-func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.RepositoryTx, id string, ip string, document string, proof any, owner string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	proofBytes, err := json.Marshal(proof)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
 	commitLog := models.CommitLog{
-		ID:       id,
-		IP:       ip,
-		Document: document,
-		Owner:    owner,
+		ID:       commit.ID,
+		IP:       commit.IP,
+		Document: commit.Document,
+		Owner:    commit.Owner,
 		Proof:    string(proofBytes),
 	}
 
-	if err := db.Clauses(clause.OnConflict{
+	result := tx.Clauses(clause.OnConflict{
 		DoNothing: true,
-	}).Create(&commitLog).Error; err != nil {
-		span.RecordError(err)
-		return err
+	}).Create(&commitLog)
+	if result.Error != nil {
+		return false, result.Error
 	}
-
-	return nil
-}
-
-func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	if err := db.Model(&models.CommitLog{}).
-		Where("id = ?", documentID).
-		Update("gc_candidate", true).Error; err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return nil
+	return result.RowsAffected > 0, nil
 }
 
 func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]concrnt.SignedDocument, error) {
@@ -179,4 +130,87 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	}
 
 	return rows, nil
+}
+
+func (r *Repository) CountGcCandidates(ctx context.Context, cutoffID string) (int64, error) {
+	var count int64
+	err := r.db.WithContext(ctx).
+		Model(&models.CommitLog{}).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Count(&count).Error
+	return count, err
+}
+
+func (r *Repository) ListGcCandidates(ctx context.Context, cutoffID string, afterID string, limit int) ([]ucrecord.CommitLogEntry, error) {
+	q := r.db.WithContext(ctx).
+		Where("gc_candidate AND id < ?", cutoffID).
+		Order("id ASC").
+		Limit(limit)
+	if afterID != "" {
+		q = q.Where("id > ?", afterID)
+	}
+	var logs []models.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return commitLogEntries(logs)
+}
+
+func (r *Repository) DeleteCommitLogs(ctx context.Context, ids []string) (int, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	res := r.db.WithContext(ctx).Where("id IN ?", ids).Delete(&models.CommitLog{})
+	return int(res.RowsAffected), res.Error
+}
+
+// ListCommitLogs orders, paginates and filters on the id column's own
+// collation so the primary-key index backs the range scan (forcing COLLATE
+// "C" would defeat the index and full-scan the table on every page). This is
+// correct because time-kind CDIDs are fixed-length lowercase base32 whose byte
+// order encodes the embedded timestamp, and every standard collation orders
+// that alphabet identically to byte order.
+func (r *Repository) ListCommitLogs(ctx context.Context, page ucrecord.CommitLogPage) ([]ucrecord.CommitLogEntry, error) {
+	q := r.db.WithContext(ctx).Order("commit_logs.id ASC")
+	if page.Limit > 0 {
+		q = q.Limit(page.Limit)
+	}
+	if page.AfterID != "" {
+		q = q.Where("commit_logs.id > ?", page.AfterID)
+	} else if page.FromID != "" {
+		q = q.Where("commit_logs.id >= ?", page.FromID)
+	}
+	if page.UntilID != "" {
+		q = q.Where("commit_logs.id <= ?", page.UntilID)
+	}
+	if page.Owner != "" {
+		q = q.Where("commit_logs.owner = ?", page.Owner)
+	}
+
+	var logs []models.CommitLog
+	if err := q.Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	return commitLogEntries(logs)
+}
+
+func commitLogEntries(logs []models.CommitLog) ([]ucrecord.CommitLogEntry, error) {
+	entries := make([]ucrecord.CommitLogEntry, 0, len(logs))
+	for _, cl := range logs {
+		var proof concrnt.Proof
+		if cl.Proof != "" {
+			if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {
+				return nil, fmt.Errorf("failed to parse proof for commit %s: %w", cl.ID, err)
+			}
+		}
+		entries = append(entries, ucrecord.CommitLogEntry{
+			ID:       cl.ID,
+			IP:       cl.IP,
+			Document: cl.Document,
+			Proof:    proof,
+			Owner:    cl.Owner,
+			CDate:    cl.CDate,
+		})
+	}
+	return entries, nil
 }

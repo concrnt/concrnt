@@ -26,7 +26,8 @@ func (r *Repository) QueryByPrefix(
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id").
-		Where("uri LIKE ?", prefix+"%")
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id").
+		Where(`record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace(prefix)+"%")
 
 	if schema != "" {
 		query = query.Where("r.schema = ?", schema)
@@ -51,7 +52,7 @@ func (r *Repository) QueryByPrefix(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -68,23 +69,35 @@ var likeEscaper = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 // URI so base leads. Unlike QueryByPrefix's raw prefix match this never picks
 // up sibling keys ("item2" for base "item"), and metacharacters in base are
 // escaped — the result is exactly the set a range delete may remove.
-func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool) ([]concrnt.SignedDocument, error) {
+func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includeSelf bool, afterURI string, limit int) ([]concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		// not the disjunction alone: it hides the LIKE prefix from the planner,
+		// which then walks the whole index. base and base/... both sort in
+		// [base, base+"0") ('/' < '0')
+		query = query.Where(`record_keys.uri COLLATE "C" >= ? AND record_keys.uri COLLATE "C" < ? AND (uri = ? OR record_keys.uri COLLATE "C" LIKE ? ESCAPE '\')`,
+			base, base+"0", base, subtreePattern)
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where(`record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, subtreePattern)
+	}
+
+	if afterURI != "" {
+		query = query.Where(`uri COLLATE "C" > ?`, afterURI)
+	}
+	if limit > 0 {
+		query = query.Limit(limit)
 	}
 
 	var rks []models.RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Order(`uri COLLATE "C" ASC`).Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -125,7 +138,8 @@ func (r *Repository) QueryByParent(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -136,7 +150,7 @@ func (r *Repository) QueryByParent(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
@@ -164,7 +178,7 @@ func (r *Repository) QueryByParent(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -191,7 +205,8 @@ func (r *Repository) QueryByParentOrderByKey(
 
 	query := r.db.WithContext(ctx).
 		Model(&models.RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id").
+		Joins("LEFT JOIN commit_logs c ON c.id = record_keys.record_id")
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -199,7 +214,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`parent_id IS NULL AND record_keys.uri COLLATE "C" LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
 		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
@@ -210,24 +225,26 @@ func (r *Repository) QueryByParentOrderByKey(
 	if author != "" {
 		query = query.Where("r.author = ?", author)
 	}
+	// not the database's default collation: it orders keys differently
+	// from server to server (CIP-5 orderby=key must not)
 	if since != nil {
-		query = query.Where("record_keys.uri >= ?", *since)
+		query = query.Where(`record_keys.uri COLLATE "C" >= ?`, *since)
 	}
 	if until != nil {
-		query = query.Where("record_keys.uri <= ?", *until)
+		query = query.Where(`record_keys.uri COLLATE "C" <= ?`, *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("record_keys.uri DESC")
+		query = query.Order(`record_keys.uri COLLATE "C" DESC`)
 	} else {
-		query = query.Order("record_keys.uri ASC")
+		query = query.Order(`record_keys.uri COLLATE "C" ASC`)
 	}
 
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Select(recordKeySelect).Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

@@ -2,7 +2,12 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -45,4 +50,39 @@ func TestResolvePolicyStackVirtualParentPlacement(t *testing.T) {
 		}
 		assert.Len(t, result[2], 0)
 	}
+}
+
+// A policy URL is fetched once; past the fresh window the stale copy is
+// served immediately and refreshed in the background, so no evaluation
+// waits on the policy host.
+func TestResolvePolicyURLStaleWhileRevalidate(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(policy.PolicyDocument{Name: "p", Versions: map[string]any{"2025-12-23": map[string]any{"entries": []any{}}}})
+	}))
+	defer srv.Close()
+
+	s := NewPolicyService(policy.Policy{}, GlobalParameters{}, client.New("example.com"))
+	ctx := context.Background()
+	for range 3 {
+		_, err := s.ResolvePolicyURL(ctx, srv.URL)
+		assert.NoError(t, err)
+	}
+	assert.EqualValues(t, 1, hits.Load(), "a fresh copy is served without a fetch")
+
+	x, _ := s.cache.Get(srv.URL)
+	stale := x.(cachedPolicy)
+	stale.fetchedAt = time.Now().Add(-policyFreshFor - time.Minute)
+	s.cache.Set(srv.URL, stale, policyStaleFor)
+
+	start := time.Now()
+	_, err := s.ResolvePolicyURL(ctx, srv.URL)
+	assert.NoError(t, err)
+	assert.Less(t, time.Since(start), 500*time.Millisecond, "the stale read does not wait for the refresh")
+	assert.Eventually(t, func() bool { return hits.Load() == 2 }, 2*time.Second, 10*time.Millisecond, "the refresh runs in the background")
+	assert.Eventually(t, func() bool {
+		x, _ := s.cache.Get(srv.URL)
+		return time.Since(x.(cachedPolicy).fetchedAt) < policyFreshFor
+	}, 2*time.Second, 10*time.Millisecond, "the refreshed copy replaces the stale one")
 }

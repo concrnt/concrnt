@@ -48,6 +48,25 @@ type Client struct {
 	defaultResolver string
 	remappings      map[string]*url.URL
 	transport       http.RoundTripper
+	localResolver   LocalResolver
+}
+
+// ErrNotFound is returned by GetResource when the resource is known not to
+// exist. A LocalResolver returns it for a document the owner's home server
+// (this server) does not have: fetching it over HTTP would hit this same
+// server and 404.
+var ErrNotFound = errors.New("resource not found")
+
+// LocalResolver answers a cckv URI from the store of the server this client
+// runs in: the signed document and true when the owner lives on this server,
+// false when the URI has to be fetched over HTTP, ErrNotFound when this server
+// is the authority and has no such document. It lets a server read its own
+// documents (the auth middleware's subkey documents, routing lookups) without
+// calling its own resolve endpoint.
+type LocalResolver func(ctx context.Context, uri string) (concrnt.SignedDocument, bool, error)
+
+func (c *Client) SetLocalResolver(fn LocalResolver) {
+	c.localResolver = fn
 }
 
 func New(defaultResolver string) *Client {
@@ -200,7 +219,13 @@ func (c *Client) healthCheckDomain(ctx context.Context, domain string) error {
 	return json.NewDecoder(resp.Body).Decode(&wkc)
 }
 
+// markOffline backs off from domain. This server's own domain is never
+// marked: a request to itself only times out under load, and backing off
+// would fail every local resource until the next health check.
 func (c *Client) markOffline(domain string) {
+	if domain == c.defaultResolver {
+		return
+	}
 	c.onlineMu.Lock()
 	defer c.onlineMu.Unlock()
 	if since, ok := c.plainHosts[domain]; ok && time.Since(since) < plainHostTTL {
@@ -211,6 +236,10 @@ func (c *Client) markOffline(domain string) {
 
 func (c *Client) markOfflineIfTimeout(domain string, action string, err error) {
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		if domain == c.defaultResolver {
+			slog.Warn("Request to this server timed out while "+action, "error", err)
+			return
+		}
 		slog.Warn("Mark domain "+domain+" as offline while "+action, "error", err)
 		c.markOffline(domain)
 	}
@@ -555,6 +584,37 @@ func (c *Client) GetResource(ctx context.Context, uri string, accept string, opt
 		err := errors.Join(fmt.Errorf("invalid cc uri %s", uri), err)
 		span.RecordError(err)
 		return err
+	}
+
+	// a routing hint other than this server means the caller wants that
+	// server's copy (e.g. the entity recheck by hint), not the local one
+	if c.localResolver != nil && parsed.Scheme == "cckv" && accept == "application/json" && (opts.Resolver == "" || opts.Resolver == c.defaultResolver) {
+		sd, found, err := c.localResolver(ctx, uri)
+		if errors.Is(err, ErrNotFound) {
+			localResolves.WithLabelValues("notfound").Inc()
+			span.RecordError(err)
+			return err
+		}
+		if err != nil {
+			span.RecordError(fmt.Errorf("local resolver for %s: %w", uri, err))
+		}
+		if found && err == nil {
+			localResolves.WithLabelValues("hit").Inc()
+			bytes, err := json.Marshal(sd)
+			if err != nil {
+				span.RecordError(err)
+				return err
+			}
+			if err := json.Unmarshal(bytes, &result); err != nil {
+				span.RecordError(err)
+				return err
+			}
+			if !opts.NoCache {
+				c.cache.Set(cacheKey, bytes, cache.DefaultExpiration)
+			}
+			return nil
+		}
+		localResolves.WithLabelValues("miss").Inc()
 	}
 
 	endpoint := uri

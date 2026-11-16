@@ -20,11 +20,13 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	chunklineuc "github.com/concrnt/concrnt/internal/usecase/chunkline"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
 )
 
 type batchChunklineRepo struct {
+	record.Repository
 	mu      sync.Mutex
 	calls   []batchChunklineLookupCall
 	missing map[string]bool
@@ -155,7 +157,7 @@ func TestChunklineItrMissingIsNotFound(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, responses["1"].StatusCode)
 }
 
-var _ chunklineuc.Repository = (*batchChunklineRepo)(nil)
+var _ record.Repository = (*batchChunklineRepo)(nil)
 
 // A batch carrying more than maxBatchParts application/http parts is rejected
 // with a 400 before any part is dispatched.

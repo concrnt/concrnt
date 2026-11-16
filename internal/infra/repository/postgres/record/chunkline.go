@@ -2,13 +2,12 @@ package record
 
 import (
 	"context"
-	"errors"
+	"database/sql"
 	"net/url"
 	"time"
 
-	"gorm.io/gorm"
-
 	"github.com/concrnt/concrnt/chunkline"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
@@ -16,39 +15,34 @@ const (
 	defaultChunkSize = 32
 )
 
-type ChunklineRepository struct {
-	db *gorm.DB
-}
-
-func NewChunklineRepository(db *gorm.DB) *ChunklineRepository {
-	return &ChunklineRepository{db: db}
-}
-
-func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
+func (r *Repository) GetChunklineManifest(ctx context.Context, uri string) (*chunkline.Manifest, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.GetChunklineManifest")
 	defer span.End()
 
-	recordKey, err := getRecordKeyByURI(ctx, r.db, uri)
+	var rows []struct {
+		First *time.Time
+	}
+	err := r.db.WithContext(ctx).Raw(`SELECT (
+			SELECT child.record_created_at FROM record_keys child
+			WHERE child.parent_id = parent.id AND child.record_created_at IS NOT NULL
+			ORDER BY child.record_created_at ASC LIMIT 1
+		) AS first
+		FROM record_keys parent WHERE parent.uri = ?`, uri).
+		Scan(&rows).Error
 	if err != nil {
+		span.RecordError(err)
+		return nil, err
+	}
+	if len(rows) == 0 {
+		err := domain.NotFoundError{Resource: "record key"}
 		span.RecordError(err)
 		return nil, err
 	}
 
 	var firstChunk *int64
-	firstCollectionMember := models.RecordKey{}
-	err = r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
-		Where("record_keys.parent_id = ?", recordKey.ID).
-		Where("record_keys.record_created_at IS NOT NULL").
-		Order("record_keys.record_created_at ASC").
-		Limit(1).
-		Take(&firstCollectionMember).Error
-	if err == nil {
-		chunk := firstCollectionMember.RecordCreatedAt.Unix() / 600
+	if rows[0].First != nil {
+		chunk := rows[0].First.Unix() / 600
 		firstChunk = &chunk
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		span.RecordError(err)
-		return nil, err
 	}
 
 	safeURI := url.QueryEscape(uri)
@@ -66,7 +60,7 @@ func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri stri
 	}, nil
 }
 
-func (r *ChunklineRepository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
+func (r *Repository) LookupLocalItrs(ctx context.Context, uris []string, chunkID int64) (map[string]int64, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LookupLocalItrs")
 	defer span.End()
 
@@ -108,68 +102,59 @@ func (r *ChunklineRepository) LookupLocalItrs(ctx context.Context, uris []string
 	return lookup, nil
 }
 
-func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
+func (r *Repository) LoadLocalBody(ctx context.Context, uri string, chunkID int64) ([]chunkline.BodyItem, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Chunkline.LoadLocalBody")
 	defer span.End()
 
 	chunkDate := time.Unix((chunkID+1)*600, 0)
 	prevChunkDate := time.Unix((chunkID-1)*600, 0)
 
-	parentRecordKey, err := getRecordKeyByURI(ctx, r.db, uri)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
+	// Not the newest page first and the whole window only when the page does
+	// not cover it: that is a second round trip. Not an inner join on the
+	// timeline's key either: an empty timeline would look like a missing one.
 	var members []models.RecordKey
-	err = r.db.WithContext(ctx).
-		Where("parent_id = ?", parentRecordKey.ID).
-		Where("record_created_at < ?", chunkDate).
-		Order("record_created_at DESC").
-		Limit(defaultChunkSize).
-		Preload("Record").
-		Preload("Record.Document").
-		Find(&members).Error
+	err := r.db.WithContext(ctx).Raw(`SELECT member.uri AS uri, member.redirect AS redirect, member.record_created_at AS record_created_at
+		FROM record_keys parent
+		LEFT JOIN (
+			SELECT page.* FROM (
+				SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+				WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end
+				ORDER BY record_created_at DESC LIMIT @page
+			) page
+			UNION
+			SELECT parent_id, uri, redirect, record_created_at FROM record_keys
+			WHERE parent_id = (SELECT id FROM record_keys WHERE uri = @uri) AND record_created_at < @end AND record_created_at >= @start
+		) member ON member.parent_id = parent.id
+		WHERE parent.uri = @uri
+		ORDER BY member.record_created_at DESC`,
+		sql.Named("uri", uri), sql.Named("end", chunkDate), sql.Named("start", prevChunkDate), sql.Named("page", defaultChunkSize)).
+		Scan(&members).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
-
-	// Judge window coverage by record_created_at — the same column the queries
-	// filter and order by — not the joined Record.CreatedAt, which can diverge
-	// (e.g. backdated records) and would skip the window scan.
-	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
-		err = r.db.WithContext(ctx).
-			Where("parent_id = ?", parentRecordKey.ID).
-			Where("record_created_at < ?", chunkDate).
-			Where("record_created_at >= ?", prevChunkDate).
-			Order("record_created_at DESC").
-			Preload("Record").
-			Preload("Record.Document").
-			Find(&members).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+	if len(members) == 0 {
+		err := domain.NotFoundError{Resource: "record key"}
+		span.RecordError(err)
+		return nil, err
 	}
 
 	bodyItems := make([]chunkline.BodyItem, 0, len(members))
 
 	for _, member := range members {
+		if member.RecordCreatedAt == nil {
+			// the timeline's own row, without a member joined to it
+			continue
+		}
 
 		href := member.URI
 		contentType := "application/concrnt.document+json"
-		if member.Record.Redirect != nil {
-			href = *member.Record.Redirect
-		}
-
-		timestamp := member.Record.CreatedAt
-		if member.RecordCreatedAt != nil {
-			timestamp = *member.RecordCreatedAt
+		if member.Redirect != nil {
+			href = *member.Redirect
 		}
 
 		item := chunkline.BodyItem{
-			Timestamp:   timestamp,
+			Timestamp:   *member.RecordCreatedAt,
 			Href:        href,
 			ContentType: contentType,
 		}

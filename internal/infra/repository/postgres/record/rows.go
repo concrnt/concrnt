@@ -10,7 +10,11 @@ import (
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
-// recordKeysToQueryRows converts preloaded record keys into query rows
+// Not Preload("Record.Document"): that is one more round trip per relation.
+// The aliases are the ones gorm scans into RecordKey.Record and its Document.
+const recordKeySelect = `record_keys.*, r.document_id AS "Record__document_id", r.owner AS "Record__owner", r.created_at AS "Record__created_at", c.document AS "Record__Document__document", c.proof AS "Record__Document__proof"`
+
+// recordKeysToQueryRows converts joined record keys into query rows
 // carrying the created_at sort key the query ordered by. A placeholder key
 // (record_id NULL, reachable only through QueryByParentOrderByKey's LEFT
 // JOIN) becomes a key-only row holding just its cckv (CIP-5 §3.2.1).

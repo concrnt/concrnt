@@ -13,12 +13,19 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/usecase/chunkline"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/policy"
 	"github.com/concrnt/concrnt/schemas"
 )
 
-func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string, requester domain.Entity, sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
+// rangeDeleteSyncLimit bounds how many targets one ApplyDelete call removes
+// (a write stays bounded: on Spanner every deleted row and index entry
+// counts against the commit's mutation limit, on Firestore against the
+// commit size). A range delete removes that many with its commit; the rest
+// of the subtree is deleted page by page by RecordRangeDelete jobs.
+const rangeDeleteSyncLimit = 500
+
+func (uc *Usecase) deleteRecord(ctx context.Context, ip string, requester domain.Entity, sd concrnt.SignedDocument, mode domain.CommitMode) (*commitApplyResult, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Delete")
 	defer span.End()
 
@@ -47,9 +54,18 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 	var targets []concrnt.SignedDocument
 	var targetURIs []string // per-target address (cckv/ccfs URI) deletion and policy key on
+	// deferred is set when the subtree is larger than one write removes:
+	// the first page goes with the commit, the rest to RecordRangeDelete jobs
+	deferred := false
 	if authoritative {
 		if isRange {
-			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf)
+			// without a job queue (offline tooling) the whole subtree is
+			// removed here
+			limit := 0
+			if uc.jobs != nil {
+				limit = rangeDeleteSyncLimit + 1
+			}
+			targets, err = uc.repo.QueryRecordSubtree(ctx, rangeBase, includeSelf, "", limit)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err
@@ -58,6 +74,10 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 				err := domain.NotFoundError{Resource: rawTarget}
 				span.RecordError(err)
 				return nil, err
+			}
+			if limit > 0 && len(targets) > rangeDeleteSyncLimit {
+				targets = targets[:rangeDeleteSyncLimit]
+				deferred = true
 			}
 			for _, target := range targets {
 				targetURIs = append(targetURIs, *target.CCKV)
@@ -86,48 +106,24 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		// act on — pass it through as a no-op success (commitlog included, so
 		// a later delivery that does carry the targets is not deduplicated away)
 		if len(targetURIs) == 0 {
-			return &commitApplyResult{result: &sd, noop: true}, nil
+			return &commitApplyResult{noop: true, unapplied: &sd}, nil
 		}
 		for _, targetURI := range targetURIs {
 			targets = append(targets, sd.References[targetURI])
 		}
 	}
 
-	targetDocs := make([]concrnt.Document[any], len(targets))
-	for i, target := range targets {
-		err = json.Unmarshal([]byte(target.Document), &targetDocs[i])
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+	targetDocs, err := unmarshalTargets(targets)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 
 	// evaluate the delete policy on every authoritative target before
 	// removing anything
 	if authoritative {
 		for i := range targets {
-			policyRoot := targetURIs[i]
-			if targetDocs[i].Associate != nil {
-				policyRoot = *targetDocs[i].Associate
-			}
-
-			stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, policyRoot)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			err = uc.policy.Eval(
-				ctx,
-				policy.RequestContext{
-					Requester: requester,
-					Self:      targetDocs[i],
-				},
-				stack,
-				policyDeleteAction(targetDocs[i]),
-				targetURIs[i],
-			)
-			if err != nil {
+			if err := uc.evalDeletePolicy(ctx, requester, targetDocs[i], targetURIs[i]); err != nil {
 				span.RecordError(err)
 				return nil, err
 			}
@@ -158,39 +154,172 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return nil, err
 	}
 
-	if err := uc.repo.CreateCommitLog(ctx, tx, documentID, ip, sd.Document, sd.Proof, parsedBase.Owner); err != nil {
+	page := deletePage{
+		ip: ip, requester: requester, delete: sd, mode: mode, authoritative: authoritative, remoteKind: remoteKind,
+		targets: targets, targetDocs: targetDocs, targetURIs: targetURIs,
+	}
+	pagePlan, err := uc.planDeleteTargets(ctx, page)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
+
+	// CIP-4 §6.1: a delete that removes nothing here (the forwarded targets
+	// have no local reference rows) is not recorded, so a later delivery
+	// that does find rows is not deduplicated away
+	if !pagePlan.deletedAny {
+		return &commitApplyResult{noop: true, unapplied: &sd}, nil
+	}
+
+	postProcesses := pagePlan.postProcesses
+	if deferred {
+		// the pages to come decide the fate of the delete commit (a retained
+		// target in any page keeps it)
+		job := RangeDeleteJob{
+			IP: ip, Requester: requester.ID, Delete: sd, Base: rangeBase, IncludeSelf: includeSelf,
+			AfterURI: targetURIs[len(targetURIs)-1], Retained: pagePlan.retained,
+		}
+		postProcesses = append(postProcesses, func(ctx context.Context) error {
+			return uc.jobs.Enqueue(ctx, JobTypeRecordRangeDelete, job)
+		})
+	} else if !pagePlan.retained {
+		pagePlan.gcCommitIDs = append(pagePlan.gcCommitIDs, documentID)
+	}
+
+	commit := Commit{ID: documentID, IP: ip, Document: sd.Document, Proof: sd.Proof, Owner: parsedBase.Owner}
+
+	// targets are URI-ordered, so with includeSelf the base record itself
+	// leads and becomes the reported result
+	return &commitApplyResult{
+		apply: func(ctx context.Context) (ApplyStatus, error) {
+			return uc.applyDeletePage(ctx, &commit, pagePlan)
+		},
+		result:        &targets[0],
+		unapplied:     &sd,
+		postProcesses: postProcesses,
+	}, nil
+}
+
+func unmarshalTargets(targets []concrnt.SignedDocument) ([]concrnt.Document[any], error) {
+	targetDocs := make([]concrnt.Document[any], len(targets))
+	for i, target := range targets {
+		if err := json.Unmarshal([]byte(target.Document), &targetDocs[i]); err != nil {
+			return nil, err
+		}
+	}
+	return targetDocs, nil
+}
+
+// evalDeletePolicy evaluates the delete policy of one authoritative target;
+// an association is governed by the policy of what it is attached to, and a
+// record by the stack of its key however the delete addressed it (a version
+// its key has moved on from has no key pointing at it to look the stack up
+// by).
+func (uc *Usecase) evalDeletePolicy(ctx context.Context, requester domain.Entity, targetDoc concrnt.Document[any], targetURI string) error {
+	policyRoot := targetURI
+	if targetDoc.Associate != nil {
+		policyRoot = *targetDoc.Associate
+	} else if targetDoc.Kind == "record" && targetDoc.Key != "" {
+		policyRoot = targetDoc.Key
+	}
+	stack, err := uc.policyStack(ctx, policyRoot)
+	if err != nil {
+		return err
+	}
+	return uc.policy.Eval(
+		ctx,
+		policy.RequestContext{Requester: requester, Self: targetDoc},
+		stack,
+		policyDeleteAction(targetDoc),
+		targetURI,
+	)
+}
+
+// deletePage is one batch of delete targets with everything
+// planDeleteTargets needs to plan their removal: targets, targetDocs and
+// targetURIs are parallel.
+type deletePage struct {
+	ip            string
+	requester     domain.Entity
+	delete        concrnt.SignedDocument
+	mode          domain.CommitMode
+	authoritative bool
+	remoteKind    DeliveryRemoteKind
+	targets       []concrnt.SignedDocument
+	targetDocs    []concrnt.Document[any]
+	targetURIs    []string
+}
+
+// deletePagePlan is one ApplyDelete call in the making.
+type deletePagePlan struct {
+	removals    []Removal
+	gcCommitIDs []string
+	// deletedAny reports that the page removes something; retained that a
+	// removed document has onUpdate=retain, which keeps the delete commit
+	// too.
+	deletedAny bool
+	retained   bool
+	// postProcesses run once the page is applied; outcome is what they
+	// read the result from.
+	postProcesses []PostProcessAction
+	outcome       *DeleteOutcome
+}
+
+// applyDeletePage is the page's one repository write. commit is the delete
+// document, nil on the continuation pages of a range delete.
+func (uc *Usecase) applyDeletePage(ctx context.Context, commit *Commit, plan *deletePagePlan) (ApplyStatus, error) {
+	outcome, err := uc.repo.ApplyDelete(ctx, DeleteCommit{Commit: commit, Removals: plan.removals, GcCommitIDs: plan.gcCommitIDs})
+	if err != nil {
+		return outcome.Status, err
+	}
+	*plan.outcome = outcome
+	return outcome.Status, nil
+}
+
+// planDeleteTargets plans the removal of the page's targets and of the
+// reference records distributing them left on this server, and the actions
+// to run once the page is applied. Every read happens here; nothing is
+// removed.
+func (uc *Usecase) planDeleteTargets(ctx context.Context, page deletePage) (*deletePagePlan, error) {
+	ctx, span := tracer.Start(ctx, "Usecase.Record.PlanDeleteTargets")
+	defer span.End()
+
+	sd := page.delete
+	requester := page.requester
+	mode := page.mode
+	authoritative := page.authoritative
+
+	var err error
+	plan := &deletePagePlan{outcome: &DeleteOutcome{}}
+	plan.postProcesses = []PostProcessAction{uc.cleanupsScheduled(plan.outcome)}
 
 	// History is only kept for what asked for it: a deleted document with
 	// onUpdate=retain keeps its commit and, with it, this delete's (the
 	// replay needs both); everything else is flagged for gc once the
 	// backdate window has passed (the replay guard then holds on its own).
-	deleteRetained := false
-	deletedAny := false
 	flagDeleted := func(deleted *concrnt.SignedDocument, onUpdate *string) error {
-		deletedAny = true
+		plan.deletedAny = true
 		if onUpdate != nil && *onUpdate == "retain" {
-			deleteRetained = true
+			plan.retained = true
 			return nil
 		}
 		deletedID, err := deleted.CDID()
 		if err != nil {
 			return err
 		}
-		return uc.repo.MarkCommitLogGcCandidate(ctx, tx, deletedID)
+		plan.gcCommitIDs = append(plan.gcCommitIDs, deletedID)
+		return nil
 	}
 
-	postProcesses := []PostProcessAction{}
-	for i := range targets {
-		targetSD := &targets[i]
-		targetDoc := targetDocs[i]
-		targetURI := targetURIs[i]
+	for i := range page.targets {
+		targetSD := &page.targets[i]
+		targetDoc := page.targetDocs[i]
+		targetURI := page.targetURIs[i]
 
 		var removedTimeline, removedItemID string
 
 		if authoritative {
+			plan.postProcesses = append(plan.postProcesses, uc.documentCacheInvalidated(&targetURI, targetSD.CCKV, targetSD.CCFS))
 			switch targetDoc.Kind {
 			case "record":
 
@@ -212,24 +341,22 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					return nil, err
 				}
 
+				// a deleted record may have been a layer of its subtree's
+				// stacks; deletes are rare enough to drop the owner's stacks
+				plan.postProcesses = append(plan.postProcesses, uc.policyStacksInvalidated(parsedURI.Owner))
+
 				switch parsedURI.Scheme {
 				case "cckv":
-					err = uc.repo.DeleteRecordByKey(ctx, tx, targetURI)
-					if err != nil {
-						span.RecordError(err)
-						return nil, err
-					}
+					plan.removals = append(plan.removals, Removal{Kind: RemoveKey, URI: targetURI})
+					// the key's associations go with it
+					plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(targetURI))
 				case "ccfs":
 					if parsedURI.Type != concrnt.CCFSTypeConcrnt {
 						err := errors.New("unsupported ccfs type for delete record: " + parsedURI.Type)
 						span.RecordError(err)
 						return nil, err
 					}
-					err = uc.repo.DeleteRecordByDocumentID(ctx, tx, parsedURI.CDID)
-					if err != nil {
-						span.RecordError(err)
-						return nil, err
-					}
+					plan.removals = append(plan.removals, Removal{Kind: RemoveVersion, URI: targetDoc.Key, DocumentID: parsedURI.CDID})
 				default:
 					err := errors.New("unsupported document scheme for delete record: " + parsedURI.Scheme)
 					span.RecordError(err)
@@ -255,11 +382,12 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					return nil, err
 				}
 
-				err = uc.repo.DeleteAssociation(ctx, tx, parsedURI.CDID)
-				if err != nil {
-					span.RecordError(err)
-					return nil, err
+				removal := Removal{Kind: RemoveAssociation, DocumentID: parsedURI.CDID}
+				if targetDoc.Associate != nil {
+					removal.URI = *targetDoc.Associate
+					plan.postProcesses = append(plan.postProcesses, uc.associationCountsRemoved(*targetDoc.Associate, targetDoc.Schema, targetDoc.AssociationVariant, plan.outcome, len(plan.removals), mode))
 				}
+				plan.removals = append(plan.removals, removal)
 
 				if err := flagDeleted(targetSD, nil); err != nil {
 					span.RecordError(err)
@@ -306,20 +434,27 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 			}.String()
 		}
 		refSegment := cdid.MakeHash([]byte(href)).String()
+		refKeys := []string{}
 		for _, dest := range distributionsFromPtr(targetDoc.Distributes) {
 			refKey, err := url.JoinPath(dest, refSegment)
 			if err != nil {
 				slog.Error("failed to join path for distribution sweep", slog.String("destination", dest), slog.String("href", href), slog.String("error", err.Error()))
 				continue
 			}
-
-			refSD, err := uc.repo.GetSignedDocument(ctx, refKey)
-			if errors.Is(err, domain.ErrNotFound) {
-				continue
-			}
+			refKeys = append(refKeys, refKey)
+		}
+		refSDs := map[string]*concrnt.SignedDocument{}
+		if len(refKeys) > 0 {
+			refSDs, err = uc.repo.GetSignedDocuments(ctx, refKeys)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err
+			}
+		}
+		for _, refKey := range refKeys {
+			refSD, ok := refSDs[refKey]
+			if !ok {
+				continue
 			}
 
 			var refDoc concrnt.Document[any]
@@ -329,10 +464,13 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 				return nil, err
 			}
 
-			stack, err := uc.repo.GetHierarchicalRecordPolicies(ctx, refKey)
+			stack, err := uc.policyStack(ctx, refKey)
 			if err != nil {
 				span.RecordError(err)
 				return nil, err
+			}
+			if parsedRef, err := concrnt.ParseCCURI(refKey); err == nil && policyLayerAt(stack, refKey) {
+				plan.postProcesses = append(plan.postProcesses, uc.policyStacksInvalidated(parsedRef.Owner))
 			}
 
 			err = uc.policy.Eval(
@@ -359,17 +497,14 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 				if err != nil {
 					span.RecordError(err) // non-fatal: the deleted item just lingers in caches
 				} else if tl != "" {
-					postProcesses = append(postProcesses, func(ctx context.Context) error {
-						return uc.kvs.SetAdd(ctx, chunkline.RemovedItemsKey(tl), id, chunkline.RemovedItemsTTL)
+					plan.postProcesses = append(plan.postProcesses, func(ctx context.Context) error {
+						return uc.kvs.SetAdd(ctx, usecase.RemovedItemsKey(tl), id, usecase.RemovedItemsTTL)
 					})
 				}
 			}
 
-			err = uc.repo.DeleteRecordByKey(ctx, tx, refKey)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
+			plan.removals = append(plan.removals, Removal{Kind: RemoveKey, URI: refKey})
+			plan.postProcesses = append(plan.postProcesses, uc.associationCountsInvalidated(refKey), uc.documentCacheInvalidated(&refKey, refSD.CCFS))
 
 			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
 				span.RecordError(err)
@@ -383,8 +518,8 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 
 		if uc.kvs != nil && removedTimeline != "" {
 			tl, id := removedTimeline, removedItemID
-			postProcesses = append(postProcesses, func(ctx context.Context) error {
-				return uc.kvs.SetAdd(ctx, chunkline.RemovedItemsKey(tl), id, chunkline.RemovedItemsTTL)
+			plan.postProcesses = append(plan.postProcesses, func(ctx context.Context) error {
+				return uc.kvs.SetAdd(ctx, usecase.RemovedItemsKey(tl), id, usecase.RemovedItemsTTL)
 			})
 		}
 
@@ -400,14 +535,14 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					targetURI: *targetSD,
 				},
 			}
-			postProcesses = append(
-				postProcesses,
+			plan.postProcesses = append(
+				plan.postProcesses,
 				func(ctx context.Context) error {
-					return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+					return uc.enqueueEventDelivery(ctx, DeliveryJob{
 						ResolveURI: dest,
 						Payload:    remoteSD,
 						Local:      DeliveryLocalPublish,
-						Remote:     remoteKind,
+						Remote:     page.remoteKind,
 						Event: &concrnt.Event{
 							Type:      "deleted",
 							URI:       targetURI,
@@ -462,13 +597,13 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 						associatedURI: *associatedSD,
 					},
 				}
-				postProcesses = append(postProcesses,
+				plan.postProcesses = append(plan.postProcesses,
 					func(ctx context.Context) error {
-						return uc.jobs.Enqueue(ctx, JobTypeRecordDelivery, DeliveryJob{
+						return uc.enqueueEventDelivery(ctx, DeliveryJob{
 							ResolveURI: dest,
 							Payload:    remoteSD,
 							Local:      DeliveryLocalPublish,
-							Remote:     remoteKind,
+							Remote:     page.remoteKind,
 							Event: &concrnt.Event{
 								Type:      "unassociated",
 								URI:       associatedURI,
@@ -481,23 +616,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		}
 	}
 
-	// CIP-4 §6.1: a delete that removed nothing here (the forwarded targets
-	// had no local reference rows) is not recorded — the tx rolls back — so
-	// a later delivery that does find rows is not deduplicated away
-	if !deletedAny {
-		return &commitApplyResult{result: &sd, noop: true}, nil
-	}
-
-	if !deleteRetained {
-		if err := uc.repo.MarkCommitLogGcCandidate(ctx, tx, documentID); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-	}
-
-	// targets are URI-ordered, so with includeSelf the base record itself
-	// leads and becomes the reported result
-	return &commitApplyResult{result: &targets[0], postProcesses: postProcesses}, nil
+	return plan, nil
 }
 
 // parseRangeDeleteTarget detects the trailing-asterisk range notation on a

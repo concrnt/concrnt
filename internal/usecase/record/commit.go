@@ -47,15 +47,6 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		return nil, err
 	}
 
-	alreadyCommitted, err := uc.repo.HasCommitLog(ctx, documentID)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	if alreadyCommitted {
-		return &sd, nil
-	}
-
 	serviceAccountType, _ := ctx.Value(interop.ServiceAccountTypeCtxKey).(string)
 	isServiceAccount := serviceAccountType == "system"
 
@@ -193,22 +184,28 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 	}
 
-	var applyCommit func(tx RepositoryTx) (*commitApplyResult, error)
+	var applyResult *commitApplyResult
 
 	switch doc.Kind {
 	case "entity":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.saveEntity(ctx, tx, ip, sd)
+		applyResult, err = uc.saveEntity(ctx, ip, sd)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "record":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createRecord(ctx, tx, ip, *requester, doc, sd, mode)
+		applyResult, err = uc.createRecord(ctx, ip, *requester, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "association":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.createAssociation(ctx, tx, ip, *requester, doc, sd, mode)
+		applyResult, err = uc.createAssociation(ctx, ip, *requester, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "ack", "acked", "unack", "unacked":
@@ -217,52 +214,44 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 			span.RecordError(err)
 			return nil, err
 		}
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.processAck(ctx, tx, ip, *requester, *targetUser, doc, sd, mode)
+		applyResult, err = uc.processAck(ctx, ip, *requester, *targetUser, doc, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 
 	case "delete":
-		applyCommit = func(tx RepositoryTx) (*commitApplyResult, error) {
-			return uc.deleteRecord(ctx, tx, ip, *requester, sd, mode)
+		applyResult, err = uc.deleteRecord(ctx, ip, *requester, sd, mode)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
+
 	default:
 		err := errors.New("unsupported document kind: " + doc.Kind)
 		span.RecordError(err)
 		return nil, err
 	}
 
-	//  ** start transatction **
-
-	tx, err := uc.repo.BeginTx(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback(ctx)
+	status := Applied
+	if !applyResult.noop && applyResult.apply != nil {
+		status, err = applyResult.apply(ctx)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
-	}()
-
-	applyResult, err := applyCommit(tx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
 	}
 
-	if applyResult.noop {
+	if status == Duplicate {
+		// a redelivery: the commit is in the log already and nothing changed
+		return &sd, nil
+	}
+
+	if applyResult.noop || status == Stale {
 		slog.Info("commit no-op (accept-if-newer loss)",
 			"documentID", documentID, "kind", doc.Kind, "author", doc.Author)
-		return applyResult.result, nil
+		return applyResult.unapplied, nil
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	committed = true
 
 	// A same-key overwrite or delete must be visible to this server's own
 	// verification paths immediately, not after the resource cache's TTL:
