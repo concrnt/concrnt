@@ -55,7 +55,7 @@ func (uc *Usecase) GetAcknowledgeRecords(ctx context.Context, from, to, schema s
 }
 
 func (uc *Usecase) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
-	return uc.repo.GetAcknowledgeRecordCounts(ctx, from, to, schema)
+	return uc.repo.ComputeAcknowledgeCounts(ctx, from, to, schema)
 }
 
 func (uc *Usecase) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) (concrnt.QueryResult, error) {

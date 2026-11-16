@@ -242,3 +242,53 @@ func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, tar
 
 	return &result, nil
 }
+
+// ComputeAssociationSummary reads a target's associations once: the CTE is
+// scanned for the counts per (schema, variant) and again, from the same
+// materialised rows, for the distinct authors, which stop one past
+// maxAuthors (that one row is what tells an overflow).
+func (r *Repository) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (ucrecord.AssociationSummary, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Record.ComputeAssociationSummary")
+	defer span.End()
+
+	var rows []struct {
+		Kind     int
+		Schema   string
+		Variant  string
+		Author   string
+		Count    int64
+		Earliest *time.Time
+	}
+	err := r.db.WithContext(ctx).Raw(`WITH a AS MATERIALIZED (
+			SELECT associations.schema, associations.variant, associations.author, associations.created_at
+			FROM associations JOIN record_keys rk ON rk.id = associations.target_id
+			WHERE rk.uri = ?
+		)
+		SELECT 0 AS kind, schema, variant, NULL AS author, COUNT(*) AS count, MIN(created_at) AS earliest
+			FROM a GROUP BY schema, variant
+		UNION ALL
+		SELECT 1, NULL, NULL, author, 0, NULL
+			FROM (SELECT DISTINCT author FROM a LIMIT ?) d`, targetURI, maxAuthors+1).
+		Scan(&rows).Error
+	if err != nil {
+		span.RecordError(err)
+		return ucrecord.AssociationSummary{}, err
+	}
+
+	var summary ucrecord.AssociationSummary
+	for _, row := range rows {
+		if row.Kind == 1 {
+			summary.Authors = append(summary.Authors, row.Author)
+			continue
+		}
+		variant := ucrecord.AssociationVariant{Schema: row.Schema, Variant: row.Variant, Count: row.Count}
+		if row.Earliest != nil {
+			variant.Earliest = *row.Earliest
+		}
+		summary.Variants = append(summary.Variants, variant)
+	}
+	if len(summary.Authors) > maxAuthors {
+		summary.Authors, summary.AuthorsOverflow = nil, true
+	}
+	return summary, nil
+}

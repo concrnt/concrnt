@@ -96,10 +96,25 @@ type Repository interface {
 	GetSignedDocuments(ctx context.Context, uris []string) (map[string]*concrnt.SignedDocument, error)
 
 	GetAcknowledgeRecords(ctx context.Context, from, to, schema string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-	GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
 	GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	GetAssociatedRecordCountsBySchema(ctx context.Context, targetURI string) (map[string]int64, error)
 	GetAssociatedRecordCountsByVariant(ctx context.Context, targetURI, schema string) (*utils.OrderedKVMap[int64], error)
+
+	// Compute* recount from the primary data (C2). They are the aggregate
+	// layer's cache miss path and the verification tool's reference; request
+	// handlers go through the aggregate layer instead (aggregates.go).
+
+	// ComputeAcknowledgeCounts counts the valid states of one side (from or
+	// to, as in GetAcknowledgeRecords) by schema. Round trips: 1.
+	ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error)
+	// ComputeAssociationSummary scans the associations on the current
+	// incarnation of targetURI once and returns the exact count and the
+	// earliest createdAt of every (schema, variant), and the distinct
+	// authors, or AuthorsOverflow instead when there are more than
+	// maxAuthors. A target without associations (or without a key) yields
+	// the zero summary. Round trips: 1 (a backend without joins reads the
+	// target key in parallel).
+	ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (AssociationSummary, error)
 
 	QueryByPrefix(ctx context.Context, prefix, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
 	QueryByParent(ctx context.Context, parent, schema, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
@@ -338,6 +353,30 @@ type DeleteOutcome struct {
 	// Cleanups are the tokens of the physical removal left to do, one
 	// Cleanup chain each. Empty when the backend removed everything.
 	Cleanups []string
+}
+
+// AssociationSummary is everything the count cache keeps about a target
+// (ComputeAssociationSummary).
+type AssociationSummary struct {
+	// Variants has one entry per (schema, variant) with associations, in
+	// no particular order.
+	Variants []AssociationVariant
+	// Authors are the distinct authors, in no particular order; nil when
+	// AuthorsOverflow.
+	Authors []string
+	// AuthorsOverflow is set when there are more distinct authors than
+	// were asked for.
+	AuthorsOverflow bool
+}
+
+// AssociationVariant is the count of one (schema, variant) of a target. An
+// association without a variant counts under Variant "".
+type AssociationVariant struct {
+	Schema  string
+	Variant string
+	Count   int64
+	// Earliest is the createdAt of the variant's earliest association.
+	Earliest time.Time
 }
 
 // CommitLogEntry is one commit log row as offline tooling sees it.

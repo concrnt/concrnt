@@ -26,7 +26,7 @@ func (r *acknowledgesRecordRepo) GetAcknowledgeRecords(ctx context.Context, from
 	return nil, errors.New("repository must not be reached for an invalid filter")
 }
 
-func (r *acknowledgesRecordRepo) GetAcknowledgeRecordCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
+func (r *acknowledgesRecordRepo) ComputeAcknowledgeCounts(ctx context.Context, from, to, schema string) (map[string]int64, error) {
 	r.called = true
 	return nil, errors.New("repository must not be reached for an invalid filter")
 }
