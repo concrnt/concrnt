@@ -46,6 +46,7 @@ func Run(t *testing.T, open func(t *testing.T) Backend) {
 	t.Run("Ack", func(t *testing.T) { RunAckSuite(t, open) })
 	t.Run("Delete", func(t *testing.T) { RunDeleteSuite(t, open) })
 	t.Run("Chunkline", func(t *testing.T) { RunChunklineSuite(t, open) })
+	t.Run("Residence", func(t *testing.T) { RunResidenceSuite(t, open) })
 }
 
 // Inspector is what the suites need and the contract cannot give them;
