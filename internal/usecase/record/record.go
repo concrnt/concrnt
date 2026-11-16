@@ -154,13 +154,22 @@ func (uc *Usecase) createRecord(ctx context.Context, ip string, requester domain
 		CreatedAt:     createdAt,
 	}
 
+	var outcome RecordOutcome
 	apply := func(ctx context.Context) (ApplyStatus, error) {
-		outcome, err := uc.repo.ApplyRecord(ctx, commit)
+		var err error
+		outcome, err = uc.repo.ApplyRecord(ctx, commit)
 		return outcome.Status, err
 	}
 
 	resultURI := parsed.Key
 	postProcesses := []PostProcessAction{}
+
+	postProcesses = append(postProcesses, func(ctx context.Context) error {
+		if outcome.FreshKey {
+			return uc.associationCountsSeededEmpty(parsed.Key)(ctx)
+		}
+		return nil
+	})
 
 	if mode == domain.CommitModeExecute {
 		postProcesses = append(postProcesses, func(ctx context.Context) error {
