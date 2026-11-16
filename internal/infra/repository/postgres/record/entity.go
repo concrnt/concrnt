@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -33,29 +32,6 @@ func (r *Repository) ApplyEntity(ctx context.Context, commit ucrecord.EntityComm
 		span.RecordError(err)
 	}
 	return status, err
-}
-
-func (r *Repository) CreateEntity(
-	ctx context.Context,
-	tx ucrecord.RepositoryTx,
-	ccid string,
-	alias *string,
-	domain string,
-	documentID string,
-	createdAt time.Time,
-) (bool, error) {
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-	status, err := createEntity(ctx, db, ucrecord.EntityCommit{
-		Commit:    ucrecord.Commit{ID: documentID, Owner: ccid},
-		CCID:      ccid,
-		Alias:     alias,
-		Domain:    domain,
-		CreatedAt: createdAt,
-	})
-	return status == ucrecord.Applied, err
 }
 
 func createEntity(ctx context.Context, db *gorm.DB, commit ucrecord.EntityCommit) (ucrecord.ApplyStatus, error) {

@@ -44,19 +44,6 @@ func (r *Repository) ApplyAck(ctx context.Context, commit ucrecord.AckCommit) (u
 	return outcome, nil
 }
 
-func (r *Repository) legacyAck(ctx context.Context, tx ucrecord.RepositoryTx, commit ucrecord.AckCommit) (bool, error) {
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-	process := processAck
-	if commit.Side == ucrecord.TargetSide {
-		process = processAcked
-	}
-	outcome, err := process(ctx, db, commit)
-	return outcome.Status == ucrecord.Applied, err
-}
-
 func processAck(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
 	defer span.End()
@@ -116,14 +103,6 @@ func processAck(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (uc
 	return ucrecord.AckOutcome{Status: ucrecord.Applied, WasValid: state.Valid, IsValid: commit.Valid}, nil
 }
 
-func (r *Repository) Acknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.AckerSide, From: from, To: to, Schema: schema, Valid: true, CreatedAt: createdAt})
-}
-
-func (r *Repository) UnAcknowledge(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.AckerSide, From: from, To: to, Schema: schema, Valid: false, CreatedAt: createdAt})
-}
-
 func processAcked(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (ucrecord.AckOutcome, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
 	defer span.End()
@@ -181,14 +160,6 @@ func processAcked(ctx context.Context, db *gorm.DB, commit ucrecord.AckCommit) (
 	}
 
 	return ucrecord.AckOutcome{Status: ucrecord.Applied, WasValid: state.Valid, IsValid: commit.Valid}, nil
-}
-
-func (r *Repository) Acknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.TargetSide, From: from, To: to, Schema: schema, Valid: true, CreatedAt: createdAt})
-}
-
-func (r *Repository) UnAcknowledged(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time) (bool, error) {
-	return r.legacyAck(ctx, tx, ucrecord.AckCommit{Commit: ucrecord.Commit{ID: documentID}, Side: ucrecord.TargetSide, From: from, To: to, Schema: schema, Valid: false, CreatedAt: createdAt})
 }
 
 func (r *Repository) getAckRecords(ctx context.Context, from, schema string, since, until *time.Time, limit int, order string) ([]ucrecord.QueryRow, error) {

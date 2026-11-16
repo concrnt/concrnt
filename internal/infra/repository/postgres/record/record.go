@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"time"
 
 	"github.com/lib/pq"
 	"gorm.io/gorm"
@@ -42,38 +41,6 @@ func (r *Repository) ApplyRecord(ctx context.Context, commit ucrecord.RecordComm
 	}
 	outcome.Status = status
 	return outcome, nil
-}
-
-func (r *Repository) CreateRecord(
-	ctx context.Context,
-	tx ucrecord.RepositoryTx,
-	documentID string,
-	key string,
-	owner string,
-	author string,
-	schema string,
-	onUpdate *string,
-	policies *string,
-	distributions []string,
-	redirect *string,
-	createdAt time.Time,
-) (bool, error) {
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-	outcome, err := createRecord(ctx, db, ucrecord.RecordCommit{
-		Commit:        ucrecord.Commit{ID: documentID, Owner: owner},
-		Key:           key,
-		Author:        author,
-		Schema:        schema,
-		OnUpdate:      onUpdate,
-		Policies:      policies,
-		Distributions: distributions,
-		Redirect:      redirect,
-		CreatedAt:     createdAt,
-	})
-	return outcome.Status == ucrecord.Applied, err
 }
 
 func createRecord(ctx context.Context, db *gorm.DB, commit ucrecord.RecordCommit) (ucrecord.RecordOutcome, error) {

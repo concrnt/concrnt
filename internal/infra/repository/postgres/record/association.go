@@ -34,23 +34,6 @@ func (r *Repository) ApplyAssociation(ctx context.Context, commit ucrecord.Assoc
 	return status, err
 }
 
-func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, targetURI string, owner string, author string, schema string, variant *string, unique string, createdAt time.Time) (bool, error) {
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-	status, err := createAssociation(ctx, db, ucrecord.AssociationCommit{
-		Commit:    ucrecord.Commit{ID: documentID, Owner: owner},
-		Target:    targetURI,
-		Author:    author,
-		Schema:    schema,
-		Variant:   variant,
-		Unique:    unique,
-		CreatedAt: createdAt,
-	})
-	return status == ucrecord.Applied, err
-}
-
 func createAssociation(ctx context.Context, db *gorm.DB, commit ucrecord.AssociationCommit) (ucrecord.ApplyStatus, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
 	defer span.End()
