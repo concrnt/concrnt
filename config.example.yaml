@@ -28,6 +28,8 @@ concrnt:
   #   electorEndpoint: "http://127.0.0.1:8002"
 
 backends:
+  # database is the record store: postgres (the default).
+  database: postgres
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
   # postgres sizes the connection pool of each replica. replicas x
   # (maxOpenConns + 1, the readiness check's own connection) must stay

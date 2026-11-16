@@ -45,6 +45,7 @@ import (
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
+	"github.com/concrnt/concrnt/internal/usecase"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
@@ -199,15 +200,64 @@ func main() {
 	buildInfo.Set(1)
 	prometheus.MustRegister(buildInfo)
 
-	maxOpenConns := conf.Backends.Postgres.MaxOpenConnsOrDefault()
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn, maxOpenConns)
-	if err != nil {
-		panic("failed to connect database")
+	cl := client.New(domainConfig.FQDN)
+	if conf.Backends.GatewayAddr != "" {
+		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
 	}
+	cl.SetUserAgent("concrnt", version)
 
-	err = database.MigratePostgres(db)
-	if err != nil {
-		panic("failed to migrate database")
+	// the record store backend: every repository of one backend is built
+	// here, by hand, from that backend's package (CONTRACT.md)
+	var (
+		recordRepo       record.Repository
+		entityMetaRepo   usecase.EntityMetaRepository
+		serverRepo       server.Repository
+		notificationRepo notification.Repository
+		abuseRepo        abuse.Repository
+		databaseReady    health.Check
+		// the count cache table in the record database, under its
+		// backends.aggregate.store name
+		databaseAggregate     aggregate.Store
+		databaseAggregateName string
+		// logged as one line once the job queue is sized
+		concurrencySettings []any
+	)
+	switch conf.Backends.Database {
+	case "", "postgres":
+		maxOpenConns := conf.Backends.Postgres.MaxOpenConnsOrDefault()
+		concurrencySettings = append(concurrencySettings, slog.Int("postgresMaxOpenConns", maxOpenConns))
+		pg, err := database.NewPostgres(conf.Backends.PostgresDsn, maxOpenConns)
+		if err != nil {
+			panic("failed to connect database: " + err.Error())
+		}
+		if err := database.MigratePostgres(pg); err != nil {
+			panic("failed to migrate database: " + err.Error())
+		}
+		sqlDB, err := pg.DB()
+		if err != nil {
+			panic("failed to get sql.DB: " + err.Error())
+		}
+		defer sqlDB.Close()
+		// connection pool usage (go_sql_*): the pool is small, so saturation
+		// and wait time are the first thing to check when everything gets slow
+		prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
+
+		// readiness pings through a connection of its own: the pool above
+		// is what a burst saturates
+		pgProbe, err := database.NewPostgresProbe(conf.Backends.PostgresDsn)
+		if err != nil {
+			panic("failed to open the database readiness connection: " + err.Error())
+		}
+		defer pgProbe.Close()
+		databaseReady = pgProbe.PingContext
+		recordRepo = pgrecord.New(pg)
+		entityMetaRepo = postgres.NewEntityMetaRepository(pg)
+		serverRepo = postgres.NewServerRepository(&domainConfig, pg, cl)
+		notificationRepo = postgres.NewNotificationRepository(pg)
+		abuseRepo = postgres.NewAbuseRepository(pg)
+		databaseAggregate, databaseAggregateName = aggpostgres.New(pg), "postgres"
+	default:
+		panic("unknown backends.database " + conf.Backends.Database + " (postgres)")
 	}
 
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
@@ -215,6 +265,26 @@ func main() {
 
 	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
 	redis := database.NewRedisServing(conf.Backends.RedisAddr, "", conf.Backends.RedisDB, jobQueueConcurrency)
+
+	// the count cache store, built here like the repositories: "" keeps
+	// the counts in the record database, and a database store must be the
+	// record database itself
+	aggregateName := cmp.Or(conf.Backends.Aggregate.Store, databaseAggregateName)
+	var aggregateStore aggregate.Store
+	switch name := aggregateName; name {
+	case "postgres":
+		if name != databaseAggregateName {
+			panic("backends.aggregate.store " + name + " needs backends.database " + name)
+		}
+		aggregateStore = databaseAggregate
+	case "redis":
+		aggregateStore = aggredis.New(redis)
+	case "memcached":
+		aggregateStore = aggmemcached.New(mc, "")
+	default:
+		panic("unknown backends.aggregate.store " + name + " (postgres, redis, memcached)")
+	}
+	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
 
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
@@ -241,17 +311,11 @@ func main() {
 		elector = cluster.AlwaysLeader{}
 	}
 
-	cl := client.New(domainConfig.FQDN)
-	if conf.Backends.GatewayAddr != "" {
-		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
-	}
-	cl.SetUserAgent("concrnt", version)
-
 	moduleManager := service.NewModuleManager(rest.Endpoints, conf.Services)
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	slog.Info("concurrency settings", slog.Int("postgresMaxOpenConns", maxOpenConns), slog.Int("jobQueueConsumers", jobQueueConcurrency))
+	slog.Info("concurrency settings", append(concurrencySettings, slog.Int("jobQueueConsumers", jobQueueConcurrency))...)
 	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
@@ -261,24 +325,8 @@ func main() {
 		cl,
 	)
 
-	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
-	entityMetaRepo := postgres.NewEntityMetaRepository(db)
-	var aggregateStore aggregate.Store
-	switch name := cmp.Or(conf.Backends.Aggregate.Store, "postgres"); name {
-	case "postgres":
-		aggregateStore = aggpostgres.New(db)
-	case "redis":
-		aggregateStore = aggredis.New(redis)
-	case "memcached":
-		aggregateStore = aggmemcached.New(mc, "")
-	default:
-		panic("unknown backends.aggregate.store " + name + " (postgres, redis, memcached)")
-	}
-	aggregateUC := aggregate.New(aggregateStore, conf.Backends.Aggregate.TTL, conf.Backends.Aggregate.MaxDeltas)
-
-	recordRepo := pgrecord.New(db)
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
 	recordUC.SetAggregates(aggregateUC)
 	recordUC.SetSharedCache(mc)
@@ -329,7 +377,6 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := postgres.NewNotificationRepository(db)
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
@@ -375,7 +422,6 @@ func main() {
 		}
 	}()
 
-	abuseRepo := postgres.NewAbuseRepository(db)
 	abuseUC := abuse.New(abuseRepo)
 
 	var notificationReactor *worker.NotificationReactor
@@ -457,32 +503,15 @@ func main() {
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
-	}
-
-	// connection pool usage (go_sql_*): the pool is small, so saturation
-	// and wait time are the first thing to check when everything gets slow
-	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
-
-	// readiness pings through connections of its own: the serving pools
-	// are what a burst saturates
-	pgProbe, err := database.NewPostgresProbe(conf.Backends.PostgresDsn)
-	if err != nil {
-		panic("failed to open the database readiness connection: " + err.Error())
-	}
-	defer pgProbe.Close()
-	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
-	defer redisProbe.Close()
-
 	// every backend the public API needs gates readiness: the database
 	// holds the data, redis carries delivery jobs and realtime events,
 	// memcached serves the timeline chunks. they are watched in the
 	// background and /ready reads the verdict, so the probe answers at once
 	// however busy the process and its connection pools are
+	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	defer redisProbe.Close()
 	readiness := health.NewReadiness(health.DefaultReadinessPolicy)
-	readiness.Add("database", health.DefaultCheckInterval, pgProbe.PingContext)
+	readiness.Add("database", health.DefaultCheckInterval, databaseReady)
 	readiness.Add("redis", health.DefaultCheckInterval, func(ctx context.Context) error {
 		return redisProbe.Ping(ctx).Err()
 	})

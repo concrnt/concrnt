@@ -91,6 +91,8 @@ type Cluster struct {
 }
 
 type Backends struct {
+	// Database selects the record store: "postgres" (default).
+	Database      string    `yaml:"database"`
 	PostgresDsn   string    `yaml:"postgresDsn"`
 	Postgres      Postgres  `yaml:"postgres"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
@@ -139,7 +141,8 @@ func (j JobQueue) ConcurrencyOrDefault() int {
 // Aggregate configures the count cache (internal/usecase/aggregate).
 type Aggregate struct {
 	// Store is "postgres" (a table in the record database), "redis" or
-	// "memcached" (backends.memcachedAddr); empty means postgres.
+	// "memcached" (backends.memcachedAddr); empty means the store matching
+	// the record database.
 	Store string `yaml:"store"`
 	// TTL is how long a computed value is served before it is recomputed
 	// (default 24h); MaxDeltas how many writes an entry absorbs before it is
