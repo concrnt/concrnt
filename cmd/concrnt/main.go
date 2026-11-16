@@ -57,11 +57,6 @@ import (
 	"github.com/concrnt/concrnt/internal/worker"
 )
 
-// readinessTimeout bounds one /ready sweep. The kubelet gives a probe one
-// second by default, so a backend that has not answered by then must
-// already be reported as down inside that window.
-const readinessTimeout = 800 * time.Millisecond
-
 var (
 	version      = "unknown"
 	buildMachine = "unknown"
@@ -218,7 +213,8 @@ func main() {
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
 
-	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	redis := database.NewRedisServing(conf.Backends.RedisAddr, "", conf.Backends.RedisDB, jobQueueConcurrency)
 
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
@@ -255,7 +251,6 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
 	slog.Info("concurrency settings", slog.Int("postgresMaxOpenConns", maxOpenConns), slog.Int("jobQueueConsumers", jobQueueConcurrency))
 	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
@@ -471,19 +466,32 @@ func main() {
 	// and wait time are the first thing to check when everything gets slow
 	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
 
-	// every backend the public API needs gates readiness: postgres holds
-	// the data, redis carries delivery jobs and realtime events, memcached
-	// serves the timeline chunks. the sweep stays under the kubelet's probe
-	// timeout so a hung backend reads as "down" rather than as a timed-out
-	// probe with no body
-	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("postgres", sqlDB.PingContext)
-	readiness.Add("redis", func(ctx context.Context) error {
-		return redis.Ping(ctx).Err()
+	// readiness pings through connections of its own: the serving pools
+	// are what a burst saturates
+	pgProbe, err := database.NewPostgresProbe(conf.Backends.PostgresDsn)
+	if err != nil {
+		panic("failed to open the database readiness connection: " + err.Error())
+	}
+	defer pgProbe.Close()
+	redisProbe := database.NewRedisProbe(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+	defer redisProbe.Close()
+
+	// every backend the public API needs gates readiness: the database
+	// holds the data, redis carries delivery jobs and realtime events,
+	// memcached serves the timeline chunks. they are watched in the
+	// background and /ready reads the verdict, so the probe answers at once
+	// however busy the process and its connection pools are
+	readiness := health.NewReadiness(health.DefaultReadinessPolicy)
+	readiness.Add("database", health.DefaultCheckInterval, pgProbe.PingContext)
+	readiness.Add("redis", health.DefaultCheckInterval, func(ctx context.Context) error {
+		return redisProbe.Ping(ctx).Err()
 	})
-	readiness.Add("memcached", func(ctx context.Context) error {
+	// gomemcache dials past its idle connections instead of queueing, so
+	// the serving client is already independent of the load
+	readiness.Add("memcached", health.DefaultCheckInterval, func(ctx context.Context) error {
 		return mc.Ping()
 	})
+	readiness.Start(ctx)
 
 	probes := rest.NewProbeHandler(watchdog, readiness)
 	probes.RegisterRoutes(internal)
