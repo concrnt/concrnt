@@ -9,6 +9,8 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/infra/aggregate/storetest"
+	"github.com/concrnt/concrnt/internal/usecase/aggregate"
 )
 
 // queryRepo serves a fixed page for the parent listings and records which
@@ -38,11 +40,7 @@ func (r *queryRepo) QueryByParentOrderByKey(ctx context.Context, parent, schema,
 }
 
 func (r *queryRepo) GetHierarchicalRecordPoliciesMulti(ctx context.Context, uris []string) (map[string][]concrnt.Policy, error) {
-	stacks := make(map[string][]concrnt.Policy, len(uris))
-	for _, uri := range uris {
-		stacks[uri] = []concrnt.Policy{}
-	}
-	return stacks, nil
+	return emptyStacks(uris), nil
 }
 
 func keyOnlyRow(key string) QueryRow {
@@ -154,4 +152,59 @@ func urisOf(items []concrnt.SignedDocument) []string {
 		uris = append(uris, *sd.CCKV)
 	}
 	return uris
+}
+
+// associationListRepo counts list reads and summary computations and serves
+// a fixed summary.
+type associationListRepo struct {
+	Repository
+	summary   AssociationSummary
+	summaries int
+	lists     int
+}
+
+func (r *associationListRepo) ComputeAssociationSummary(ctx context.Context, targetURI string, maxAuthors int) (AssociationSummary, error) {
+	r.summaries++
+	return r.summary, nil
+}
+
+func (r *associationListRepo) GetAssociatedRecords(ctx context.Context, targetURI, schema, variant, author string, since, until *time.Time, limit int, order string) ([]QueryRow, error) {
+	r.lists++
+	return nil, nil
+}
+
+// An association listing consults the count cache first: a target the cache
+// knows to have nothing matching is answered without the primary data, and
+// without a cache every listing reads it.
+func TestGetAssociatedRecordsSkipsRepoWhenCountsSayEmpty(t *testing.T) {
+	ctx := context.Background()
+	repo := &associationListRepo{summary: AssociationSummary{
+		Variants: []AssociationVariant{{Schema: "like", Count: 1, Earliest: time.Now()}},
+		Authors:  []string{"con1liker"},
+	}}
+	uc := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
+	uc.SetAggregates(aggregate.New(storetest.NewInMemory(), 0, 0))
+
+	res, err := uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "reply", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Empty(t, res.Items)
+	require.Equal(t, 0, repo.lists, "a schema the counts lack must not reach the repository")
+
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "someone", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 0, repo.lists, "an author without associations on the target must not reach the repository")
+
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/1", "like", "", "con1liker", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.lists, "an author with associations is listed from the repository")
+
+	repo.summary = AssociationSummary{}
+	_, err = uc.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 1, repo.lists, "a target without associations must not reach the repository")
+
+	plain := New(repo, nil, nil, &domain.Config{}, nil, nil, nil, nil, nil)
+	_, err = plain.GetAssociatedRecords(ctx, "cckv://owner/post/2", "", "", "", nil, nil, 10, "desc")
+	require.NoError(t, err)
+	require.Equal(t, 2, repo.lists, "without a count cache every listing reads the repository")
 }
