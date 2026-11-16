@@ -120,10 +120,14 @@ func (uc *Usecase) processAck(ctx context.Context, ip string, from domain.Entity
 		return &commitApplyResult{noop: true, unapplied: &sd}, nil
 	}
 
+	var outcome AckOutcome
 	apply := func(ctx context.Context) (ApplyStatus, error) {
-		outcome, err := uc.repo.ApplyAck(ctx, *commit)
+		var err error
+		outcome, err = uc.repo.ApplyAck(ctx, *commit)
 		return outcome.Status, err
 	}
+
+	postProcesses = append(postProcesses, uc.ackCountsTouched(commit.Side, from.ID, to.ID, doc.Schema, &outcome, mode))
 
 	return &commitApplyResult{apply: apply, result: &sd, unapplied: &sd, postProcesses: postProcesses}, nil
 
