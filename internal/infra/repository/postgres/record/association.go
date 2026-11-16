@@ -76,19 +76,6 @@ func createAssociation(ctx context.Context, db *gorm.DB, commit ucrecord.Associa
 	return ucrecord.Applied, nil
 }
 
-func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return db.Delete(&models.Association{}, "document_id = ?", documentID).Error
-}
-
 func (r *Repository) GetAssociatedRecords(
 	ctx context.Context,
 	targetURI, schema, variant, author string,

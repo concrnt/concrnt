@@ -522,33 +522,6 @@ func (r *Repository) ApplyDelete(ctx context.Context, commit ucrecord.DeleteComm
 	return ucrecord.DeleteOutcome{Status: status, Removed: removed}, nil
 }
 
-func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.RepositoryTx, targetURI string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	q := db.Model(&models.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
-	return db.Where("document_id = (?)", q).Delete(&models.Record{}).Error
-}
-
-func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
-	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByDocumentID")
-	defer span.End()
-
-	db, err := getRecordTx(ctx, tx)
-	if err != nil {
-		span.RecordError(err)
-		return err
-	}
-
-	return db.Delete(&models.Record{}, "document_id = ?", documentID).Error
-}
-
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()

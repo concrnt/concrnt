@@ -27,21 +27,6 @@ type Repository struct {
 	txSlots chan struct{}
 }
 
-type recordTx struct {
-	tx    *gorm.DB
-	slots chan struct{}
-	done  bool // slot released (Commit or Rollback ran)
-}
-
-func (tx *recordTx) release() {
-	if !tx.done {
-		tx.done = true
-		if tx.slots != nil {
-			<-tx.slots
-		}
-	}
-}
-
 // New builds the repository over db. Half of a bounded pool is the most
 // its transactions take at once; the rest stays with the reads.
 func New(db *gorm.DB) ucrecord.Repository {
@@ -61,34 +46,6 @@ var txSlotWait = promauto.NewHistogram(prometheus.HistogramOpts{
 	Help:      "Time an Apply* transaction waited for one of the transaction slots (half the connection pool).",
 	Buckets:   []float64{0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
 })
-
-func (r *Repository) BeginTx(ctx context.Context) (ucrecord.RepositoryTx, error) {
-	if r.txSlots != nil {
-		select {
-		case r.txSlots <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	tx := r.db.WithContext(ctx).Begin()
-	if tx.Error != nil {
-		if r.txSlots != nil {
-			<-r.txSlots
-		}
-		return nil, tx.Error
-	}
-	return &recordTx{tx: tx, slots: r.txSlots}, nil
-}
-
-func (tx *recordTx) Commit(ctx context.Context) error {
-	defer tx.release()
-	return tx.tx.WithContext(ctx).Commit().Error
-}
-
-func (tx *recordTx) Rollback(ctx context.Context) error {
-	defer tx.release()
-	return tx.tx.WithContext(ctx).Rollback().Error
-}
 
 // errNotStored rolls back a transaction whose write ended Stale or
 // Duplicate: neither leaves a trace, not even the commit log entry.
@@ -140,12 +97,4 @@ func (r *Repository) apply(ctx context.Context, fn func(tx *gorm.DB) (ucrecord.A
 // DELETE CASCADE) and issues no token.
 func (r *Repository) Cleanup(ctx context.Context, token string) (string, error) {
 	return "", nil
-}
-
-func getRecordTx(ctx context.Context, tx ucrecord.RepositoryTx) (*gorm.DB, error) {
-	recordTx, ok := tx.(*recordTx)
-	if !ok || recordTx == nil || recordTx.tx == nil {
-		return nil, errors.New("invalid record repository transaction")
-	}
-	return recordTx.tx.WithContext(ctx), nil
 }

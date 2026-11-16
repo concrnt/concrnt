@@ -82,14 +82,6 @@ type Repository interface {
 	// done.
 	Cleanup(ctx context.Context, token string) (next string, err error)
 
-	// Utilities
-	BeginTx(ctx context.Context) (RepositoryTx, error)
-
-	// Create / Update
-	CreateCommitLog(ctx context.Context, tx RepositoryTx, id string, ip string, document string, proof any, owner string) error
-
-	// Read
-	HasCommitLog(ctx context.Context, id string) (bool, error)
 	GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error)
 	// GetSignedDocuments is GetSignedDocument for several URIs at once; a URI
 	// that resolves to nothing is absent from the map, not an error.
@@ -141,14 +133,6 @@ type Repository interface {
 	// tie-broken by id), the replication sort key; QueryRow.CreatedAt carries
 	// that c_date. owner "" means no owner filter.
 	QueryCommitLogs(ctx context.Context, owner string, since, until *time.Time, limit int, order string) ([]QueryRow, error)
-
-	// Delete
-	// MarkCommitLogGcCandidate flags a commit log for `conctl op gc-commitlog`
-	// once the backdate window has passed (CIP-3 §3.4 replay guard).
-	MarkCommitLogGcCandidate(ctx context.Context, tx RepositoryTx, documentID string) error
-	DeleteRecordByKey(ctx context.Context, tx RepositoryTx, targetURI string) error
-	DeleteRecordByDocumentID(ctx context.Context, tx RepositoryTx, documentID string) error
-	DeleteAssociation(ctx context.Context, tx RepositoryTx, documentID string) error
 
 	// Offline tooling (conctl gc-commitlog / dump-commitlog)
 	CountGcCandidates(ctx context.Context, cutoffID string) (int64, error)
@@ -427,11 +411,6 @@ type QueryParams struct {
 	UntilKey *string
 	Limit    int
 	Order    string
-}
-
-type RepositoryTx interface {
-	Commit(ctx context.Context) error
-	Rollback(ctx context.Context) error
 }
 
 type PostProcessAction func(ctx context.Context) error
