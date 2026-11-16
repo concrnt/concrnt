@@ -29,7 +29,8 @@ Dependents go by `ON DELETE CASCADE` inside the same transaction
 `record_keys`, everything anchored to a commit → `commit_logs`), so
 `ApplyDelete` issues no cleanup tokens and `Cleanup` is a no-op.
 
-Two things this schema does that the contract does not ask for:
+Two things this schema does that the contract does not ask for
+(`CONTRACT.md`, backend notes):
 
 - `associations."unique"` is unique table-wide, not per target. The usecase
   derives the value from the target, so the difference is not reachable
@@ -63,6 +64,10 @@ The remaining cost of a prefix listing is joining every matching key to
 `records` and `commit_logs` before the sort (top-N heapsort, in memory).
 Ordering by the denormalised `record_keys.record_created_at` would let the
 limit apply before the joins.
+
+Spanner (`STARTS_WITH` on the uri key) and Firestore (an `ancestors`
+array-contains filter) do not use LIKE. SQLite's `BINARY` collation is byte
+order already and `case_sensitive_like` is on (`sqlite/db.go`).
 
 ## Indexes with callers the load tests do not exercise
 
