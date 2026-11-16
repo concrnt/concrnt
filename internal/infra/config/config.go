@@ -92,11 +92,48 @@ type Cluster struct {
 
 type Backends struct {
 	PostgresDsn   string    `yaml:"postgresDsn"`
+	Postgres      Postgres  `yaml:"postgres"`
 	GatewayAddr   string    `yaml:"gatewayAddr"`
 	RedisAddr     string    `yaml:"redisAddr"`
 	RedisDB       int       `yaml:"redisDB"`
 	MemcachedAddr string    `yaml:"memcachedAddr"`
 	Aggregate     Aggregate `yaml:"aggregate"`
+	JobQueue      JobQueue  `yaml:"jobqueue"`
+}
+
+// Postgres sizes the connection pool of one process.
+type Postgres struct {
+	// MaxOpenConns is the pool size (default 64).
+	MaxOpenConns int `yaml:"maxOpenConns"`
+}
+
+const (
+	DefaultPostgresMaxOpenConns = 64
+	DefaultJobQueueConcurrency  = 16
+)
+
+// MaxOpenConnsOrDefault is MaxOpenConns, or its default when unset. A
+// commit is one transaction on one connection and reads never run inside
+// it, so the pool needs no headroom beyond the concurrency wanted.
+func (p Postgres) MaxOpenConnsOrDefault() int {
+	if p.MaxOpenConns <= 0 {
+		return DefaultPostgresMaxOpenConns
+	}
+	return p.MaxOpenConns
+}
+
+// JobQueue configures the background job consumers of one process.
+type JobQueue struct {
+	// Concurrency is the number of consumer goroutines (default 16).
+	Concurrency int `yaml:"concurrency"`
+}
+
+// ConcurrencyOrDefault is Concurrency, or its default when unset.
+func (j JobQueue) ConcurrencyOrDefault() int {
+	if j.Concurrency <= 0 {
+		return DefaultJobQueueConcurrency
+	}
+	return j.Concurrency
 }
 
 // Aggregate configures the count cache (internal/usecase/aggregate).

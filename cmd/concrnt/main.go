@@ -202,7 +202,8 @@ func main() {
 	buildInfo.Set(1)
 	prometheus.MustRegister(buildInfo)
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
+	maxOpenConns := conf.Backends.Postgres.MaxOpenConnsOrDefault()
+	db, err := database.NewPostgres(conf.Backends.PostgresDsn, maxOpenConns)
 	if err != nil {
 		panic("failed to connect database")
 	}
@@ -252,7 +253,9 @@ func main() {
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
 	redisKVS := kvs.NewRedis(redis)
-	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog))
+	jobQueueConcurrency := conf.Backends.JobQueue.ConcurrencyOrDefault()
+	slog.Info("concurrency settings", slog.Int("postgresMaxOpenConns", maxOpenConns), slog.Int("jobQueueConsumers", jobQueueConcurrency))
+	jobQueue := jobqueue.NewRedisJobQueue(redis, jobqueue.WithWatchdog(watchdog), jobqueue.WithConcurrency(jobQueueConcurrency))
 	policy := service.NewPolicyService(
 		GetGlobalPolicy(),
 		service.GlobalParameters{

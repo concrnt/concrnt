@@ -18,10 +18,9 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
-
-func NewPostgres(dsn string) (*gorm.DB, error) {
+// NewPostgres opens a pool of maxOpenConns connections
+// (config.Postgres.MaxOpenConnsOrDefault).
+func NewPostgres(dsn string, maxOpenConns int) (*gorm.DB, error) {
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -54,13 +53,8 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// A transaction holds one connection while the reads issued inside it
-	// (through the repository's plain db handle) take another one from this
-	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (half of it, see the record repository); otherwise that many
-	// concurrent commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	sqlDB.SetMaxOpenConns(maxOpenConns)
+	sqlDB.SetMaxIdleConns(maxOpenConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 

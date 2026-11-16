@@ -216,6 +216,7 @@ func (q *RedisJobQueue) Run(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 
+	consumers.Set(float64(q.concurrency))
 	for i := 0; i < q.concurrency; i++ {
 		consumer := q.consumerName + "-" + strconv.Itoa(i)
 		heartbeat := q.watchdog.Register("jobqueue/consumer-"+strconv.Itoa(i), consumerDeadline)

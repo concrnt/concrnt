@@ -10,10 +10,12 @@ attempts with a 10 ms to 500 ms backoff, and it is rolled back when the
 outcome is `Stale` or `Duplicate`, which is how those leave no trace. The
 usecase issues its reads before the call, never inside the transaction.
 
-What stays bounded: at most half the pool's connections are in `Apply*`
-transactions at once (`Repository.txSlots`, derived from the pool; none
-when the pool is unbounded). A transaction holds its connection for five or
-more round trips and a read for one, and `database/sql` gives a freed
+Size the pool with `backends.postgres.maxOpenConns` alone.
+
+What stays bounded: at most `maxOpenConns / 2` `Apply*` transactions are
+open at once (`Repository.txSlots`, derived from the pool; none when the
+pool is unbounded). A transaction holds its connection for five or more
+round trips and a read for one, and `database/sql` gives a freed
 connection to any waiter, so without the bound a burst of commits (a seed,
 an import, a delivery backlog) takes every connection and each read waits
 among them. A transaction waiting for a slot holds no connection; the wait

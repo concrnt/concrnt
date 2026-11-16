@@ -29,6 +29,11 @@ concrnt:
 
 backends:
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # postgres sizes the connection pool of each replica. replicas x
+  # maxOpenConns must stay under the server's max_connections. a commit
+  # takes one connection for one transaction.
+  # postgres:
+  #   maxOpenConns: 64      # default 64
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"
@@ -45,6 +50,11 @@ backends:
   #   store: postgres
   #   ttl: 24h
   #   maxDeltas: 10000
+  # jobqueue runs the background jobs (federation delivery, realtime
+  # events, the later pages of a range delete); concurrency is the consumer
+  # goroutines per replica.
+  # jobqueue:
+  #   concurrency: 16       # default 16
 
 observability:
   enableTrace: true
