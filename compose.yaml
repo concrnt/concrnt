@@ -4,6 +4,8 @@ services:
     build:
       context: .
       dockerfile: ./cmd/concrnt/Dockerfile
+      args:
+        VERSION: ${VERSION}
     restart: always
     links:
       - db

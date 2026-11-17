@@ -105,6 +105,7 @@ func MigratePostgres(db *gorm.DB) error {
 			&models.EntityMeta{},
 			&models.Subscription{},
 			&models.AbuseReport{},
+			&models.State{},
 		)
 	})
 }

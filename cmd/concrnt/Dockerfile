@@ -6,7 +6,7 @@ ARG VERSION
 COPY ./go.mod ./go.sum ./
 RUN go mod download && go mod verify
 COPY ./ ./
-RUN VERSION=${VERSION:-$(git describe)} \
+RUN VERSION=${VERSION} \
  && BUILD_MACHINE=$(uname -srmo) \
  && BUILD_TIME=$(date) \
  && GO_VERSION=$(go version) \
@@ -21,7 +21,7 @@ ARG VERSION
 COPY ./go.mod ./go.sum ./
 RUN go mod download && go mod verify
 COPY ./ ./
-RUN VERSION=${VERSION:-$(git describe)} \
+RUN VERSION=${VERSION} \
  && BUILD_MACHINE=$(uname -srmo) \
  && BUILD_TIME=$(date) \
  && GO_VERSION=$(go version) \

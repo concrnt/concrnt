@@ -36,6 +36,7 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/push"
 	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	"github.com/concrnt/concrnt/internal/migrations"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
 	"github.com/concrnt/concrnt/internal/service"
@@ -211,6 +212,14 @@ func main() {
 	defer mc.Close()
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
+
+	stateRepo := postgres.NewStateRepository(db)
+	migrator := migrations.NewMigrator(stateRepo)
+
+	err = migrator.Do(ctx, version)
+	if err != nil {
+		panic("failed to run migrations: " + err.Error())
+	}
 
 	// the internal (operational) listener port, alongside the fixed public
 	// :8000; never expose it outside the cluster
