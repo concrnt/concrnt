@@ -8,27 +8,31 @@ import (
 	"sort"
 
 	"golang.org/x/mod/semver"
+
+	"github.com/concrnt/concrnt/internal/usecase/lease"
 )
 
 const VERSION_KEY = "net.concrnt.version"
 
-const LOCK_KEY = "net.concrnt.migration"
+// leaseKey serializes the migrators of replicas starting at the same time.
+const leaseKey = "net.concrnt.migration"
 
 var migrations = make(map[string]func(ctx context.Context) error)
 
 type Repository interface {
 	GetState(ctx context.Context, name string) (string, error)
 	SetState(ctx context.Context, name string, state string) error
-	Lock(ctx context.Context, name string) (unlock func(), err error)
 }
 
 type Migrator struct {
-	repo Repository
+	repo  Repository
+	lease lease.Lease
 }
 
-func NewMigrator(repo Repository) *Migrator {
+func NewMigrator(repo Repository, lease lease.Lease) *Migrator {
 	return &Migrator{
-		repo: repo,
+		repo:  repo,
+		lease: lease,
 	}
 }
 
@@ -39,11 +43,11 @@ func (m *Migrator) Do(ctx context.Context, version string) error {
 		return nil
 	}
 
-	unlock, err := m.repo.Lock(ctx, LOCK_KEY)
+	release, err := m.lease.Acquire(ctx, leaseKey)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer release()
 
 	currentVersion, err := m.repo.GetState(ctx, VERSION_KEY)
 	if err != nil {

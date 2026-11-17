@@ -214,7 +214,7 @@ func main() {
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
 	stateRepo := postgres.NewStateRepository(db)
-	migrator := migrations.NewMigrator(stateRepo)
+	migrator := migrations.NewMigrator(stateRepo, postgres.NewLease(db))
 
 	err = migrator.Do(ctx, version)
 	if err != nil {
