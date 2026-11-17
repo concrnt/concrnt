@@ -12,11 +12,14 @@ import (
 
 const VERSION_KEY = "net.concrnt.version"
 
+const LOCK_KEY = "net.concrnt.migration"
+
 var migrations = make(map[string]func(ctx context.Context) error)
 
 type Repository interface {
 	GetState(ctx context.Context, name string) (string, error)
 	SetState(ctx context.Context, name string, state string) error
+	Lock(ctx context.Context, name string) (unlock func(), err error)
 }
 
 type Migrator struct {
@@ -36,8 +39,11 @@ func (m *Migrator) Do(ctx context.Context, version string) error {
 		return nil
 	}
 
-	// accuire lock
-	// defer release lock
+	unlock, err := m.repo.Lock(ctx, LOCK_KEY)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	currentVersion, err := m.repo.GetState(ctx, VERSION_KEY)
 	if err != nil {
