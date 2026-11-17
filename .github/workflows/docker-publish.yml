@@ -41,8 +41,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get tag
-        run: echo "TAG=${GITHUB_REF##*/}" >> $GITHUB_ENV
+      # a tag push builds exactly that tag (another tag may share the commit);
+      # anything else gets the same dev version as scripts/build-compose.sh
+      - name: Get version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="$(./scripts/version.sh)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version: $version"
 
       - name: Setup Docker buildx
         uses: docker/setup-buildx-action@v4
@@ -74,7 +84,7 @@ jobs:
           cache-to: type=gha,mode=max
           # apt/ca-certificates layer must be rebuilt every time (eMudhra 2026-10 lesson)
           no-cache-filters: certificates
-          build-args: VERSION=${{env.TAG}}
+          build-args: VERSION=${{ steps.version.outputs.version }}
 
       - name: Export digest
         run: |
