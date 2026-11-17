@@ -1,4 +1,4 @@
-package postgres
+package entitymeta
 
 import (
 	"context"
@@ -14,12 +14,12 @@ import (
 
 // UpdateMetaInfo must touch only the info column (SaveMeta's upsert would
 // clobber inviter) and report NotFound for unregistered ccids.
-func TestResidenceUpdateMetaInfo(t *testing.T) {
+func TestUpdateMetaInfo(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := &ResidenceRepository{db: db}
+	repo := &Repository{db: db}
 
 	ccid := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	inviter := "con1pppppppppppppppppppppppppppppppppppppppp"
@@ -47,12 +47,12 @@ func TestResidenceUpdateMetaInfo(t *testing.T) {
 // owned by the acker and the acked mirror owned by the target), so the whole
 // repository of the departing user is eligible and nobody else's rows are
 // touched; commits with no recorded owner are left alone.
-func TestResidenceMarkCommitLogsGcCandidateByOwner(t *testing.T) {
+func TestMarkCommitLogsGcCandidateByOwner(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	repo := &ResidenceRepository{db: db}
+	repo := &Repository{db: db}
 
 	userA := "con1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 	userB := "con1pppppppppppppppppppppppppppppppppppppppp"

@@ -1,16 +1,19 @@
-package postgres
+package notification
 
 import (
 	"context"
 	"errors"
 
 	"github.com/lib/pq"
+	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
 )
+
+var tracer = otel.Tracer("repository")
 
 type NotificationRepository struct {
 	db *gorm.DB

@@ -1,14 +1,17 @@
-package postgres
+package abuse
 
 import (
 	"context"
 
+	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 )
+
+var tracer = otel.Tracer("repository")
 
 type AbuseRepository struct {
 	db *gorm.DB

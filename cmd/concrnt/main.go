@@ -34,8 +34,13 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/kvs"
 	"github.com/concrnt/concrnt/internal/infra/pubsub"
 	"github.com/concrnt/concrnt/internal/infra/push"
-	"github.com/concrnt/concrnt/internal/infra/repository/postgres"
+	pgabuse "github.com/concrnt/concrnt/internal/infra/repository/postgres/abuse"
+	pgentitymeta "github.com/concrnt/concrnt/internal/infra/repository/postgres/entitymeta"
+	pglease "github.com/concrnt/concrnt/internal/infra/repository/postgres/lease"
+	pgnotification "github.com/concrnt/concrnt/internal/infra/repository/postgres/notification"
 	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
+	pgserver "github.com/concrnt/concrnt/internal/infra/repository/postgres/server"
+	pgstate "github.com/concrnt/concrnt/internal/infra/repository/postgres/state"
 	"github.com/concrnt/concrnt/internal/migrations"
 	"github.com/concrnt/concrnt/internal/present/rest"
 	"github.com/concrnt/concrnt/internal/present/rest/middleware"
@@ -213,8 +218,8 @@ func main() {
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
-	stateRepo := postgres.NewStateRepository(db)
-	migrator := migrations.NewMigrator(stateRepo, postgres.NewLease(db))
+	stateRepo := pgstate.NewStateRepository(db)
+	migrator := migrations.NewMigrator(stateRepo, pglease.NewLease(db))
 
 	err = migrator.Do(ctx, version)
 	if err != nil {
@@ -265,13 +270,13 @@ func main() {
 		cl,
 	)
 
-	serverRepo := postgres.NewServerRepository(&domainConfig, db, cl)
+	serverRepo := pgserver.NewServerRepository(&domainConfig, db, cl)
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
-	residenceRepo := postgres.NewResidenceRepository(db, cl, domainConfig)
+	entityMetaRepo := pgentitymeta.New(db, cl, domainConfig)
 	recordRepo := pgrecord.New(db)
-	recordUC := record.New(recordRepo, residenceRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(residenceRepo, recordUC, &domainConfig)
+	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	residenceUC := residence.New(entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)
 
@@ -299,7 +304,7 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := postgres.NewNotificationRepository(db)
+	notificationRepo := pgnotification.NewNotificationRepository(db)
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
@@ -344,7 +349,7 @@ func main() {
 		}
 	}()
 
-	abuseRepo := postgres.NewAbuseRepository(db)
+	abuseRepo := pgabuse.NewAbuseRepository(db)
 	abuseUC := abuse.New(abuseRepo)
 
 	var notificationReactor *worker.NotificationReactor

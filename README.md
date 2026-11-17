@@ -120,7 +120,8 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   commit-log feed for external followers, `deliver.go` the federation delivery job,
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
-  (GORM), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  (GORM; one subpackage per independently replaceable unit — `record`, `entitymeta`,
+  `server`, `notification`, `abuse`, `state`, `lease`), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).

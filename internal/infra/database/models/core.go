@@ -9,17 +9,17 @@ import (
 // Indexes:
 //   - PRIMARY KEY (id): canonical commit/document lookup; used by record,
 //     entity, ack, association foreign keys and direct ccfs lookups in
-//     postgres.RecordRepository.GetSignedDocument/Delete.
+//     pgrecord.Repository.GetSignedDocument/Delete.
 //   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump and
-//     replication scans; used by postgres.RecordRepository.GetAllCommitLogs,
-//     postgres.RecordRepository.QueryCommitLogs (owner filter) and
-//     postgres.ResidenceRepository.MarkCommitLogsGcCandidateByOwner.
+//     replication scans; used by pgrecord.Repository.GetAllCommitLogs,
+//     pgrecord.Repository.QueryCommitLogs (owner filter) and
+//     pgentitymeta.Repository.MarkCommitLogsGcCandidateByOwner.
 //   - idx_commit_logs_c_date_id (c_date, id): replication cursor scan without an
 //     owner filter, ordered by receipt time with id as tie-break; used by
-//     postgres.RecordRepository.QueryCommitLogs.
+//     pgrecord.Repository.QueryCommitLogs.
 //   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
-//     scans; set by postgres.RecordRepository.CreateRecord when replacing a key
-//     and by postgres.ResidenceRepository.MarkCommitLogsGcCandidateByOwner on
+//     scans; set by pgrecord.Repository.CreateRecord when replacing a key
+//     and by pgentitymeta.Repository.MarkCommitLogsGcCandidateByOwner on
 //     unregister.
 type CommitLog struct {
 	ID          string    `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
@@ -33,24 +33,24 @@ type CommitLog struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): internal key identity; used by parent_id references and
-//     associations.target_id joins in postgres.RecordRepository.GetAssociated*.
+//     associations.target_id joins in pgrecord.Repository.GetAssociated*.
 //   - uni_record_keys_uri (uri): URI resolution and upsert target; used by
-//     postgres.GetRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
+//     pgrecord.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument, ChunklineRepository.GetChunklineManifest/LookupLocalItrs,
 //     and association target lookups.
 //   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup
-//     and record joins; used by postgres.RecordRepository.GetSignedDocument and
+//     and record joins; used by pgrecord.Repository.GetSignedDocument and
 //     GetHierarchicalRecordPolicies.
 //   - idx_record_keys_parent_id_record_id (parent_id, record_id): parent member
-//     lookup and record preload joins; used by postgres.RecordRepository.QueryByParent.
+//     lookup and record preload joins; used by pgrecord.Repository.QueryByParent.
 //   - idx_record_keys_parent_created_at_record_id
 //     (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL
 //     AND record_created_at IS NOT NULL: timeline/chunkline range scans without
-//     joining records; used by postgres.ChunklineRepository.GetChunklineManifest,
+//     joining records; used by pgrecord.ChunklineRepository.GetChunklineManifest,
 //     LookupLocalItrs, and LoadLocalBody.
 //   - idx_record_keys_parent_id_uri (parent_id, uri): key-ordered child listing
 //     including placeholder keys (no record_created_at predicate); used by
-//     postgres.RecordRepository.QueryByParentOrderByKey.
+//     pgrecord.Repository.QueryByParentOrderByKey.
 type RecordKey struct {
 	ID              int64      `json:"id" gorm:"primaryKey;autoIncrement"`
 	ParentID        *int64     `json:"parentID" gorm:"index:idx_record_keys_parent_id_record_id,priority:1;index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
@@ -64,12 +64,12 @@ type RecordKey struct {
 // Indexes:
 //   - PRIMARY KEY (document_id): record payload lookup and foreign-key target;
 //     used by preloads from RecordKey.Record and direct deletes in
-//     postgres.RecordRepository.CreateRecord/Delete.
+//     pgrecord.Repository.CreateRecord/Delete.
 //   - idx_records_schema_created_at_document_id (schema, created_at, document_id):
-//     schema/time-ordered record searches; used by postgres.RecordRepository
+//     schema/time-ordered record searches; used by pgrecord.Repository
 //     QueryByPrefix and QueryByParent when schema/time filters are present.
 //   - idx_records_author_created_at_document_id (author, created_at, document_id):
-//     author/time-ordered record searches; used by postgres.RecordRepository
+//     author/time-ordered record searches; used by pgrecord.Repository
 //     QueryByPrefix and QueryByParent when the author filter is present.
 //   - idx_records_document_id_created_at (document_id, created_at): record join
 //     plus timestamp predicate support for record_keys-to-records joins that still
@@ -95,15 +95,15 @@ type Record struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_ack_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by postgres.RecordRepository.saveAck and filtered by
+//     upsert; used by pgrecord.Repository.saveAck and filtered by
 //     GetAcknowledgeRecords/GetAcknowledgeRecordCounts.
 //   - idx_acks_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by postgres.RecordRepository.GetAcknowledge*.
+//     ack list/count lookup; used by pgrecord.Repository.GetAcknowledge*.
 //   - idx_acks_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; used by postgres.RecordRepository.GetAcknowledge*.
+//     list/count lookup; used by pgrecord.Repository.GetAcknowledge*.
 //   - idx_acks_schema_valid_created_at (schema, valid, created_at):
 //     schema-filtered ack list/count lookup; used by
-//     postgres.RecordRepository.GetAcknowledge*.
+//     pgrecord.Repository.GetAcknowledge*.
 type Ack struct {
 	From   string `json:"from" gorm:"type:text;index:idx_ack_from_to_schema,unique;index:idx_acks_from_valid_created_at,priority:1"`
 	To     string `json:"to" gorm:"type:text;index:idx_ack_from_to_schema,unique;index:idx_acks_to_valid_created_at,priority:1"`
@@ -122,15 +122,15 @@ type Ack struct {
 //   - PRIMARY KEY (document_id): one ack state per commit document and commit-log
 //     foreign-key target.
 //   - idx_acked_from_to_schema UNIQUE (from, to, schema): idempotent ack state
-//     upsert; used by postgres.RecordRepository.saveAck and filtered by
+//     upsert; used by pgrecord.Repository.saveAck and filtered by
 //     GetAcknowledgeRecords/GetAcknowledgeRecordCounts.
 //   - idx_acked_from_valid_created_at (from, valid, created_at): from-filtered
-//     ack list/count lookup; used by postgres.RecordRepository.GetAcknowledge*.
+//     ack list/count lookup; used by pgrecord.Repository.GetAcknowledge*.
 //   - idx_acked_to_valid_created_at (to, valid, created_at): to-filtered ack
-//     list/count lookup; used by postgres.RecordRepository.GetAcknowledge*.
+//     list/count lookup; used by pgrecord.Repository.GetAcknowledge*.
 //   - idx_acked_schema_valid_created_at (schema, valid, created_at):
 //     schema-filtered ack list/count lookup; used by
-//     postgres.RecordRepository.GetAcknowledge*.
+//     pgrecord.Repository.GetAcknowledge*.
 type Acked struct {
 	From   string `json:"from" gorm:"type:text;index:idx_acked_from_to_schema,unique;index:idx_acked_from_valid_created_at,priority:1"`
 	To     string `json:"to" gorm:"type:text;index:idx_acked_from_to_schema,unique;index:idx_acked_to_valid_created_at,priority:1"`
@@ -149,17 +149,17 @@ type Acked struct {
 //   - PRIMARY KEY (document_id): one association per commit document and
 //     commit-log foreign-key target.
 //   - idx_associations_target_id (target_id): association lookup by target record
-//     key; used by postgres.RecordRepository.GetAssociatedRecords,
+//     key; used by pgrecord.Repository.GetAssociatedRecords,
 //     GetAssociatedRecordCountsBySchema, and GetAssociatedRecordCountsByVariant.
 //   - idx_associations_target_schema_variant_author
 //     (target_id, schema, variant, author): target lookup with optional filters;
-//     used by postgres.RecordRepository.GetAssociatedRecords.
+//     used by pgrecord.Repository.GetAssociatedRecords.
 //   - idx_associations_target_schema_variant_created_at
 //     (target_id, schema, variant, created_at): target/schema counts by variant
 //     and earliest association ordering; used by
-//     postgres.RecordRepository.GetAssociatedRecordCountsByVariant.
+//     pgrecord.Repository.GetAssociatedRecordCountsByVariant.
 //   - uni_associations_unique (unique): idempotency key for association writes;
-//     used by postgres.RecordRepository.CreateAssociation.
+//     used by pgrecord.Repository.CreateAssociation.
 type Association struct {
 	DocumentID string    `json:"id" gorm:"primaryKey;type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
@@ -180,9 +180,9 @@ type Association struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): FQDN lookup and upsert target; used by
-//     postgres.ServerRepository.GetAndCacheByFQDN and cache writes.
+//     pgserver.ServerRepository.GetAndCacheByFQDN and cache writes.
 //   - idx_servers_cs_id (cs_id): CSID cache lookup; used by
-//     postgres.ServerRepository.GetAndCacheByCSID.
+//     pgserver.ServerRepository.GetAndCacheByCSID.
 type Server struct {
 	ID          string    `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
 	CSID        string    `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
@@ -196,10 +196,10 @@ type Server struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): ccid lookup and upsert target; used by
-//     postgres.RecordRepository.CreateEntity and
-//     postgres.ResidenceRepository.GetEntityByCCID.
+//     pgrecord.Repository.CreateEntity and
+//     pgentitymeta.Repository.GetEntityByCCID.
 //   - idx_entities_alias (alias): alias lookup; used by
-//     postgres.ResidenceRepository.GetEntityByAlias.
+//     pgentitymeta.Repository.GetEntityByAlias.
 type Entity struct {
 	ID     string  `json:"ccid" gorm:"type:text;primaryKey"`
 	Alias  *string `json:"alias,omitempty" gorm:"type:text;index"`
@@ -219,7 +219,7 @@ type Entity struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): entity metadata lookup and upsert target; used by
-//     postgres.ResidenceRepository.SaveMeta and GetMeta.
+//     pgentitymeta.Repository.SaveMeta and GetMeta.
 type EntityMeta struct {
 	ID      string    `json:"ccid" gorm:"type:text;primaryKey"`
 	Inviter *string   `json:"inviter" gorm:"type:text"`
@@ -230,7 +230,7 @@ type EntityMeta struct {
 
 // Indexes:
 //   - PRIMARY KEY (id): report identity. Abuse reports are currently append-only;
-//     postgres.AbuseRepository.CreateAbuseReport does not issue read queries.
+//     pgabuse.AbuseRepository.CreateAbuseReport does not issue read queries.
 type AbuseReport struct {
 	ID        int64     `json:"id" gorm:"primaryKey;autoIncrement"`
 	IP        string    `json:"ip" gorm:"type:text"`

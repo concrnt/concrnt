@@ -1,10 +1,11 @@
-package postgres
+package server
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
 
+	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -14,6 +15,8 @@ import (
 	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
+
+var tracer = otel.Tracer("repository")
 
 type ServerRepository struct {
 	config *domain.Config

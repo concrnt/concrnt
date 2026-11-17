@@ -1,10 +1,11 @@
-package postgres
+package entitymeta
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 
+	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -15,18 +16,20 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/residence"
 )
 
-type ResidenceRepository struct {
+var tracer = otel.Tracer("repository")
+
+type Repository struct {
 	db     *gorm.DB
 	client *client.Client
 	config domain.Config
 }
 
-func NewResidenceRepository(db *gorm.DB, cl *client.Client, config domain.Config) residence.Repository {
-	return &ResidenceRepository{db: db, client: cl, config: config}
+func New(db *gorm.DB, cl *client.Client, config domain.Config) residence.Repository {
+	return &Repository{db: db, client: cl, config: config}
 }
 
-func (r *ResidenceRepository) SaveMeta(ctx context.Context, meta domain.EntityMeta) error {
-	ctx, span := tracer.Start(ctx, "ResidenceRepository.Register")
+func (r *Repository) SaveMeta(ctx context.Context, meta domain.EntityMeta) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.SaveMeta")
 	defer span.End()
 
 	modelMeta := models.EntityMeta{
@@ -45,8 +48,8 @@ func (r *ResidenceRepository) SaveMeta(ctx context.Context, meta domain.EntityMe
 	return nil
 }
 
-func (r *ResidenceRepository) GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
-	ctx, span := tracer.Start(ctx, "ResidenceRepository.GetMeta")
+func (r *Repository) GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetMeta")
 	defer span.End()
 
 	var meta models.EntityMeta
@@ -67,8 +70,8 @@ func (r *ResidenceRepository) GetMeta(ctx context.Context, ccid string) (*domain
 
 // UpdateMetaInfo replaces only the info column, preserving inviter (unlike
 // SaveMeta, whose upsert overwrites both).
-func (r *ResidenceRepository) UpdateMetaInfo(ctx context.Context, ccid string, info string) error {
-	ctx, span := tracer.Start(ctx, "ResidenceRepository.UpdateMetaInfo")
+func (r *Repository) UpdateMetaInfo(ctx context.Context, ccid string, info string) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.UpdateMetaInfo")
 	defer span.End()
 
 	result := r.db.WithContext(ctx).Model(&models.EntityMeta{}).Where("id = ?", ccid).Update("info", info)
@@ -83,8 +86,8 @@ func (r *ResidenceRepository) UpdateMetaInfo(ctx context.Context, ccid string, i
 	return nil
 }
 
-func (r *ResidenceRepository) DeleteMeta(ctx context.Context, ccid string) error {
-	ctx, span := tracer.Start(ctx, "ResidenceRepository.DeleteMeta")
+func (r *Repository) DeleteMeta(ctx context.Context, ccid string) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.DeleteMeta")
 	defer span.End()
 
 	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&models.EntityMeta{}).Error; err != nil {
@@ -99,8 +102,8 @@ func (r *ResidenceRepository) DeleteMeta(ctx context.Context, ccid string) error
 // ccid as a GC candidate. Every commit has exactly one owner (an ack between
 // two local users is two commits: the ack owned by the acker and the acked
 // owned by the target), so nothing another user holds is touched. Idempotent.
-func (r *ResidenceRepository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
-	ctx, span := tracer.Start(ctx, "ResidenceRepository.MarkCommitLogsGcCandidateByOwner")
+func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.MarkCommitLogsGcCandidateByOwner")
 	defer span.End()
 
 	err := r.db.WithContext(ctx).
@@ -116,8 +119,8 @@ func (r *ResidenceRepository) MarkCommitLogsGcCandidateByOwner(ctx context.Conte
 	return nil
 }
 
-func (r *ResidenceRepository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByCCID")
+func (r *Repository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetEntityByCCID")
 	defer span.End()
 
 	entity, err := gorm.G[models.Entity](r.db).
@@ -152,8 +155,8 @@ func (r *ResidenceRepository) GetEntityByCCID(ctx context.Context, ccid string) 
 	}, nil
 }
 
-func (r *ResidenceRepository) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetEntityByAlias")
+func (r *Repository) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetEntityByAlias")
 	defer span.End()
 
 	entity, err := gorm.G[models.Entity](r.db).
