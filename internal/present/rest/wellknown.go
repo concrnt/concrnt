@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/labstack/echo/v4"
-	echomiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	echomiddleware "github.com/labstack/echo/v5/middleware"
 
 	"github.com/concrnt/concrnt/internal/infra/config"
 	"github.com/concrnt/concrnt/internal/present/rest/presenter"
@@ -39,16 +39,16 @@ func NewWellKnownHandler(
 }
 
 func (p *WellKnownHandler) RegisterRoutes(e *echo.Echo) {
-	w := e.Group("", echomiddleware.CORS())
+	w := e.Group("", echomiddleware.CORS("*"))
 	w.GET("/.well-known/concrnt", p.handleWellKnown)
 	for name, doc := range p.additional {
-		w.GET("/.well-known/"+name, func(c echo.Context) error {
+		w.GET("/.well-known/"+name, func(c *echo.Context) error {
 			return c.Blob(http.StatusOK, doc.ContentType, doc.Body)
 		})
 	}
 }
 
-func (p *WellKnownHandler) handleWellKnown(c echo.Context) error {
+func (p *WellKnownHandler) handleWellKnown(c *echo.Context) error {
 	server, err := p.server.GetThisServer()
 	if err != nil {
 		return presenter.InternalError(c, err)

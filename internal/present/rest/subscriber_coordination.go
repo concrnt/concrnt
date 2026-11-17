@@ -4,7 +4,7 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/concrnt/concrnt/internal/worker"
 )
@@ -65,7 +65,7 @@ func (h *SubscriberCoordinationHandler) RegisterRoutes(e *echo.Echo) {
 // handleDemand returns the prefixes wanted by this replica's own realtime
 // sessions. The leader polls this on every replica (including itself) to
 // build the cluster-wide demand set.
-func (h *SubscriberCoordinationHandler) handleDemand(c echo.Context) error {
+func (h *SubscriberCoordinationHandler) handleDemand(c *echo.Context) error {
 	prefixes := h.local.CurrentSubscriptions()
 	if prefixes == nil {
 		prefixes = []string{}
@@ -77,7 +77,7 @@ func (h *SubscriberCoordinationHandler) handleDemand(c echo.Context) error {
 // Only the leader can answer this — it is the only replica that actually
 // knows it, and forwarding would let two GET /internal/subscriptions handlers
 // loop off each other during a leadership handover.
-func (h *SubscriberCoordinationHandler) handleSubscriptions(c echo.Context) error {
+func (h *SubscriberCoordinationHandler) handleSubscriptions(c *echo.Context) error {
 	if !h.leader.IsLeader() {
 		return c.String(http.StatusConflict, "not the leader")
 	}
@@ -92,7 +92,7 @@ func (h *SubscriberCoordinationHandler) handleSubscriptions(c echo.Context) erro
 // handleEnsure applies subscription demand immediately. Only the leader runs
 // the Subscriber, so non-leaders reject the request; the caller falls back to
 // the periodic peer poll.
-func (h *SubscriberCoordinationHandler) handleEnsure(c echo.Context) error {
+func (h *SubscriberCoordinationHandler) handleEnsure(c *echo.Context) error {
 	if !h.leader.IsLeader() {
 		return c.String(http.StatusConflict, "not the leader")
 	}

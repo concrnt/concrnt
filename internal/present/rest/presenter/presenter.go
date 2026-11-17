@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 type errorResponse struct {
@@ -24,43 +24,43 @@ func errorCode(err error) string {
 }
 
 // OK wraps a successful response.
-func OK(c echo.Context, payload any) error {
+func OK(c *echo.Context, payload any) error {
 	return c.JSON(http.StatusOK, payload)
 }
 
-func BadRequest(c echo.Context, err error) error {
+func BadRequest(c *echo.Context, err error) error {
 	slog.Warn("bad request", slog.String("error", err.Error()))
 	return c.JSON(http.StatusBadRequest, errorResponse{Error: err.Error()})
 }
 
-func BadRequestMessage(c echo.Context, msg string) error {
+func BadRequestMessage(c *echo.Context, msg string) error {
 	slog.Warn("bad request", slog.String("error", msg))
 	return c.JSON(http.StatusBadRequest, errorResponse{Error: msg})
 }
 
-func NotFound(c echo.Context, msg string) error {
+func NotFound(c *echo.Context, msg string) error {
 	slog.Info("not found", slog.String("error", msg))
 	return c.JSON(http.StatusNotFound, errorResponse{Error: msg})
 }
 
 // NotFoundError renders a 404 from a domain error, carrying the error's
 // machine-readable code (if it has one) alongside the message.
-func NotFoundError(c echo.Context, err error) error {
+func NotFoundError(c *echo.Context, err error) error {
 	slog.Info("not found", slog.String("error", err.Error()))
 	return c.JSON(http.StatusNotFound, errorResponse{Error: err.Error(), Code: errorCode(err)})
 }
 
-func InternalError(c echo.Context, err error) error {
+func InternalError(c *echo.Context, err error) error {
 	slog.Error("internal error", slog.String("error", err.Error()))
 	return c.JSON(http.StatusInternalServerError, errorResponse{Error: err.Error()})
 }
 
-func Forbidden(c echo.Context, msg string) error {
+func Forbidden(c *echo.Context, msg string) error {
 	slog.Warn("forbidden", slog.String("error", msg))
 	return c.JSON(http.StatusForbidden, errorResponse{Error: msg})
 }
 
-func Redirect(c echo.Context, location string, body any) error {
+func Redirect(c *echo.Context, location string, body any) error {
 	slog.Info("redirecting", slog.String("location", location))
 	c.Response().Header().Set(echo.HeaderLocation, location)
 	return c.JSON(http.StatusFound, body)

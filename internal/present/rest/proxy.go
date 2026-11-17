@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/labstack/echo/v4"
-	echomiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	echomiddleware "github.com/labstack/echo/v5/middleware"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
@@ -37,7 +37,7 @@ func NewProxy(
 
 func (p *Proxy) RegisterRoutes(e *echo.Echo) {
 
-	cors := echomiddleware.CORS()
+	cors := echomiddleware.CORS("*")
 
 	for _, service := range p.services {
 
@@ -85,7 +85,7 @@ func (p *Proxy) RegisterRoutes(e *echo.Echo) {
 				middlewares = append(middlewares, p.authMiddleware)
 			}
 
-			handler := func(c echo.Context) error {
+			handler := func(c *echo.Context) error {
 				ctx := c.Request().Context()
 				c.Response().Header().Set("cc-service", service.Name)
 

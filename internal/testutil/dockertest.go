@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/ory/dockertest"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
@@ -54,7 +54,7 @@ func SetupTraceCtx() (context.Context, string) {
 	return ctx, traceID
 }
 
-func CreateHttpRequest() (echo.Context, *http.Request, *httptest.ResponseRecorder, string) {
+func CreateHttpRequest() (*echo.Context, *http.Request, *httptest.ResponseRecorder, string) {
 	e := echo.New()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
@@ -54,7 +54,7 @@ func TestImportRepositoryRequiresAuthentication(t *testing.T) {
 		rec := httptest.NewRecorder()
 		err := h.handleImportRepository(e.NewContext(req, rec))
 		if err != nil {
-			e.HTTPErrorHandler(err, e.NewContext(req, rec))
+			e.HTTPErrorHandler(e.NewContext(req, rec), err)
 		}
 		return rec
 	}
@@ -93,7 +93,7 @@ func TestImportRepositoryBodyLimits(t *testing.T) {
 		rec := httptest.NewRecorder()
 		err := h.handleImportRepository(e.NewContext(req, rec))
 		if err != nil {
-			e.HTTPErrorHandler(err, e.NewContext(req, rec))
+			e.HTTPErrorHandler(e.NewContext(req, rec), err)
 		}
 		return rec
 	}
@@ -129,7 +129,7 @@ func TestApiGroupBodyLimit(t *testing.T) {
 	h := newRepositoryTestHandler()
 	app := echo.New()
 	withUser := func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			ctx := context.WithValue(c.Request().Context(), interop.RequesterCtxKey, domain.Entity{ID: "con1user"})
 			c.SetRequest(c.Request().WithContext(ctx))
 			return next(c)

@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/labstack/echo/v4"
-	echomiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	echomiddleware "github.com/labstack/echo/v5/middleware"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/impl/interop"
@@ -88,12 +88,12 @@ var Endpoints = map[string]string{
 func (h *Handler) RegisterRoutes(app *echo.Echo, e *echo.Group) {
 
 	bodyLimit := echomiddleware.BodyLimitWithConfig(echomiddleware.BodyLimitConfig{
-		Limit: "1M",
-		Skipper: func(c echo.Context) bool {
+		LimitBytes: 1 << 20,
+		Skipper: func(c *echo.Context) bool {
 			return c.Path() == apiPrefix+"/repository" || c.Path() == apiPrefix+"/batch"
 		},
 	})
-	api := e.Group(apiPrefix, echomiddleware.CORS(), bodyLimit)
+	api := e.Group(apiPrefix, echomiddleware.CORS("*"), bodyLimit)
 	api.POST("/commit", h.handleCommit)
 	api.OPTIONS("/commit", h.handleNop)
 	api.GET("/resolve", h.handleResolve)
@@ -147,15 +147,15 @@ func (h *Handler) RegisterRoutes(app *echo.Echo, e *echo.Group) {
 	// api.GET("/internal/signal/subscriptions", h.handleCurrentSubs)
 	// api.OPTIONS("/internal/signal/subscriptions", h.handleNop)
 
-	api.POST("/batch", batchHandler(app, h.config.FQDN, h.chunklineItrBatchHandler()), echomiddleware.BodyLimit("16M"))
+	api.POST("/batch", batchHandler(app, h.config.FQDN, h.chunklineItrBatchHandler()), echomiddleware.BodyLimit(16<<20))
 
 }
 
-func (h *Handler) handleNop(c echo.Context) error {
+func (h *Handler) handleNop(c *echo.Context) error {
 	return c.NoContent(http.StatusOK)
 }
 
-func (h *Handler) handleCommit(c echo.Context) error {
+func (h *Handler) handleCommit(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	var sd concrnt.SignedDocument
@@ -185,14 +185,14 @@ func (h *Handler) handleCommit(c echo.Context) error {
 
 // permissionDenied returns a 403 when debug mode is enabled (to aid diagnosis),
 // or a 404 otherwise, to avoid leaking whether a resource exists.
-func (h *Handler) permissionDenied(c echo.Context) error {
+func (h *Handler) permissionDenied(c *echo.Context) error {
 	if h.config.Debug {
 		return presenter.Forbidden(c, "permission denied")
 	}
 	return presenter.NotFound(c, "resource not found")
 }
 
-func (h *Handler) handleResolve(c echo.Context) error {
+func (h *Handler) handleResolve(c *echo.Context) error {
 	ctx, span := tracer.Start(c.Request().Context(), "Handler.handleResource")
 	defer span.End()
 
@@ -212,7 +212,7 @@ func (h *Handler) handleResolve(c echo.Context) error {
 	}
 
 	if uri.Scheme == "http" || uri.Scheme == "https" {
-		return presenter.Redirect(c, uri.String(), echo.Map{"location": uri.String()})
+		return presenter.Redirect(c, uri.String(), map[string]any{"location": uri.String()})
 	}
 
 	parsed, err := concrnt.ParseCCURI(uriString)
@@ -312,7 +312,7 @@ type queryWindow struct {
 	order    string
 }
 
-func parseQueryWindow(c echo.Context, keyCursors bool) (queryWindow, error) {
+func parseQueryWindow(c *echo.Context, keyCursors bool) (queryWindow, error) {
 	w := queryWindow{limit: 10, order: "desc"}
 
 	sinceStr := c.QueryParam("since")
@@ -367,7 +367,7 @@ func parseQueryWindow(c echo.Context, keyCursors bool) (queryWindow, error) {
 	return w, nil
 }
 
-func (h *Handler) handleQuery(c echo.Context) error {
+func (h *Handler) handleQuery(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	prefix := c.QueryParam("prefix")
@@ -415,7 +415,7 @@ func (h *Handler) handleQuery(c echo.Context) error {
 	return presenter.OK(c, result)
 }
 
-func (h *Handler) handleReplication(c echo.Context) error {
+func (h *Handler) handleReplication(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner := c.QueryParam("owner")
@@ -437,7 +437,7 @@ func (h *Handler) handleReplication(c echo.Context) error {
 	return presenter.OK(c, result)
 }
 
-func (h *Handler) handleChunklineItr(c echo.Context) error {
+func (h *Handler) handleChunklineItr(c *echo.Context) error {
 	ctx := c.Request().Context()
 	uri := c.QueryParam("uri")
 
@@ -539,7 +539,7 @@ func chunklineItrBatchChunk(path string) (string, bool) {
 	return chunk, true
 }
 
-func (h *Handler) handleChunklineBody(c echo.Context) error {
+func (h *Handler) handleChunklineBody(c *echo.Context) error {
 	ctx := c.Request().Context()
 	uri := c.QueryParam("uri")
 
@@ -554,7 +554,7 @@ func (h *Handler) handleChunklineBody(c echo.Context) error {
 	return presenter.OK(c, results)
 }
 
-func (h *Handler) handleChunklineRemoved(c echo.Context) error {
+func (h *Handler) handleChunklineRemoved(c *echo.Context) error {
 	ctx := c.Request().Context()
 	uri := c.QueryParam("uri")
 
@@ -565,7 +565,7 @@ func (h *Handler) handleChunklineRemoved(c echo.Context) error {
 	return presenter.OK(c, results)
 }
 
-func (h *Handler) handleRegister(c echo.Context) error {
+func (h *Handler) handleRegister(c *echo.Context) error {
 	ctx := c.Request().Context()
 	var req concrnt.RegisterRequest
 	err := c.Bind(&req)
@@ -579,10 +579,10 @@ func (h *Handler) handleRegister(c echo.Context) error {
 	if err != nil {
 		return presenter.InternalError(c, err)
 	}
-	return presenter.OK(c, echo.Map{"status": "ok"})
+	return presenter.OK(c, map[string]any{"status": "ok"})
 }
 
-func (h *Handler) handleGetRegistration(c echo.Context) error {
+func (h *Handler) handleGetRegistration(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	meta, err := h.residence.GetRegistration(ctx)
@@ -608,10 +608,10 @@ func (h *Handler) handleGetRegistration(c echo.Context) error {
 		Meta:    json.RawMessage(meta.Info),
 	}
 
-	return presenter.OK(c, echo.Map{"status": "ok", "content": content})
+	return presenter.OK(c, map[string]any{"status": "ok", "content": content})
 }
 
-func (h *Handler) handleUpdateRegistration(c echo.Context) error {
+func (h *Handler) handleUpdateRegistration(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	var req struct {
@@ -631,10 +631,10 @@ func (h *Handler) handleUpdateRegistration(c echo.Context) error {
 		}
 		return presenter.InternalError(c, err)
 	}
-	return presenter.OK(c, echo.Map{"status": "ok"})
+	return presenter.OK(c, map[string]any{"status": "ok"})
 }
 
-func (h *Handler) handleUnregister(c echo.Context) error {
+func (h *Handler) handleUnregister(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	err := h.residence.Unregister(ctx)
@@ -644,10 +644,10 @@ func (h *Handler) handleUnregister(c echo.Context) error {
 		}
 		return presenter.InternalError(c, err)
 	}
-	return presenter.OK(c, echo.Map{"status": "ok"})
+	return presenter.OK(c, map[string]any{"status": "ok"})
 }
 
-func (h *Handler) handleTimelineRecent(c echo.Context) error {
+func (h *Handler) handleTimelineRecent(c *echo.Context) error {
 	ctx := c.Request().Context()
 	uriString := c.QueryParam("uris")
 	if uriString == "" {
@@ -685,7 +685,7 @@ func (h *Handler) handleTimelineRecent(c echo.Context) error {
 	return presenter.OK(c, results)
 }
 
-func (h *Handler) handleSubscribeNotification(c echo.Context) error {
+func (h *Handler) handleSubscribeNotification(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner, err := url.PathUnescape(c.Param("owner"))
@@ -721,10 +721,10 @@ func (h *Handler) handleSubscribeNotification(c echo.Context) error {
 		return presenter.InternalError(c, err)
 	}
 
-	return c.JSON(http.StatusCreated, echo.Map{"status": "ok", "content": subscription})
+	return c.JSON(http.StatusCreated, map[string]any{"status": "ok", "content": subscription})
 }
 
-func (h *Handler) handleGetNotification(c echo.Context) error {
+func (h *Handler) handleGetNotification(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner, err := url.PathUnescape(c.Param("owner"))
@@ -748,10 +748,10 @@ func (h *Handler) handleGetNotification(c echo.Context) error {
 		return presenter.InternalError(c, err)
 	}
 
-	return presenter.OK(c, echo.Map{"status": "ok", "content": subscription})
+	return presenter.OK(c, map[string]any{"status": "ok", "content": subscription})
 }
 
-func (h *Handler) handleDeleteNotification(c echo.Context) error {
+func (h *Handler) handleDeleteNotification(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner, err := url.PathUnescape(c.Param("owner"))
@@ -775,7 +775,7 @@ func (h *Handler) handleDeleteNotification(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (h *Handler) handleGetNotificationCounter(c echo.Context) error {
+func (h *Handler) handleGetNotificationCounter(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner, err := url.PathUnescape(c.Param("owner"))
@@ -796,10 +796,10 @@ func (h *Handler) handleGetNotificationCounter(c echo.Context) error {
 		return presenter.InternalError(c, err)
 	}
 
-	return presenter.OK(c, echo.Map{"status": "ok", "content": echo.Map{"count": count}})
+	return presenter.OK(c, map[string]any{"status": "ok", "content": map[string]any{"count": count}})
 }
 
-func (h *Handler) handleResetNotificationCounter(c echo.Context) error {
+func (h *Handler) handleResetNotificationCounter(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	owner, err := url.PathUnescape(c.Param("owner"))
@@ -833,7 +833,7 @@ func requireNotificationOwner(ctx context.Context, owner string) error {
 	return nil
 }
 
-func (h *Handler) handleAssociations(c echo.Context) error {
+func (h *Handler) handleAssociations(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	uri := c.QueryParam("uri")
@@ -858,7 +858,7 @@ func (h *Handler) handleAssociations(c echo.Context) error {
 
 }
 
-func (h *Handler) handleAssociationCounts(c echo.Context) error {
+func (h *Handler) handleAssociationCounts(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	uri := c.QueryParam("uri")
@@ -910,7 +910,7 @@ const (
 	realtimeMaxPrefixes     = 3000
 )
 
-func (h *Handler) handleRealtime(c echo.Context) error {
+func (h *Handler) handleRealtime(c *echo.Context) error {
 	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
 		slog.Error(
@@ -1051,7 +1051,7 @@ func (h *Handler) handleRealtime(c echo.Context) error {
 	}
 }
 
-func (h *Handler) handleKnownServers(c echo.Context) error {
+func (h *Handler) handleKnownServers(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	servers, err := h.server.List(ctx)
@@ -1061,7 +1061,7 @@ func (h *Handler) handleKnownServers(c echo.Context) error {
 	return presenter.OK(c, servers)
 }
 
-func (h *Handler) handleAcknowledges(c echo.Context) error {
+func (h *Handler) handleAcknowledges(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	from := c.QueryParam("from")
@@ -1086,7 +1086,7 @@ func (h *Handler) handleAcknowledges(c echo.Context) error {
 	return presenter.OK(c, result)
 }
 
-func (h *Handler) handleAcknowledgeCounts(c echo.Context) error {
+func (h *Handler) handleAcknowledgeCounts(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	from := c.QueryParam("from")
@@ -1106,7 +1106,7 @@ func (h *Handler) handleAcknowledgeCounts(c echo.Context) error {
 	return presenter.OK(c, counts)
 }
 
-func (h *Handler) handleDumpRepository(c echo.Context) error {
+func (h *Handler) handleDumpRepository(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	dump, err := h.record.DumpCommitLogs(ctx)
@@ -1120,7 +1120,7 @@ func (h *Handler) handleDumpRepository(c echo.Context) error {
 // up to 1000 lines per request, each at most a MaxDocumentSize document.
 const maxImportBodyBytes = 64 << 20
 
-func (h *Handler) handleImportRepository(c echo.Context) error {
+func (h *Handler) handleImportRepository(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	// Either a user (domain.Entity) or a service account (CSID string) may
@@ -1146,7 +1146,7 @@ func (h *Handler) handleImportRepository(c echo.Context) error {
 	return presenter.OK(c, results)
 }
 
-func (h *Handler) handleAbuse(c echo.Context) error {
+func (h *Handler) handleAbuse(c *echo.Context) error {
 	ctx := c.Request().Context()
 
 	var req concrnt.AbuseReport
@@ -1169,5 +1169,5 @@ func (h *Handler) handleAbuse(c echo.Context) error {
 		return presenter.InternalError(c, err)
 	}
 
-	return presenter.OK(c, echo.Map{"status": "ok"})
+	return presenter.OK(c, map[string]any{"status": "ok"})
 }

@@ -1,26 +1,27 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/SherClockHolmes/webpush-go"
-	"github.com/labstack/echo-contrib/echoprometheus"
-	"github.com/labstack/echo/v4"
-	echomiddleware "github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo-contrib/v5/echoprometheus"
+	echootel "github.com/labstack/echo-otel/v5"
+	"github.com/labstack/echo/v5"
+	echomiddleware "github.com/labstack/echo/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/xinguang/go-recaptcha"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/concrnt/concrnt"
@@ -85,6 +86,23 @@ func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
 	return h.Handler.Handle(ctx, r)
 }
 
+// accessLogLine is one access log entry; fields are declared in output order.
+type accessLogLine struct {
+	Time         string `json:"time"`
+	TraceID      string `json:"traceID"`
+	SpanID       string `json:"spanID"`
+	RemoteIP     string `json:"remote_ip"`
+	Host         string `json:"host"`
+	Method       string `json:"method"`
+	URI          string `json:"uri"`
+	Status       int    `json:"status"`
+	Error        string `json:"error"`
+	Latency      int64  `json:"latency"`
+	LatencyHuman string `json:"latency_human"`
+	BytesIn      int64  `json:"bytes_in"`
+	BytesOut     int64  `json:"bytes_out"`
+}
+
 func main() {
 
 	lh := &CustomHandler{Handler: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -119,8 +137,6 @@ func main() {
 	)
 
 	e := echo.New()
-	e.HideBanner = true
-	e.HidePort = true
 
 	e.Use(echomiddleware.Recover())
 
@@ -133,14 +149,14 @@ func main() {
 			// which service answered: proxied requests carry the target
 			// service's name in the cc-service header set by rest.Proxy;
 			// everything else is handled in-process
-			"service": func(c echo.Context, err error) string {
+			"service": func(c *echo.Context, err error) string {
 				if service := c.Response().Header().Get("cc-service"); service != "" {
 					return service
 				}
 				return "concrnt"
 			},
 		},
-		Skipper: func(c echo.Context) bool {
+		Skipper: func(c *echo.Context) bool {
 			// long-lived websocket upgrades would skew the duration histogram
 			return c.Request().Header.Get("Upgrade") == "websocket"
 		},
@@ -153,10 +169,10 @@ func main() {
 		}
 		defer cleanup()
 
-		e.Use(otelecho.Middleware(conf.Concrnt.FQDN))
+		e.Use(echootel.NewMiddleware(conf.Concrnt.FQDN))
 
 		e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-			return func(c echo.Context) error {
+			return func(c *echo.Context) error {
 				span := trace.SpanFromContext(c.Request().Context())
 				c.Response().Header().Set("trace-id", span.SpanContext().TraceID().String())
 				return next(c)
@@ -164,19 +180,42 @@ func main() {
 		})
 	}
 
-	e.Use(echomiddleware.LoggerWithConfig(echomiddleware.LoggerConfig{
-		Skipper: func(c echo.Context) bool {
+	// access log in the same JSON shape the v4 Logger middleware produced
+	accessLog := json.NewEncoder(os.Stdout)
+	e.Use(echomiddleware.RequestLoggerWithConfig(echomiddleware.RequestLoggerConfig{
+		Skipper: func(c *echo.Context) bool {
 			return c.Path() == "/.well-known/concrnt"
 		},
-		Format: `{"time":"${time_rfc3339_nano}",${custom},"remote_ip":"${remote_ip}",` +
-			`"host":"${host}","method":"${method}","uri":"${uri}","status":${status},` +
-			`"error":"${error}","latency":${latency},"latency_human":"${latency_human}",` +
-			`"bytes_in":${bytes_in},"bytes_out":${bytes_out}}` + "\n",
-		CustomTagFunc: func(c echo.Context, buf *bytes.Buffer) (int, error) {
+		HandleError:      true,
+		LogLatency:       true,
+		LogRemoteIP:      true,
+		LogHost:          true,
+		LogMethod:        true,
+		LogURI:           true,
+		LogStatus:        true,
+		LogContentLength: true,
+		LogResponseSize:  true,
+		LogValuesFunc: func(c *echo.Context, v echomiddleware.RequestLoggerValues) error {
 			span := trace.SpanFromContext(c.Request().Context())
-			fmt.Fprintf(buf, "\"%s\":\"%s\"", "traceID", span.SpanContext().TraceID().String())
-			fmt.Fprintf(buf, ",\"%s\":\"%s\"", "spanID", span.SpanContext().SpanID().String())
-			return 0, nil
+			line := accessLogLine{
+				Time:         time.Now().Format(time.RFC3339Nano),
+				TraceID:      span.SpanContext().TraceID().String(),
+				SpanID:       span.SpanContext().SpanID().String(),
+				RemoteIP:     v.RemoteIP,
+				Host:         v.Host,
+				Method:       v.Method,
+				URI:          v.URI,
+				Status:       v.Status,
+				Latency:      int64(v.Latency),
+				LatencyHuman: v.Latency.String(),
+				BytesOut:     v.ResponseSize,
+			}
+			if v.Error != nil {
+				line.Error = v.Error.Error()
+			}
+			// a missing or malformed Content-Length is logged as 0
+			line.BytesIn, _ = strconv.ParseInt(v.ContentLength, 10, 64)
+			return accessLog.Encode(line)
 		},
 	}))
 
@@ -419,7 +458,7 @@ func main() {
 	proxy := rest.NewProxy(conf.Services, authMiddleware.IdentifyIdentity)
 	proxy.RegisterRoutes(e)
 
-	static := e.Group("", echomiddleware.CORS())
+	static := e.Group("", echomiddleware.CORS("*"))
 
 	rest.RegisterStaticFiles(static, conf.Static)
 
@@ -428,8 +467,6 @@ func main() {
 	// replica-to-replica subscriber coordination API. it must never be
 	// exposed outside the cluster.
 	internal := echo.New()
-	internal.HideBanner = true
-	internal.HidePort = true
 
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
@@ -462,8 +499,13 @@ func main() {
 	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
 	coordination.RegisterRoutes(internal)
 
+	// plain http.Servers rather than echo's StartConfig: shutdown below is
+	// staged by hand (drain, Shutdown, Close, then the internal listener)
+	internalServer := &http.Server{Addr: ":" + internalPort, Handler: internal}
+	server := &http.Server{Addr: ":8000", Handler: e}
+
 	go func() {
-		if err := internal.Start(":" + internalPort); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := internalServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			// the probes target this listener, so a dead internal listener
 			// gets the process restarted by its supervisor; the public API
 			// keeps serving in the meantime
@@ -473,7 +515,7 @@ func main() {
 
 	var serverFailed atomic.Bool
 	go func() {
-		if err := e.Start(":8000"); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server stopped unexpectedly", slog.String("error", err.Error()))
 			serverFailed.Store(true)
 			stop()
@@ -495,17 +537,17 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelShutdown()
 
-	if err := e.Shutdown(shutdownCtx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		slog.Error("failed to shut down gracefully", slog.String("error", err.Error()))
 	}
 
 	// Shutdown does not touch hijacked connections: this is what terminates
 	// the realtime websockets so clients reconnect to another replica
-	e.Close()
+	server.Close()
 
 	// last: peers keep getting coordination answers until the public API is
 	// fully drained
-	if err := internal.Shutdown(shutdownCtx); err != nil {
+	if err := internalServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("failed to shut down internal listener", slog.String("error", err.Error()))
 	}
 
