@@ -38,8 +38,22 @@ func (tx *recordTx) release() {
 	}
 }
 
-func New(db *gorm.DB) ucrecord.Repository {
+var _ ucrecord.Repository = (*Repository)(nil)
+
+func New(db *gorm.DB) *Repository {
 	return &Repository{db: db}
+}
+
+func (r *Repository) Migrate() error {
+	return r.db.AutoMigrate(
+		&CommitLog{},
+		&Record{},
+		&RecordKey{},
+		&Association{},
+		&Ack{},
+		&Acked{},
+		&Entity{},
+	)
 }
 
 func (r *Repository) BeginTx(ctx context.Context) (ucrecord.RepositoryTx, error) {

@@ -208,18 +208,31 @@ func main() {
 		panic("failed to connect database")
 	}
 
-	err = database.MigratePostgres(db)
-	if err != nil {
-		panic("failed to migrate database")
-	}
-
 	mc := database.NewMemcached(conf.Backends.MemcachedAddr)
 	defer mc.Close()
 
 	redis := database.NewRedis(conf.Backends.RedisAddr, "", conf.Backends.RedisDB)
 
-	stateRepo := pgstate.NewStateRepository(db)
-	migrator := migrations.NewMigrator(stateRepo, pglease.NewLease(db))
+	cl := client.New(domainConfig.FQDN)
+	if conf.Backends.GatewayAddr != "" {
+		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
+	}
+	cl.SetUserAgent("concrnt", version)
+
+	abuseRepo := pgabuse.New(db)
+	entityMetaRepo := pgentitymeta.New(db)
+	notificationRepo := pgnotification.New(db)
+	recordRepo := pgrecord.New(db)
+	serverRepo := pgserver.New(&domainConfig, db, cl)
+	stateRepo := pgstate.New(db)
+
+	migrationLease := pglease.New(db)
+	err = migrations.Migrate(ctx, migrationLease, abuseRepo, entityMetaRepo, notificationRepo, recordRepo, serverRepo, stateRepo)
+	if err != nil {
+		panic("failed to migrate database: " + err.Error())
+	}
+
+	migrator := migrations.NewMigrator(stateRepo, migrationLease)
 
 	err = migrator.Do(ctx, version)
 	if err != nil {
@@ -251,12 +264,6 @@ func main() {
 		elector = cluster.AlwaysLeader{}
 	}
 
-	cl := client.New(domainConfig.FQDN)
-	if conf.Backends.GatewayAddr != "" {
-		cl.AddHostRemapping(domainConfig.FQDN, conf.Backends.GatewayAddr)
-	}
-	cl.SetUserAgent("concrnt", version)
-
 	moduleManager := service.NewModuleManager(rest.Endpoints, conf.Services)
 
 	redisPubsub := pubsub.NewRedisPubsub(redis)
@@ -270,13 +277,10 @@ func main() {
 		cl,
 	)
 
-	serverRepo := pgserver.NewServerRepository(&domainConfig, db, cl)
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
-	entityMetaRepo := pgentitymeta.New(db, cl, domainConfig)
-	recordRepo := pgrecord.New(db)
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	residenceUC := residence.New(entityMetaRepo, recordUC, &domainConfig)
+	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)
 
@@ -304,7 +308,6 @@ func main() {
 		notificationPusher = push.NewWebPush(*webpushOpts)
 	}
 
-	notificationRepo := pgnotification.NewNotificationRepository(db)
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
@@ -349,7 +352,6 @@ func main() {
 		}
 	}()
 
-	abuseRepo := pgabuse.NewAbuseRepository(db)
 	abuseUC := abuse.New(abuseRepo)
 
 	var notificationReactor *worker.NotificationReactor

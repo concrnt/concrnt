@@ -20,14 +20,13 @@ import (
 
 const followSchema = "https://example.com/follow.json"
 
-// mapResidenceRepo serves one entity per ccid, so an ack's author and target
+// entityMap serves one entity per ccid, so an ack's author and target
 // can live on different domains.
-type mapResidenceRepo struct {
-	EntityRepository
+type entityMap struct {
 	entities map[string]*domain.Entity
 }
 
-func (m mapResidenceRepo) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+func (m entityMap) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
 	if entity, ok := m.entities[ccid]; ok {
 		return entity, nil
 	}
@@ -55,12 +54,12 @@ func newAckParty(t *testing.T, host string) ackParty {
 	}
 }
 
-func residenceOf(parties ...ackParty) mapResidenceRepo {
+func entitiesOf(parties ...ackParty) entityMap {
 	entities := map[string]*domain.Entity{}
 	for _, party := range parties {
 		entities[party.ccid] = party.entity
 	}
-	return mapResidenceRepo{entities: entities}
+	return entityMap{entities: entities}
 }
 
 // signedAck builds a signed ack/unack by from targeting to (CIP-10 §3).
@@ -88,10 +87,10 @@ func derivedAcked(t *testing.T, ack concrnt.SignedDocument) concrnt.SignedDocume
 	return derived
 }
 
-func newAckUsecase(cfg *domain.Config, repo Repository, residence EntityRepository, delivery usecase.JobQueue) *Usecase {
+func newAckUsecase(cfg *domain.Config, repo Repository, entities entityLookup, delivery usecase.JobQueue) *Usecase {
 	return New(
-		repo,
-		residence,
+		withEntities(repo, entities),
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -130,7 +129,7 @@ func TestCommitAckOwnerIsAuthor(t *testing.T) {
 		t.Run(kind, func(t *testing.T) {
 			repo := &recordingRecordRepo{}
 			delivery := &recordingDeliveryQueue{}
-			uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+			uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 			sd := signedAck(t, kind, from, to, time.Now().Add(-time.Minute))
 			result, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute)
@@ -191,7 +190,7 @@ func TestCommitAckDeliversAckedToTarget(t *testing.T) {
 		t.Run(tc.kind, func(t *testing.T) {
 			repo := &recordingRecordRepo{}
 			delivery := &recordingDeliveryQueue{}
-			uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+			uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 			sd := signedAck(t, tc.kind, from, to, time.Now().Add(-time.Minute))
 			if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
@@ -256,7 +255,7 @@ func TestCommitAckImportDoesNotDeliverAcked(t *testing.T) {
 
 	repo := &recordingRecordRepo{}
 	delivery := &recordingDeliveryQueue{}
-	uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+	uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 	sd := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeLocalOnlyExecute); err != nil {
@@ -282,7 +281,7 @@ func TestCommitStaleAckDeliversNothing(t *testing.T) {
 
 	repo := &recordingRecordRepo{ackStale: true}
 	delivery := &recordingDeliveryQueue{}
-	uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+	uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 	sd := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
@@ -310,7 +309,7 @@ func TestCommitAckedAppliesOnTargetServer(t *testing.T) {
 		t.Run(tc.kind, func(t *testing.T) {
 			repo := &recordingRecordRepo{}
 			delivery := &recordingDeliveryQueue{}
-			uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+			uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 			ack := signedAck(t, tc.kind, from, to, time.Now().Add(-time.Minute))
 			mirror := derivedAcked(t, ack)
@@ -365,7 +364,7 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 
 	t.Run("canonical mirror is accepted", func(t *testing.T) {
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, to), &recordingDeliveryQueue{})
 
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
 			t.Fatalf("Commit returned error: %v", err)
@@ -377,7 +376,7 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 
 	t.Run("mirror not derived from the embedded ack is rejected", func(t *testing.T) {
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, to), &recordingDeliveryQueue{})
 
 		forged := derivedAcked(t, ack)
 		forged.Document = strings.Replace(forged.Document, `"kind":"acked"`, `"kind":"unacked"`, 1)
@@ -391,7 +390,7 @@ func TestCommitAckedVerifiesDocumentDirectProof(t *testing.T) {
 
 	t.Run("author-signed acked document is rejected", func(t *testing.T) {
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, to), &recordingDeliveryQueue{})
 
 		// kind=acked signed directly by the author: only a server-derived
 		// mirror (document-direct proof) may carry the acked kind
@@ -437,7 +436,7 @@ func TestCommitAckedExemptions(t *testing.T) {
 
 	t.Run("backdate window does not apply", func(t *testing.T) {
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, to), &recordingDeliveryQueue{})
 
 		old := signedAck(t, "ack", from, to, time.Now().Add(-domain.MaxBackdate-24*time.Hour))
 		if _, err := uc.Commit(context.Background(), "127.0.0.1", derivedAcked(t, old), domain.CommitModeExecute); err != nil {
@@ -450,7 +449,7 @@ func TestCommitAckedExemptions(t *testing.T) {
 
 	t.Run("block relationship does not apply", func(t *testing.T) {
 		repo := &blockingRecordRepo{blocker: from.ccid, blocked: []string{to.ccid}}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, to), &recordingDeliveryQueue{})
 
 		ack := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
@@ -465,7 +464,7 @@ func TestCommitAckedExemptions(t *testing.T) {
 		// dump replay after the acker's server is gone: only the target is
 		// known here
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(to), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(to), &recordingDeliveryQueue{})
 
 		ack := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {
@@ -482,7 +481,7 @@ func TestCommitAckedExemptions(t *testing.T) {
 		// rolls back
 		elsewhere := newAckParty(t, "other.example.net")
 		repo := &recordingRecordRepo{}
-		uc := newAckUsecase(cfg, repo, residenceOf(from, elsewhere), &recordingDeliveryQueue{})
+		uc := newAckUsecase(cfg, repo, entitiesOf(from, elsewhere), &recordingDeliveryQueue{})
 
 		ack := signedAck(t, "ack", from, elsewhere, time.Now().Add(-time.Minute))
 		if _, err := uc.Commit(systemCtx(), "127.0.0.1", derivedAcked(t, ack), domain.CommitModeExecute); err != nil {

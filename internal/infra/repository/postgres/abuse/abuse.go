@@ -7,25 +7,27 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
-	"github.com/concrnt/concrnt/internal/usecase/abuse"
 )
 
 var tracer = otel.Tracer("repository")
 
-type AbuseRepository struct {
+type Repository struct {
 	db *gorm.DB
 }
 
-func NewAbuseRepository(db *gorm.DB) abuse.Repository {
-	return &AbuseRepository{db: db}
+func New(db *gorm.DB) *Repository {
+	return &Repository{db: db}
 }
 
-func (r *AbuseRepository) CreateAbuseReport(ctx context.Context, report *concrnt.AbuseReport, reporter, reposterIP string) error {
-	ctx, span := tracer.Start(ctx, "AbuseRepository.CreateAbuseReport")
+func (r *Repository) Migrate() error {
+	return r.db.AutoMigrate(&AbuseReport{})
+}
+
+func (r *Repository) CreateAbuseReport(ctx context.Context, report *concrnt.AbuseReport, reporter, reposterIP string) error {
+	ctx, span := tracer.Start(ctx, "Repository.Abuse.CreateAbuseReport")
 	defer span.End()
 
-	abuseReport := &models.AbuseReport{
+	abuseReport := &AbuseReport{
 		IP:        reposterIP,
 		Reporter:  reporter,
 		TargetURI: report.TargetURI,

@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/stretchr/testify/require"
@@ -25,6 +24,7 @@ import (
 func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -46,9 +46,9 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 			Associate: &associate,
 		})
 	}
-	state := func() models.Acked {
+	state := func() Acked {
 		t.Helper()
-		var row models.Acked
+		var row Acked
 		require.NoError(t, db.Where(`"from" = ? AND "to" = ? AND schema = ?`, from, to, schema).Take(&row).Error)
 		return row
 	}
@@ -114,7 +114,7 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 	require.True(t, row.CreatedAt.Equal(t3))
 
 	var ackCount int64
-	require.NoError(t, db.Model(&models.Ack{}).Count(&ackCount).Error)
+	require.NoError(t, db.Model(&Ack{}).Count(&ackCount).Error)
 	require.EqualValues(t, 0, ackCount, "target-side state must not leak into the acker-side acks table")
 }
 
@@ -128,6 +128,7 @@ func TestAckedRepositoryAcceptIfNewer(t *testing.T) {
 func TestGetAcknowledgeRecordsServesHeldSide(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)

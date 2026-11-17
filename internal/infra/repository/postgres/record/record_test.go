@@ -12,7 +12,6 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
@@ -21,6 +20,7 @@ import (
 func TestRecordRepositoryWrites(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -46,7 +46,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 			return err
 		})
 
-		var commit models.CommitLog
+		var commit CommitLog
 		require.NoError(t, db.Where("id = ?", "record-1-old").Take(&commit).Error)
 		require.Equal(t, oldSD.Document, commit.Document)
 		require.JSONEq(t, `{"type":"none"}`, commit.Proof)
@@ -54,14 +54,14 @@ func TestRecordRepositoryWrites(t *testing.T) {
 
 		requireCommitOwner(t, db, "record-1-old", "con1owner")
 
-		var stored models.Record
+		var stored Record
 		require.NoError(t, db.Where("document_id = ?", "record-1-old").Take(&stored).Error)
 		require.Equal(t, "con1owner", stored.Owner)
 		require.Equal(t, "https://schema.example/post.json", stored.Schema)
 		require.Equal(t, distributions, []string(stored.Distributions))
 		require.True(t, stored.CreatedAt.Equal(createdAt))
 
-		var recordKey models.RecordKey
+		var recordKey RecordKey
 		require.NoError(t, db.Where("uri = ?", key).Take(&recordKey).Error)
 		require.NotNil(t, recordKey.RecordID)
 		require.Equal(t, "record-1-old", *recordKey.RecordID)
@@ -98,10 +98,10 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.True(t, commit.GcCandidate)
 
 		var oldRecordCount int64
-		require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "record-1-old").Count(&oldRecordCount).Error)
+		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "record-1-old").Count(&oldRecordCount).Error)
 		require.Zero(t, oldRecordCount)
 
-		var newRecord models.Record
+		var newRecord Record
 		require.NoError(t, db.Where("document_id = ?", "record-2-new").Take(&newRecord).Error)
 		require.Equal(t, "https://schema.example/post.v2.json", newRecord.Schema)
 		require.True(t, newRecord.CreatedAt.Equal(newCreatedAt))
@@ -118,14 +118,14 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.False(t, applied)
 		require.NoError(t, tx.Rollback(ctx))
 
-		var keptRecordKey models.RecordKey
+		var keptRecordKey RecordKey
 		require.NoError(t, db.Where("uri = ?", key).Take(&keptRecordKey).Error)
 		require.Equal(t, "record-2-new", *keptRecordKey.RecordID)
-		var keptCommit models.CommitLog
+		var keptCommit CommitLog
 		require.NoError(t, db.Where("id = ?", "record-2-new").Take(&keptCommit).Error)
 		require.False(t, keptCommit.GcCandidate)
 		var newRecordCount int64
-		require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "record-2-new").Count(&newRecordCount).Error)
+		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "record-2-new").Count(&newRecordCount).Error)
 		require.EqualValues(t, 1, newRecordCount)
 	})
 
@@ -163,17 +163,17 @@ func TestRecordRepositoryWrites(t *testing.T) {
 					})
 				}
 
-				var recordKey models.RecordKey
+				var recordKey RecordKey
 				require.NoError(t, db.Where("uri = ?", key).Take(&recordKey).Error)
 				require.NotNil(t, recordKey.RecordID)
 				require.Equal(t, newID, *recordKey.RecordID)
 
-				var commit models.CommitLog
+				var commit CommitLog
 				require.NoError(t, db.Where("id = ?", oldID).Take(&commit).Error)
 				require.Equal(t, tc.forgets, commit.GcCandidate)
 
 				var oldRecordCount int64
-				require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", oldID).Count(&oldRecordCount).Error)
+				require.NoError(t, db.Model(&Record{}).Where("document_id = ?", oldID).Count(&oldRecordCount).Error)
 				if tc.forgets {
 					require.Zero(t, oldRecordCount)
 				} else {
@@ -204,12 +204,12 @@ func TestRecordRepositoryWrites(t *testing.T) {
 			})
 		}
 
-		var entity models.Entity
+		var entity Entity
 		require.NoError(t, db.Where("id = ?", "con1entity").Take(&entity).Error)
 		require.Equal(t, "entity-2-new", entity.DocumentID)
 		require.True(t, entity.CreatedAt.Equal(time.Date(2026, 1, 2, 3, 4, 6, 0, time.UTC)))
 
-		var oldCommit models.CommitLog
+		var oldCommit CommitLog
 		require.NoError(t, db.Where("id = ?", "entity-1-old").Take(&oldCommit).Error)
 		require.False(t, oldCommit.GcCandidate)
 
@@ -260,7 +260,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 			return err
 		})
 
-		var stored models.Record
+		var stored Record
 		require.NoError(t, db.Where("document_id = ?", "reference-record").Take(&stored).Error)
 		require.NotNil(t, stored.Redirect)
 		require.Equal(t, targetURI, *stored.Redirect)
@@ -288,7 +288,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		// the advertised ID must equal the BodyItem.ID() the body endpoint
 		// serves for the same member, or readers can't match them up
 		for keyURI, wantID := range map[string]string{key: key, refKey: refTarget} {
-			var recordKey models.RecordKey
+			var recordKey RecordKey
 			require.NoError(t, db.Where("uri = ?", keyURI).Take(&recordKey).Error)
 			require.NotNil(t, recordKey.RecordCreatedAt)
 			chunkID := recordKey.RecordCreatedAt.Unix() / 600
@@ -334,7 +334,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		})
 		require.True(t, inserted)
 
-		var association models.Association
+		var association Association
 		require.NoError(t, db.Where("document_id = ?", "association-record").Take(&association).Error)
 		require.Equal(t, "con1owner", association.Owner)
 		require.Equal(t, "con1author", association.Author)
@@ -361,7 +361,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.False(t, inserted)
 
 		var associationCount int64
-		require.NoError(t, db.Model(&models.Association{}).Where(`"unique" = ?`, associationUnique).Count(&associationCount).Error)
+		require.NoError(t, db.Model(&Association{}).Where(`"unique" = ?`, associationUnique).Count(&associationCount).Error)
 		require.EqualValues(t, 1, associationCount)
 
 		ackSchema := "https://schema.example/like.json"
@@ -376,9 +376,9 @@ func TestRecordRepositoryWrites(t *testing.T) {
 				Associate: &key,
 			})
 		}
-		ackState := func() models.Ack {
+		ackState := func() Ack {
 			t.Helper()
-			var ack models.Ack
+			var ack Ack
 			require.NoError(t, db.Where(`"from" = ? AND "to" = ? AND schema = ?`, "con1author", "con1owner", ackSchema).Take(&ack).Error)
 			return ack
 		}
@@ -473,9 +473,9 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.NoError(t, tx.Rollback(ctx))
 
 		var count int64
-		require.NoError(t, db.Model(&models.CommitLog{}).Where("id = ?", "rollback-record").Count(&count).Error)
+		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "rollback-record").Count(&count).Error)
 		require.Zero(t, count)
-		require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "rollback-record").Count(&count).Error)
+		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "rollback-record").Count(&count).Error)
 		require.Zero(t, count)
 	})
 
@@ -505,12 +505,12 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		})
 
 		var count int64
-		require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "delete-target").Count(&count).Error)
+		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "delete-target").Count(&count).Error)
 		require.Zero(t, count)
-		require.NoError(t, db.Model(&models.CommitLog{}).Where("id = ?", "delete-target").Count(&count).Error)
+		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "delete-target").Count(&count).Error)
 		require.EqualValues(t, 1, count)
 
-		var commit models.CommitLog
+		var commit CommitLog
 		require.NoError(t, db.Where("id = ?", "delete-commit").Take(&commit).Error)
 		require.Equal(t, deleteSD.Document, commit.Document)
 		requireCommitOwner(t, db, "delete-commit", "con1owner")
@@ -529,7 +529,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 			return nil
 		})
 
-		var commit models.CommitLog
+		var commit CommitLog
 		require.NoError(t, db.Where("id = ?", "gc-flag").Take(&commit).Error)
 		require.False(t, commit.GcCandidate)
 
@@ -561,7 +561,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.NoError(t, repo.CreateCommitLog(ctx, tx, "commit-methods", "192.0.2.1", "second", concrnt.Proof{Type: "ignored"}, "con1other"))
 		require.NoError(t, tx.Commit(ctx))
 
-		var commit models.CommitLog
+		var commit CommitLog
 		require.NoError(t, db.Where("id = ?", "commit-methods").Take(&commit).Error)
 		require.Equal(t, "127.0.0.1", commit.IP)
 		require.Equal(t, "first", commit.Document)
@@ -621,6 +621,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -717,25 +718,25 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 		// the subtree is gone: records and their key rows
 		var count int64
 		for i := range 3 {
-			require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
+			require.NoError(t, db.Model(&Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
 			require.Zero(t, count, "record %d must be deleted", i)
 		}
-		require.NoError(t, db.Model(&models.RecordKey{}).Where("uri IN ?", []string{base, base + "/a", base + "/a/b"}).Where("record_id IS NOT NULL").Count(&count).Error)
+		require.NoError(t, db.Model(&RecordKey{}).Where("uri IN ?", []string{base, base + "/a", base + "/a/b"}).Where("record_id IS NOT NULL").Count(&count).Error)
 		require.Zero(t, count)
 
 		// the association on the deleted child cascaded away
-		require.NoError(t, db.Model(&models.Association{}).Where("document_id = ?", "subtree-association").Count(&count).Error)
+		require.NoError(t, db.Model(&Association{}).Where("document_id = ?", "subtree-association").Count(&count).Error)
 		require.Zero(t, count)
 
 		// siblings and decoys survive
 		for i := 3; i < 5; i++ {
-			require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
+			require.NoError(t, db.Model(&Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
 			require.EqualValues(t, 1, count, "record %d must survive", i)
 		}
 
 		// commitlogs of the deleted records stay (delete never erases history)
 		for i := range 3 {
-			require.NoError(t, db.Model(&models.CommitLog{}).Where("id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
+			require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
 			require.EqualValues(t, 1, count, "commitlog %d must survive", i)
 		}
 	})
@@ -751,6 +752,7 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 func TestRecordQueryAuthorFilter(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -814,6 +816,7 @@ func TestRecordQueryAuthorFilter(t *testing.T) {
 func TestHierarchicalRecordPoliciesRootFirst(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -859,6 +862,7 @@ func TestHierarchicalRecordPoliciesRootFirst(t *testing.T) {
 func TestHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -910,6 +914,7 @@ func TestHierarchicalRecordPoliciesEmitsPolicylessDistributingLevel(t *testing.T
 func TestCreateRecordAppliesOverParentPlaceholder(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -936,13 +941,13 @@ func TestCreateRecordAppliesOverParentPlaceholder(t *testing.T) {
 	// committing the child materializes the parent as a placeholder
 	commit("placeholder-child", childKey, time.Date(2026, 6, 3, 0, 0, 0, 0, time.UTC))
 
-	var rk models.RecordKey
+	var rk RecordKey
 	require.NoError(t, db.Where("uri = ?", parentKey).Take(&rk).Error)
 	require.Nil(t, rk.RecordID, "the parent must exist as a placeholder")
 
 	commit("placeholder-parent", parentKey, time.Date(2026, 6, 3, 0, 0, 1, 0, time.UTC))
 
-	rk = models.RecordKey{}
+	rk = RecordKey{}
 	require.NoError(t, db.Where("uri = ?", parentKey).Take(&rk).Error)
 	require.NotNil(t, rk.RecordID)
 	require.Equal(t, "placeholder-parent", *rk.RecordID)
@@ -956,6 +961,7 @@ func TestCreateRecordAppliesOverParentPlaceholder(t *testing.T) {
 func TestCreateRecordFreshKeyConditionalUpsert(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -1023,7 +1029,7 @@ func TestCreateRecordFreshKeyConditionalUpsert(t *testing.T) {
 	require.NoError(t, res.err)
 	require.False(t, res.applied, "the older document must lose the fresh-key race")
 
-	var rk models.RecordKey
+	var rk RecordKey
 	require.NoError(t, db.Where("uri = ?", key).Take(&rk).Error)
 	require.NotNil(t, rk.RecordID)
 	require.Equal(t, newID, *rk.RecordID)
@@ -1063,7 +1069,7 @@ func (fakeRecordTx) Rollback(ctx context.Context) error {
 func requireCommitOwner(t *testing.T, db *gorm.DB, commitID string, owner string) {
 	t.Helper()
 
-	var commit models.CommitLog
+	var commit CommitLog
 	require.NoError(t, db.Where("id = ?", commitID).Take(&commit).Error)
 	require.Equal(t, owner, commit.Owner, "owner of commit %s", commitID)
 }
@@ -1088,6 +1094,7 @@ func repositorySignedDocument(t *testing.T, doc any) concrnt.SignedDocument {
 func TestGetAllCommitLogsByOwner(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -1134,6 +1141,7 @@ func TestGetAllCommitLogsByOwner(t *testing.T) {
 func TestRecordQueryByParentOrderByKey(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)

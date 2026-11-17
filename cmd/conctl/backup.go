@@ -16,7 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 )
 
 // commitlogBackupMeta is the "meta" of each commit-log backup line: what the
@@ -80,7 +80,7 @@ func (b *backupFile) writeJSON(v any) error {
 
 // writeCommitLog appends a commit_logs row as one concrnt.SignedDocumentWithMeta
 // line: the replayable document/proof plus meta {id, owner, ip, cdate}.
-func (b *backupFile) writeCommitLog(cl models.CommitLog) error {
+func (b *backupFile) writeCommitLog(cl pgrecord.CommitLog) error {
 	var proof concrnt.Proof
 	if cl.Proof != "" {
 		if err := json.Unmarshal([]byte(cl.Proof), &proof); err != nil {

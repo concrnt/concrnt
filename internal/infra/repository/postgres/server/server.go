@@ -12,27 +12,32 @@ import (
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 )
 
 var tracer = otel.Tracer("repository")
 
-type ServerRepository struct {
+type Repository struct {
 	config *domain.Config
 	db     *gorm.DB
 	client *client.Client
 }
 
-func NewServerRepository(config *domain.Config, db *gorm.DB, cl *client.Client) server.Repository {
-	return &ServerRepository{
+var _ server.Repository = (*Repository)(nil)
+
+func New(config *domain.Config, db *gorm.DB, cl *client.Client) *Repository {
+	return &Repository{
 		config: config,
 		db:     db,
 		client: cl,
 	}
 }
 
-func modelToDomainServer(m *models.Server) (*domain.Server, error) {
+func (r *Repository) Migrate() error {
+	return r.db.AutoMigrate(&Server{})
+}
+
+func modelToDomainServer(m *Server) (*domain.Server, error) {
 	var wkc concrnt.WellKnownConcrnt
 	if err := json.Unmarshal([]byte(m.WellKnown), &wkc); err != nil {
 		return nil, err
@@ -43,8 +48,8 @@ func modelToDomainServer(m *models.Server) (*domain.Server, error) {
 	}, nil
 }
 
-func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.Resolve")
+func (r *Repository) Resolve(ctx context.Context, identifier string, hint *string) (*domain.Server, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Server.Resolve")
 	defer span.End()
 
 	if concrnt.IsCSID(identifier) {
@@ -54,11 +59,11 @@ func (r *ServerRepository) Resolve(ctx context.Context, identifier string, hint 
 	}
 }
 
-func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByCSID")
+func (r *Repository) GetAndCacheByCSID(ctx context.Context, csid string, hint *string) (*domain.Server, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Server.GetAndCacheByCSID")
 	defer span.End()
 
-	var server models.Server
+	var server Server
 	err := r.db.WithContext(ctx).
 		Where("cs_id = ?", csid).
 		Take(&server).Error
@@ -82,7 +87,7 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 		return nil, err
 	}
 
-	newServer := models.Server{
+	newServer := Server{
 		ID:        wkc.Domain,
 		CSID:      wkc.CSID,
 		Layer:     wkc.Layer,
@@ -101,11 +106,11 @@ func (r *ServerRepository) GetAndCacheByCSID(ctx context.Context, csid string, h
 	return modelToDomainServer(&newServer)
 }
 
-func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.GetAndCacheByFQDN")
+func (r *Repository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Server.GetAndCacheByFQDN")
 	defer span.End()
 
-	var server models.Server
+	var server Server
 	err := r.db.WithContext(ctx).
 		Where("id = ?", fqdn).
 		Take(&server).Error
@@ -125,7 +130,7 @@ func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (
 		return nil, err
 	}
 
-	newServer := models.Server{
+	newServer := Server{
 		ID:        wkc.Domain,
 		CSID:      wkc.CSID,
 		Layer:     wkc.Layer,
@@ -144,11 +149,11 @@ func (r *ServerRepository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (
 	return modelToDomainServer(&newServer)
 }
 
-func (r *ServerRepository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {
-	ctx, span := tracer.Start(ctx, "ServerRepository.List")
+func (r *Repository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {
+	ctx, span := tracer.Start(ctx, "Repository.Server.List")
 	defer span.End()
 
-	servers, err := gorm.G[models.Server](r.db).Find(ctx)
+	servers, err := gorm.G[Server](r.db).Find(ctx)
 	if err != nil {
 		return nil, err
 	}

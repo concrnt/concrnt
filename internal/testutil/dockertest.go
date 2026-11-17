@@ -20,8 +20,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-
-	"github.com/concrnt/concrnt/internal/infra/database"
 )
 
 var (
@@ -148,8 +146,6 @@ func CreateDB() (*gorm.DB, func()) {
 	}); err != nil {
 		log.Fatalf("Could not connect to docker: %s", err)
 	}
-
-	database.MigratePostgres(db)
 
 	return db, cleanup
 }

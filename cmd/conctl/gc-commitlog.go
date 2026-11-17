@@ -10,8 +10,8 @@ import (
 
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/infra/objectstore"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 )
 
 var (
@@ -141,7 +141,7 @@ var gcCommitlogCmd = &cobra.Command{
 		var ids []string
 		cursor := ""
 		for {
-			var logs []models.CommitLog
+			var logs []pgrecord.CommitLog
 			q := op.DB.WithContext(ctx).
 				Where("gc_candidate AND id < ?", cutoff).
 				Order("id ASC").Limit(gcCommitlogBatchSize)

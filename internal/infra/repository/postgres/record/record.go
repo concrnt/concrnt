@@ -14,7 +14,6 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -46,7 +45,7 @@ func (r *Repository) CreateRecord(
 	// key, an equal or older one is a no-op. Deciding under the row lock
 	// closes the read-then-write race between concurrent commits, same as
 	// CreateEntity's conditional upsert.
-	var oldRecordKey models.RecordKey
+	var oldRecordKey RecordKey
 	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", key).
 		Take(&oldRecordKey).Error
@@ -58,7 +57,7 @@ func (r *Repository) CreateRecord(
 		return false, nil
 	}
 
-	record := models.Record{
+	record := Record{
 		DocumentID:    documentID,
 		Owner:         owner,
 		Author:        author,
@@ -90,7 +89,7 @@ func (r *Repository) CreateRecord(
 	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
 
 	// RecordKeyを作る
-	rk := models.RecordKey{
+	rk := RecordKey{
 		URI:             key,
 		ParentID:        pid,
 		RecordID:        &documentID,
@@ -118,13 +117,13 @@ func (r *Repository) CreateRecord(
 
 	// 古いRecordKeyが指していたCommitのGCフラグを立て、Recordは消す
 	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if err := db.Model(&models.CommitLog{}).
+		if err := db.Model(&CommitLog{}).
 			Where("id = ?", oldRecordKey.RecordID).
 			Update("gc_candidate", true).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
-		if err := db.Delete(&models.Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
+		if err := db.Delete(&Record{}, "document_id = ?", oldRecordKey.RecordID).Error; err != nil {
 			span.RecordError(err)
 			return false, err
 		}
@@ -149,7 +148,7 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var rk models.RecordKey
+		var rk RecordKey
 		err = r.db.WithContext(ctx).
 			Joins("JOIN records r ON r.document_id = record_keys.record_id").
 			Where("r.document_id = ?", parsed.CDID).
@@ -184,7 +183,7 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 
 	var entries []tuple
 	err = r.db.WithContext(ctx).
-		Model(&models.Record{}).
+		Model(&Record{}).
 		Select("rk.uri AS uri, records.policies AS policy, records.distributions AS distributions").
 		Joins("JOIN record_keys rk ON rk.record_id = records.document_id").
 		Where("rk.uri IN ?", hierarchy).
@@ -248,7 +247,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 
 	switch parsed.Scheme {
 	case "cckv":
-		var recordKey models.RecordKey
+		var recordKey RecordKey
 		err = r.db.WithContext(ctx).
 			Preload("Record").
 			Preload("Record.Document").
@@ -285,7 +284,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var commitLog models.CommitLog
+		var commitLog CommitLog
 		err = r.db.WithContext(ctx).
 			Where("id = ?", parsed.CDID).
 			Take(&commitLog).Error
@@ -295,7 +294,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 		}
 
 		var cckv *string = nil
-		var recordKey models.RecordKey
+		var recordKey RecordKey
 		err = r.db.WithContext(ctx).
 			Where("record_id = ?", commitLog.ID).
 			Take(&recordKey).Error
@@ -333,8 +332,8 @@ func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.Reposito
 		return err
 	}
 
-	q := db.Model(&models.RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
-	return db.Where("document_id = (?)", q).Delete(&models.Record{}).Error
+	q := db.Model(&RecordKey{}).Select("record_id").Where("uri = ?", targetURI)
+	return db.Where("document_id = (?)", q).Delete(&Record{}).Error
 }
 
 func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.RepositoryTx, documentID string) error {
@@ -347,14 +346,14 @@ func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.R
 		return err
 	}
 
-	return db.Delete(&models.Record{}, "document_id = ?", documentID).Error
+	return db.Delete(&Record{}, "document_id = ?", documentID).Error
 }
 
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
 
-	var recordKey models.RecordKey
+	var recordKey RecordKey
 	err := r.db.WithContext(ctx).
 		Preload("Record").
 		Where("uri = ?", keyURI).
@@ -369,7 +368,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	var parent models.RecordKey
+	var parent RecordKey
 	err = r.db.WithContext(ctx).
 		Where("id = ?", *recordKey.ParentID).
 		Take(&parent).Error
@@ -389,7 +388,7 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 	return parent.URI, itemID, nil
 }
 
-func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getOrCreateParentRecordKey")
 	defer span.End()
 
@@ -423,7 +422,7 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 				pid = &parentID.ID
 			}
 
-			newRecordKey := models.RecordKey{
+			newRecordKey := RecordKey{
 				URI:      parentURI,
 				RecordID: nil,
 				ParentID: pid,
@@ -454,11 +453,11 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	return parentRK, nil
 }
 
-func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*models.RecordKey, error) {
+func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
 	defer span.End()
 
-	var recordKey models.RecordKey
+	var recordKey RecordKey
 	err := db.WithContext(ctx).
 		Where("uri = ?", uri).
 		Take(&recordKey).Error
@@ -482,7 +481,7 @@ func (r *Repository) GetDistributions(ctx context.Context, uri string) ([]string
 
 	switch parsed.Scheme {
 	case "cckv":
-		var recordKey models.RecordKey
+		var recordKey RecordKey
 		err = r.db.WithContext(ctx).Preload("Record").
 			Preload("Record.Document").
 			Where("uri = ?", uri).
@@ -496,7 +495,7 @@ func (r *Repository) GetDistributions(ctx context.Context, uri string) ([]string
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var record models.Record
+		var record Record
 		err = r.db.WithContext(ctx).
 			Where("document_id = ?", parsed.CDID).
 			Take(&record).Error

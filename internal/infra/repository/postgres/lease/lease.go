@@ -17,7 +17,7 @@ type Lease struct {
 
 var _ lease.Lease = (*Lease)(nil)
 
-func NewLease(db *gorm.DB) *Lease {
+func New(db *gorm.DB) *Lease {
 	return &Lease{db: db}
 }
 

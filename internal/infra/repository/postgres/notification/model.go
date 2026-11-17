@@ -1,4 +1,4 @@
-package models
+package notification
 
 import (
 	"github.com/lib/pq"

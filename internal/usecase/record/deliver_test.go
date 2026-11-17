@@ -65,7 +65,7 @@ func (s *remoteCommitServer) committed() []concrnt.SignedDocument {
 // newDeliverUsecase wires a usecase with a real client (no fakes possible:
 // the usecase holds *client.Client) whose remote.example is remapped to the
 // given httptest server, if any.
-func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, residence EntityRepository, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
+func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, entities entityLookup, signal SignalService, remote *httptest.Server) (*Usecase, *recordingDeliveryQueue) {
 	t.Helper()
 	cl := client.New(cfg.FQDN)
 	if remote != nil {
@@ -73,8 +73,8 @@ func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, reside
 	}
 	queue := &recordingDeliveryQueue{}
 	uc := New(
-		repo,
-		residence,
+		withEntities(repo, entities),
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		cl,
@@ -93,7 +93,7 @@ func newDeliverUsecase(t *testing.T, cfg *domain.Config, repo Repository, reside
 func TestNewRegistersDeliveryHandler(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	signal := &recordingSignalService{}
-	_, queue := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), signal, nil)
+	_, queue := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), signal, nil)
 
 	handler, ok := queue.handlers[JobTypeRecordDelivery]
 	if !ok {
@@ -128,7 +128,7 @@ func TestDeliverLocalPublish(t *testing.T) {
 	remote := &remoteCommitServer{}
 	srv := httptest.NewServer(remote.handler())
 	defer srv.Close()
-	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), signal, srv)
+	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), signal, srv)
 
 	job := DeliveryJob{
 		ResolveURI: "cckv://example.com/timelines/home",
@@ -155,7 +155,7 @@ func TestDeliverLocalCommit(t *testing.T) {
 	from := newAckParty(t, cfg.FQDN)
 	to := newAckParty(t, "remote.example.net")
 	repo := &recordingRecordRepo{}
-	uc, _ := newDeliverUsecase(t, cfg, repo, residenceOf(from, to), nopSignalService{}, nil)
+	uc, _ := newDeliverUsecase(t, cfg, repo, entitiesOf(from, to), nopSignalService{}, nil)
 
 	sd := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 	job := DeliveryJob{
@@ -184,7 +184,7 @@ func TestDeliverRemoteCommit(t *testing.T) {
 	srv := httptest.NewServer(remote.handler())
 	defer srv.Close()
 	repo := &recordingRecordRepo{}
-	uc, _ := newDeliverUsecase(t, cfg, repo, residenceOf(), signal, srv)
+	uc, _ := newDeliverUsecase(t, cfg, repo, entitiesOf(), signal, srv)
 
 	payload := concrnt.SignedDocument{Document: `{"kind":"record"}`}
 	job := DeliveryJob{
@@ -211,7 +211,7 @@ func TestDeliverRemoteNone(t *testing.T) {
 	remote := &remoteCommitServer{}
 	srv := httptest.NewServer(remote.handler())
 	defer srv.Close()
-	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), signal, srv)
+	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), signal, srv)
 
 	job := DeliveryJob{
 		ResolveURI: "cckv://" + deliverRemoteHost + "/timelines/home",
@@ -235,7 +235,7 @@ func TestDeliverPreResolvedHost(t *testing.T) {
 	remote := &remoteCommitServer{}
 	srv := httptest.NewServer(remote.handler())
 	defer srv.Close()
-	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), nopSignalService{}, srv)
+	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), nopSignalService{}, srv)
 
 	payload := concrnt.SignedDocument{Document: `{"kind":"record"}`}
 	job := DeliveryJob{
@@ -259,7 +259,7 @@ func TestDeliverResolveError(t *testing.T) {
 	remote := &remoteCommitServer{}
 	srv := httptest.NewServer(remote.handler())
 	defer srv.Close()
-	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), signal, srv)
+	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), signal, srv)
 
 	job := DeliveryJob{
 		ResolveURI: "not a cc uri",
@@ -278,7 +278,7 @@ func TestDeliverResolveError(t *testing.T) {
 func TestDeliverLocalPublishMissingEvent(t *testing.T) {
 	cfg := &domain.Config{FQDN: "example.com"}
 	signal := &recordingSignalService{}
-	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, residenceOf(), signal, nil)
+	uc, _ := newDeliverUsecase(t, cfg, &recordingRecordRepo{}, entitiesOf(), signal, nil)
 
 	job := DeliveryJob{
 		ResolveURI: "cckv://example.com/timelines/home",

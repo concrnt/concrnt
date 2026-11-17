@@ -111,8 +111,9 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `server`, `notification`, `subscription`, `chunkline`, `abuse`), each exposing
   `Usecase`/`New` plus the repository/gateway interfaces only it needs; infra packages
   satisfy these interfaces structurally. The parent package holds only the ports shared
-  across concerns (`JobQueue`, `KVS`). `record` is the hub: `residence` builds on it (its
-  `Repository` embeds `record.EntityRepository`), and `record` depends on `server` (remote
+  across concerns (`JobQueue`, `KVS`, `EntityMetaRepository`). `record` is the hub:
+  `residence` builds on it (it takes `record.Repository` for entity lookups and
+  `EntityMetaRepository` for registration meta), and `record` depends on `server` (remote
   server resolution) and `chunkline` (removed-item advertisements). Inside `record`,
   `commit.go` is the write entry point (`Commit` dispatches on document kind) and each
   target object has its own file (`entity.go`, `record.go`, `association.go`, `ack.go`,
@@ -121,7 +122,8 @@ present/rest (Echo handlers) -> usecase (business logic, interfaces for deps) ->
   `commitlog.go` dump/import, and `usecase.go` the ports and constructor.
 - **`internal/infra`** — adapters behind the usecase interfaces: `repository/postgres`
   (GORM; one subpackage per independently replaceable unit — `record`, `entitymeta`,
-  `server`, `notification`, `abuse`, `state`, `lease`), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
+  `server`, `notification`, `abuse`, `state`, `lease` — each owning its models in
+  `model.go` and its schema via `Migrate()`), `gateway` (outbound HTTP to other servers, e.g. chunkline federation), `pubsub`
   (Redis realtime pub/sub), `kvs` and `jobqueue` (Redis), `push` (Web Push), `cluster`
   (leader election / peer discovery via the elector HTTP protocol), `database` and
   `config` (connections and YAML loading).

@@ -1,4 +1,4 @@
-package models
+package record
 
 import (
 	"time"
@@ -13,13 +13,13 @@ import (
 //   - idx_commit_logs_owner_c_date (owner, c_date): owner-scoped dump and
 //     replication scans; used by pgrecord.Repository.GetAllCommitLogs,
 //     pgrecord.Repository.QueryCommitLogs (owner filter) and
-//     pgentitymeta.Repository.MarkCommitLogsGcCandidateByOwner.
+//     pgrecord.Repository.MarkCommitLogsGcCandidateByOwner.
 //   - idx_commit_logs_c_date_id (c_date, id): replication cursor scan without an
 //     owner filter, ordered by receipt time with id as tie-break; used by
 //     pgrecord.Repository.QueryCommitLogs.
 //   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
 //     scans; set by pgrecord.Repository.CreateRecord when replacing a key
-//     and by pgentitymeta.Repository.MarkCommitLogsGcCandidateByOwner on
+//     and by pgrecord.Repository.MarkCommitLogsGcCandidateByOwner on
 //     unregister.
 type CommitLog struct {
 	ID          string    `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
@@ -179,27 +179,11 @@ type Association struct {
 }
 
 // Indexes:
-//   - PRIMARY KEY (id): FQDN lookup and upsert target; used by
-//     pgserver.ServerRepository.GetAndCacheByFQDN and cache writes.
-//   - idx_servers_cs_id (cs_id): CSID cache lookup; used by
-//     pgserver.ServerRepository.GetAndCacheByCSID.
-type Server struct {
-	ID          string    `json:"fqdn" gorm:"type:text;primaryKey"` // FQDN
-	CSID        string    `json:"csid" gorm:"type:text;index:idx_servers_cs_id"`
-	Tag         string    `json:"tag" gorm:"type:text"`
-	Layer       string    `json:"layer" gorm:"type:text"`
-	WellKnown   string    `json:"wellKnown" gorm:"type:jsonb"`
-	CDate       time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
-	MDate       time.Time `json:"mdate" gorm:"autoUpdateTime"`
-	LastScraped time.Time `json:"lastScraped" gorm:"type:timestamp with time zone"`
-}
-
-// Indexes:
 //   - PRIMARY KEY (id): ccid lookup and upsert target; used by
 //     pgrecord.Repository.CreateEntity and
-//     pgentitymeta.Repository.GetEntityByCCID.
+//     pgrecord.Repository.GetEntityByCCID.
 //   - idx_entities_alias (alias): alias lookup; used by
-//     pgentitymeta.Repository.GetEntityByAlias.
+//     pgrecord.Repository.GetEntityByAlias.
 type Entity struct {
 	ID     string  `json:"ccid" gorm:"type:text;primaryKey"`
 	Alias  *string `json:"alias,omitempty" gorm:"type:text;index"`
@@ -213,36 +197,6 @@ type Entity struct {
 	// `conctl op repair-single-owner`, so any real document replaces them.
 	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;default:'epoch'"`
 
-	CDate time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
-	MDate time.Time `json:"mdate" gorm:"autoUpdateTime"`
-}
-
-// Indexes:
-//   - PRIMARY KEY (id): entity metadata lookup and upsert target; used by
-//     pgentitymeta.Repository.SaveMeta and GetMeta.
-type EntityMeta struct {
-	ID      string    `json:"ccid" gorm:"type:text;primaryKey"`
-	Inviter *string   `json:"inviter" gorm:"type:text"`
-	Info    string    `json:"info" gorm:"type:jsonb;default:'null'"`
-	CDate   time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
-	MDate   time.Time `json:"mdate" gorm:"autoUpdateTime"`
-}
-
-// Indexes:
-//   - PRIMARY KEY (id): report identity. Abuse reports are currently append-only;
-//     pgabuse.AbuseRepository.CreateAbuseReport does not issue read queries.
-type AbuseReport struct {
-	ID        int64     `json:"id" gorm:"primaryKey;autoIncrement"`
-	IP        string    `json:"ip" gorm:"type:text"`
-	Reporter  string    `json:"reporter" gorm:"type:text"`
-	TargetURI string    `json:"target" gorm:"type:text"`
-	Body      string    `json:"body" gorm:"type:text"`
-	CDate     time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
-}
-
-type State struct {
-	Name  string    `json:"name" gorm:"type:text;primaryKey"`
-	Value string    `json:"value" gorm:"type:text"`
 	CDate time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
 	MDate time.Time `json:"mdate" gorm:"autoUpdateTime"`
 }

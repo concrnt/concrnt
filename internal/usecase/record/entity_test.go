@@ -48,10 +48,10 @@ func remoteParty(t *testing.T, storedAt time.Time) ackParty {
 	return party
 }
 
-func newReferenceCommitUsecase(cfg *domain.Config, repo Repository, residence EntityRepository) *Usecase {
+func newReferenceCommitUsecase(cfg *domain.Config, repo Repository, entities entityLookup) *Usecase {
 	return New(
-		repo,
-		residence,
+		withEntities(repo, entities),
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		nil,
@@ -70,7 +70,7 @@ func TestCommitAppliesNewerReferencedEntity(t *testing.T) {
 	storedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	author := remoteParty(t, storedAt)
 	repo := &recordingRecordRepo{storedCreatedAt: storedAt}
-	uc := newReferenceCommitUsecase(cfg, repo, residenceOf(author))
+	uc := newReferenceCommitUsecase(cfg, repo, entitiesOf(author))
 
 	newer := signedEntityDoc(t, author.ccid, author.priv, storedAt.Add(30*time.Minute))
 	sd := signedRecord(t, author.ccid, author.priv, time.Now())
@@ -111,7 +111,7 @@ func TestCommitIgnoresOlderOrEqualReferencedEntity(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			author := remoteParty(t, storedAt)
 			repo := &recordingRecordRepo{storedCreatedAt: storedAt}
-			uc := newReferenceCommitUsecase(cfg, repo, residenceOf(author))
+			uc := newReferenceCommitUsecase(cfg, repo, entitiesOf(author))
 
 			sd := signedRecord(t, author.ccid, author.priv, time.Now())
 			sd.References = map[string]concrnt.SignedDocument{
@@ -145,7 +145,7 @@ func TestCommitIgnoresForeignReferencedEntity(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			repo := &recordingRecordRepo{storedCreatedAt: storedAt}
-			uc := newReferenceCommitUsecase(cfg, repo, residenceOf(author, other))
+			uc := newReferenceCommitUsecase(cfg, repo, entitiesOf(author, other))
 
 			sd := signedRecord(t, author.ccid, author.priv, time.Now())
 			sd.References = map[string]concrnt.SignedDocument{author.entity.CCKV(): ref}
@@ -170,7 +170,7 @@ func TestCommitReferencedEntityFailureDoesNotFailCommit(t *testing.T) {
 	storedAt := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	author := remoteParty(t, storedAt)
 	repo := &recordingRecordRepo{storedCreatedAt: storedAt}
-	uc := newReferenceCommitUsecase(cfg, repo, residenceOf(author))
+	uc := newReferenceCommitUsecase(cfg, repo, entitiesOf(author))
 
 	forged := signedEntityDoc(t, author.ccid, author.priv, storedAt.Add(time.Minute))
 	forged.Document = strings.Replace(forged.Document, remoteEntityHost, "evil.example.net", 1)
@@ -198,7 +198,7 @@ func TestCommitAckAppliesTargetReferencedEntity(t *testing.T) {
 	to := remoteParty(t, storedAt)
 	repo := &recordingRecordRepo{storedCreatedAt: storedAt}
 	delivery := &recordingDeliveryQueue{}
-	uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+	uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 	newer := signedEntityDoc(t, to.ccid, to.priv, storedAt.Add(time.Minute))
 	sd := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
@@ -227,7 +227,7 @@ func TestAckedDeliveryCarriesAckerEntity(t *testing.T) {
 	to := newAckParty(t, remoteEntityHost)
 	repo := &recordingRecordRepo{}
 	delivery := &recordingDeliveryQueue{}
-	uc := newAckUsecase(cfg, repo, residenceOf(from, to), delivery)
+	uc := newAckUsecase(cfg, repo, entitiesOf(from, to), delivery)
 
 	sd := signedAck(t, "ack", from, to, time.Now().Add(-time.Minute))
 	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
@@ -279,7 +279,7 @@ func TestCommitEntityInvalidatesResourceCache(t *testing.T) {
 	cl.AddHostRemapping(remoteEntityHost, srv.URL)
 
 	repo := &recordingRecordRepo{}
-	uc := New(repo, stubResidenceRepo{}, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, nil)
+	uc := New(withEntities(repo, notFoundEntities{}), nil, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, nil)
 
 	fetch := func() {
 		t.Helper()
@@ -368,7 +368,7 @@ func newHintRecheckFixture(t *testing.T, serve func(w http.ResponseWriter, ccid 
 
 	repo := &recordingRecordRepo{storedCreatedAt: time.Now().Add(-2 * time.Hour)}
 	kvs := &stubKVS{}
-	uc := New(repo, fixedResidenceRepo{entity: stored}, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, kvs)
+	uc := New(withEntities(repo, fixedEntity{entity: stored}), nil, newTestServerUsecase(cfg), cfg, cl, nopSignalService{}, nopPolicyService{}, nil, kvs)
 	return hintRecheckFixture{uc: uc, repo: repo, kvs: kvs, resolves: resolves, ccid: ccid, priv: priv}
 }
 

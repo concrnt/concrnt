@@ -13,8 +13,10 @@ import (
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/infra/objectstore"
+	pgentitymeta "github.com/concrnt/concrnt/internal/infra/repository/postgres/entitymeta"
+	pgnotification "github.com/concrnt/concrnt/internal/infra/repository/postgres/notification"
+	pgrecord "github.com/concrnt/concrnt/internal/infra/repository/postgres/record"
 )
 
 var (
@@ -143,7 +145,7 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 
 	// What the server knows about this user, for the operator to confirm the
 	// target before anything happens.
-	var entity models.Entity
+	var entity pgrecord.Entity
 	switch err := db.WithContext(ctx).Where("id = ?", ccid).Take(&entity).Error; {
 	case err == nil:
 		alias := ""
@@ -156,16 +158,16 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 	default:
 		return stats, fmt.Errorf("failed to query entity: %w", err)
 	}
-	var metas []models.EntityMeta
+	var metas []pgentitymeta.EntityMeta
 	if err := db.WithContext(ctx).Where("id = ?", ccid).Find(&metas).Error; err != nil {
 		return stats, fmt.Errorf("failed to query entity meta: %w", err)
 	}
-	var subscriptions []models.Subscription
+	var subscriptions []pgnotification.Subscription
 	if err := db.WithContext(ctx).Where("owner = ?", ccid).Find(&subscriptions).Error; err != nil {
 		return stats, fmt.Errorf("failed to query subscriptions: %w", err)
 	}
 	var commits int64
-	if err := db.WithContext(ctx).Model(&models.CommitLog{}).Where("owner = ?", ccid).Count(&commits).Error; err != nil {
+	if err := db.WithContext(ctx).Model(&pgrecord.CommitLog{}).Where("owner = ?", ccid).Count(&commits).Error; err != nil {
 		return stats, fmt.Errorf("failed to count commit logs: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "registered: %t, commit logs: %d, subscriptions: %d\n", len(metas) > 0, commits, len(subscriptions))
@@ -222,7 +224,7 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		var ids []string
 		cursor := ""
 		for {
-			var logs []models.CommitLog
+			var logs []pgrecord.CommitLog
 			q := db.WithContext(ctx).
 				Where("owner = ?", ccid).
 				Order("id ASC").Limit(deleteUserBatchSize)
@@ -303,13 +305,13 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		}
 	}
 
-	res := db.WithContext(ctx).Where("owner = ?", ccid).Delete(&models.Subscription{})
+	res := db.WithContext(ctx).Where("owner = ?", ccid).Delete(&pgnotification.Subscription{})
 	if res.Error != nil {
 		return stats, fmt.Errorf("failed to delete subscriptions: %w", res.Error)
 	}
 	stats.Subscriptions = res.RowsAffected
 
-	res = db.WithContext(ctx).Where("id = ?", ccid).Delete(&models.EntityMeta{})
+	res = db.WithContext(ctx).Where("id = ?", ccid).Delete(&pgentitymeta.EntityMeta{})
 	if res.Error != nil {
 		return stats, fmt.Errorf("failed to delete entity meta: %w", res.Error)
 	}

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/stretchr/testify/require"
@@ -16,6 +15,7 @@ import (
 func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	recordRepo := New(db)
@@ -30,7 +30,7 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 	createChunklineRecord(t, ctx, recordRepo, "record-11", parentURI+"/record-11", createdAt11)
 	createChunklineRecord(t, ctx, recordRepo, "record-12", parentURI+"/record-12", createdAt12)
 
-	var parent models.RecordKey
+	var parent RecordKey
 	require.NoError(t, db.Where("uri = ?", parentURI).Take(&parent).Error)
 	require.Nil(t, parent.RecordCreatedAt)
 
@@ -58,6 +58,7 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	recordRepo := New(db)
@@ -79,7 +80,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 	// window start. The window-coverage guard must ignore this diverged
 	// column, or the oldest record in the window gets dropped.
 	backdated := time.Unix(18*600, 0).UTC()
-	require.NoError(t, db.Model(&models.Record{}).Where("document_id = ?", "div-record-01").Update("created_at", backdated).Error)
+	require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "div-record-01").Update("created_at", backdated).Error)
 
 	body, err := chunklineRepo.LoadLocalBody(ctx, parentURI, 20)
 	require.NoError(t, err)
@@ -97,6 +98,7 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 func TestChunklineChunkBoundaryIsHalfOpen(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	recordRepo := New(db)
@@ -125,6 +127,7 @@ func TestChunklineChunkBoundaryIsHalfOpen(t *testing.T) {
 func TestChunklineManifestEmptyFeedHasNullFirstChunk(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	recordRepo := New(db)

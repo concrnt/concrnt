@@ -223,8 +223,8 @@ func signedDelete(t *testing.T, ccid, privKeyHex, target string) concrnt.SignedD
 // ResolveResourceHost resolves it locally without any network.
 func newRangeDeleteUsecase(ccid string, cfg *domain.Config, repo Repository, pol PolicyService, delivery usecase.JobQueue, kvs usecase.KVS) *Usecase {
 	return New(
-		repo,
-		fixedResidenceRepo{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}},
+		withEntities(repo, fixedEntity{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}),
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),
@@ -484,8 +484,8 @@ func TestDeleteRecordRangeRemoteMatchesReferences(t *testing.T) {
 		dest + "/" + refSegment(base+"/a"): referenceRecord(t, dest+"/"+refSegment(base+"/a"), base+"/a"),
 	}}
 	uc := New(
-		repo,
-		fixedResidenceRepo{entity: &requester},
+		withEntities(repo, fixedEntity{entity: &requester}),
+		nil,
 		newTestServerUsecase(cfg),
 		cfg,
 		client.New(cfg.FQDN),

@@ -8,6 +8,8 @@ import (
 
 	"github.com/concrnt/concrnt/impl/interop"
 	"github.com/concrnt/concrnt/internal/domain"
+	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/record"
 )
 
 // encodeMetaInfo turns the client-supplied registration meta (any JSON value,
@@ -45,22 +47,22 @@ func TestEncodeMetaInfo(t *testing.T) {
 	})
 }
 
-// registrationResidenceRepo serves a fixed meta (or an error) and records
-// UpdateMetaInfo calls without touching inviter.
-type registrationResidenceRepo struct {
-	Repository
+// registrationMetaRepo serves a fixed meta (or an error) and records
+// Update calls without touching inviter.
+type registrationMetaRepo struct {
+	usecase.EntityMetaRepository
 	meta    *domain.EntityMeta
 	metaErr error
 }
 
-func (r *registrationResidenceRepo) GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
+func (r *registrationMetaRepo) Get(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
 	if r.metaErr != nil {
 		return nil, r.metaErr
 	}
 	return r.meta, nil
 }
 
-func (r *registrationResidenceRepo) UpdateMetaInfo(ctx context.Context, ccid string, info string) error {
+func (r *registrationMetaRepo) Update(ctx context.Context, ccid string, info string) error {
 	if r.metaErr != nil {
 		return r.metaErr
 	}
@@ -78,7 +80,7 @@ func TestRegistrationMeta(t *testing.T) {
 	authedCtx := context.WithValue(context.Background(), interop.RequesterCtxKey, domain.Entity{ID: ccid})
 
 	t.Run("unauthenticated get rejected", func(t *testing.T) {
-		uc := New(&registrationResidenceRepo{}, nil, cfg)
+		uc := New(nil, &registrationMetaRepo{}, nil, cfg)
 		_, err := uc.GetRegistration(context.Background())
 		if err == nil || !errors.Is(err, domain.ErrPermissionDenied) {
 			t.Fatalf("expected permission error, got %v", err)
@@ -86,19 +88,19 @@ func TestRegistrationMeta(t *testing.T) {
 	})
 
 	t.Run("unauthenticated update rejected", func(t *testing.T) {
-		repo := &registrationResidenceRepo{meta: &domain.EntityMeta{ID: ccid, Info: "null"}}
-		uc := New(repo, nil, cfg)
+		repo := &registrationMetaRepo{meta: &domain.EntityMeta{ID: ccid, Info: "null"}}
+		uc := New(nil, repo, nil, cfg)
 		err := uc.UpdateRegistration(context.Background(), map[string]any{"email": "a@example.com"})
 		if err == nil || !errors.Is(err, domain.ErrPermissionDenied) {
 			t.Fatalf("expected permission error, got %v", err)
 		}
 		if repo.meta.Info != "null" {
-			t.Fatal("UpdateMetaInfo should not be called")
+			t.Fatal("Update should not be called")
 		}
 	})
 
 	t.Run("service account (non-entity requester) rejected", func(t *testing.T) {
-		uc := New(&registrationResidenceRepo{}, nil, cfg)
+		uc := New(nil, &registrationMetaRepo{}, nil, cfg)
 		saCtx := context.WithValue(context.Background(), interop.RequesterCtxKey, "con1sssssssssssssssssssssssssssssssssssssss")
 		_, err := uc.GetRegistration(saCtx)
 		if err == nil || !errors.Is(err, domain.ErrPermissionDenied) {
@@ -107,8 +109,8 @@ func TestRegistrationMeta(t *testing.T) {
 	})
 
 	t.Run("unregistered requester gets not found", func(t *testing.T) {
-		repo := &registrationResidenceRepo{metaErr: domain.NotFoundError{Resource: "entity meta"}}
-		uc := New(repo, nil, cfg)
+		repo := &registrationMetaRepo{metaErr: domain.NotFoundError{Resource: "entity meta"}}
+		uc := New(nil, repo, nil, cfg)
 		_, err := uc.GetRegistration(authedCtx)
 		if err == nil || !errors.Is(err, domain.ErrNotFound) {
 			t.Fatalf("expected not found, got %v", err)
@@ -135,8 +137,8 @@ func TestRegistrationMeta(t *testing.T) {
 	})
 
 	t.Run("get returns own meta", func(t *testing.T) {
-		repo := &registrationResidenceRepo{meta: &domain.EntityMeta{ID: ccid, Inviter: &inviter, Info: `{"email":"a@example.com"}`}}
-		uc := New(repo, nil, cfg)
+		repo := &registrationMetaRepo{meta: &domain.EntityMeta{ID: ccid, Inviter: &inviter, Info: `{"email":"a@example.com"}`}}
+		uc := New(nil, repo, nil, cfg)
 		meta, err := uc.GetRegistration(authedCtx)
 		if err != nil {
 			t.Fatalf("GetRegistration returned error: %v", err)
@@ -147,8 +149,8 @@ func TestRegistrationMeta(t *testing.T) {
 	})
 
 	t.Run("update replaces info and keeps inviter", func(t *testing.T) {
-		repo := &registrationResidenceRepo{meta: &domain.EntityMeta{ID: ccid, Inviter: &inviter, Info: `{"email":"a@example.com"}`}}
-		uc := New(repo, nil, cfg)
+		repo := &registrationMetaRepo{meta: &domain.EntityMeta{ID: ccid, Inviter: &inviter, Info: `{"email":"a@example.com"}`}}
+		uc := New(nil, repo, nil, cfg)
 		if err := uc.UpdateRegistration(authedCtx, map[string]any{"email": "b@example.com"}); err != nil {
 			t.Fatalf("UpdateRegistration returned error: %v", err)
 		}
@@ -161,16 +163,17 @@ func TestRegistrationMeta(t *testing.T) {
 	})
 }
 
-// unregisterResidenceRepo records the order of gc-flag and meta-delete calls
-// and can fail either one.
-type unregisterResidenceRepo struct {
-	Repository
+// unregisterRepo records the order of gc-flag (record) and meta-delete
+// (entity meta) calls and can fail either one; it is passed as both repos.
+type unregisterRepo struct {
+	record.Repository
+	usecase.EntityMetaRepository
 	calls     []string
 	markErr   error
 	deleteErr error
 }
 
-func (r *unregisterResidenceRepo) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
+func (r *unregisterRepo) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
 	if r.markErr != nil {
 		return r.markErr
 	}
@@ -178,7 +181,7 @@ func (r *unregisterResidenceRepo) MarkCommitLogsGcCandidateByOwner(ctx context.C
 	return nil
 }
 
-func (r *unregisterResidenceRepo) DeleteMeta(ctx context.Context, ccid string) error {
+func (r *unregisterRepo) Delete(ctx context.Context, ccid string) error {
 	if r.deleteErr != nil {
 		return r.deleteErr
 	}
@@ -196,8 +199,8 @@ func TestUnregister(t *testing.T) {
 	authedCtx := context.WithValue(context.Background(), interop.RequesterCtxKey, domain.Entity{ID: ccid})
 
 	t.Run("unauthenticated rejected", func(t *testing.T) {
-		repo := &unregisterResidenceRepo{}
-		uc := New(repo, nil, cfg)
+		repo := &unregisterRepo{}
+		uc := New(repo, repo, nil, cfg)
 		err := uc.Unregister(context.Background())
 		if err == nil || !errors.Is(err, domain.ErrPermissionDenied) {
 			t.Fatalf("expected permission error, got %v", err)
@@ -208,8 +211,8 @@ func TestUnregister(t *testing.T) {
 	})
 
 	t.Run("service account (non-entity requester) rejected", func(t *testing.T) {
-		repo := &unregisterResidenceRepo{}
-		uc := New(repo, nil, cfg)
+		repo := &unregisterRepo{}
+		uc := New(repo, repo, nil, cfg)
 		saCtx := context.WithValue(context.Background(), interop.RequesterCtxKey, "con1sssssssssssssssssssssssssssssssssssssss")
 		err := uc.Unregister(saCtx)
 		if err == nil || !errors.Is(err, domain.ErrPermissionDenied) {
@@ -221,8 +224,8 @@ func TestUnregister(t *testing.T) {
 	})
 
 	t.Run("resident account is deleted, gc flag first", func(t *testing.T) {
-		repo := &unregisterResidenceRepo{}
-		uc := New(repo, nil, cfg)
+		repo := &unregisterRepo{}
+		uc := New(repo, repo, nil, cfg)
 		if err := uc.Unregister(authedCtx); err != nil {
 			t.Fatalf("Unregister returned error: %v", err)
 		}
@@ -234,19 +237,19 @@ func TestUnregister(t *testing.T) {
 	})
 
 	t.Run("gc mark failure propagates and keeps meta", func(t *testing.T) {
-		repo := &unregisterResidenceRepo{markErr: errors.New("db down")}
-		uc := New(repo, nil, cfg)
+		repo := &unregisterRepo{markErr: errors.New("db down")}
+		uc := New(repo, repo, nil, cfg)
 		if err := uc.Unregister(authedCtx); err == nil {
 			t.Fatal("expected error, got nil")
 		}
 		if len(repo.calls) != 0 {
-			t.Fatalf("DeleteMeta should not be called on gc-mark failure, got %v", repo.calls)
+			t.Fatalf("meta Delete should not be called on gc-mark failure, got %v", repo.calls)
 		}
 	})
 
 	t.Run("delete meta failure propagates", func(t *testing.T) {
-		repo := &unregisterResidenceRepo{deleteErr: errors.New("db down")}
-		uc := New(repo, nil, cfg)
+		repo := &unregisterRepo{deleteErr: errors.New("db down")}
+		uc := New(repo, repo, nil, cfg)
 		if err := uc.Unregister(authedCtx); err == nil {
 			t.Fatal("expected error, got nil")
 		}

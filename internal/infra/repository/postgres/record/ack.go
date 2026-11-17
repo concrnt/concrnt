@@ -10,7 +10,6 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -23,7 +22,7 @@ func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, d
 		return false, err
 	}
 
-	ack := models.Ack{
+	ack := Ack{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -69,7 +68,7 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 		return false, err
 	}
 
-	ack := models.Acked{
+	ack := Acked{
 		From:       from,
 		To:         to,
 		Schema:     schema,
@@ -110,9 +109,9 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckRecords")
 	defer span.End()
 
-	var acks []models.Ack
+	var acks []Ack
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
+		Model(&Ack{}).
 		Preload("Document").
 		Where("acks.from = ?", from).
 		Where("acks.valid = ?", true)
@@ -172,9 +171,9 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckedRecords")
 	defer span.End()
 
-	var acked []models.Acked
+	var acked []Acked
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
+		Model(&Acked{}).
 		Preload("Document").
 		Where("ackeds.to = ?", to).
 		Where("ackeds.valid = ?", true)
@@ -259,7 +258,7 @@ func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Ack{}).
+		Model(&Ack{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("acks.from = ?", from)
@@ -294,7 +293,7 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 	var results []result
 
 	query := r.db.WithContext(ctx).
-		Model(&models.Acked{}).
+		Model(&Acked{}).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("ackeds.to = ?", to)

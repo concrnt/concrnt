@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -21,10 +20,10 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
-	var rks []models.RecordKey
+	var rks []RecordKey
 
 	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id").
 		Where("uri LIKE ?", prefix+"%")
 
@@ -73,7 +72,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	defer span.End()
 
 	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id")
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
@@ -83,7 +82,7 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
 	}
 
-	var rks []models.RecordKey
+	var rks []RecordKey
 	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -121,10 +120,10 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	var rks []models.RecordKey
+	var rks []RecordKey
 
 	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&RecordKey{}).
 		Joins("JOIN records r ON r.document_id = record_keys.record_id")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
@@ -187,10 +186,10 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	var rks []models.RecordKey
+	var rks []RecordKey
 
 	query := r.db.WithContext(ctx).
-		Model(&models.RecordKey{}).
+		Model(&RecordKey{}).
 		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
 
 	parsedParent, err := concrnt.ParseCCURI(parent)

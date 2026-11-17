@@ -2,37 +2,37 @@ package entitymeta
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
-	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
-	"github.com/concrnt/concrnt/internal/usecase/residence"
+	"github.com/concrnt/concrnt/internal/usecase"
 )
 
 var tracer = otel.Tracer("repository")
 
 type Repository struct {
-	db     *gorm.DB
-	client *client.Client
-	config domain.Config
+	db *gorm.DB
 }
 
-func New(db *gorm.DB, cl *client.Client, config domain.Config) residence.Repository {
-	return &Repository{db: db, client: cl, config: config}
+var _ usecase.EntityMetaRepository = (*Repository)(nil)
+
+func New(db *gorm.DB) *Repository {
+	return &Repository{db: db}
 }
 
-func (r *Repository) SaveMeta(ctx context.Context, meta domain.EntityMeta) error {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.SaveMeta")
+func (r *Repository) Migrate() error {
+	return r.db.AutoMigrate(&EntityMeta{})
+}
+
+func (r *Repository) Save(ctx context.Context, meta domain.EntityMeta) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Save")
 	defer span.End()
 
-	modelMeta := models.EntityMeta{
+	modelMeta := EntityMeta{
 		ID:      meta.ID,
 		Inviter: meta.Inviter,
 		Info:    meta.Info,
@@ -48,11 +48,11 @@ func (r *Repository) SaveMeta(ctx context.Context, meta domain.EntityMeta) error
 	return nil
 }
 
-func (r *Repository) GetMeta(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetMeta")
+func (r *Repository) Get(ctx context.Context, ccid string) (*domain.EntityMeta, error) {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Get")
 	defer span.End()
 
-	var meta models.EntityMeta
+	var meta EntityMeta
 	err := r.db.Where("id = ?", ccid).Take(&meta).Error
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -68,13 +68,13 @@ func (r *Repository) GetMeta(ctx context.Context, ccid string) (*domain.EntityMe
 	}, nil
 }
 
-// UpdateMetaInfo replaces only the info column, preserving inviter (unlike
-// SaveMeta, whose upsert overwrites both).
-func (r *Repository) UpdateMetaInfo(ctx context.Context, ccid string, info string) error {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.UpdateMetaInfo")
+// Update replaces only the info column, preserving inviter (unlike Save,
+// whose upsert overwrites both).
+func (r *Repository) Update(ctx context.Context, ccid string, info string) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Update")
 	defer span.End()
 
-	result := r.db.WithContext(ctx).Model(&models.EntityMeta{}).Where("id = ?", ccid).Update("info", info)
+	result := r.db.WithContext(ctx).Model(&EntityMeta{}).Where("id = ?", ccid).Update("info", info)
 	if result.Error != nil {
 		span.RecordError(result.Error)
 		return result.Error
@@ -86,11 +86,11 @@ func (r *Repository) UpdateMetaInfo(ctx context.Context, ccid string, info strin
 	return nil
 }
 
-func (r *Repository) DeleteMeta(ctx context.Context, ccid string) error {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.DeleteMeta")
+func (r *Repository) Delete(ctx context.Context, ccid string) error {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Delete")
 	defer span.End()
 
-	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&models.EntityMeta{}).Error; err != nil {
+	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&EntityMeta{}).Error; err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -98,95 +98,27 @@ func (r *Repository) DeleteMeta(ctx context.Context, ccid string) error {
 	return nil
 }
 
-// MarkCommitLogsGcCandidateByOwner flags every commit log owned by the given
-// ccid as a GC candidate. Every commit has exactly one owner (an ack between
-// two local users is two commits: the ack owned by the acker and the acked
-// owned by the target), so nothing another user holds is touched. Idempotent.
-func (r *Repository) MarkCommitLogsGcCandidateByOwner(ctx context.Context, owner string) error {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.MarkCommitLogsGcCandidateByOwner")
+func (r *Repository) List(ctx context.Context, owner string) ([]domain.EntityMeta, error) {
+	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.List")
 	defer span.End()
 
-	err := r.db.WithContext(ctx).
-		Model(&models.CommitLog{}).
-		Where("owner = ?", owner).
-		Where("NOT gc_candidate").
-		Update("gc_candidate", true).Error
-	if err != nil {
+	var metas []EntityMeta
+	q := r.db.WithContext(ctx)
+	if owner != "" {
+		q = q.Where("id = ?", owner)
+	}
+	if err := q.Find(&metas).Error; err != nil {
 		span.RecordError(err)
-		return err
-	}
-
-	return nil
-}
-
-func (r *Repository) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetEntityByCCID")
-	defer span.End()
-
-	entity, err := gorm.G[models.Entity](r.db).
-		Joins(clause.Has("Document"), nil).
-		Where("entities.id = ?", ccid).
-		Take(ctx)
-	if err != nil {
-		span.RecordError(err)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, domain.NotFoundError{Resource: "entity"}
-		}
 		return nil, err
 	}
 
-	var proof concrnt.Proof
-	err = json.Unmarshal([]byte(entity.Document.Proof), &proof)
-	if err != nil {
-		return nil, err
+	result := make([]domain.EntityMeta, 0, len(metas))
+	for _, m := range metas {
+		result = append(result, domain.EntityMeta{
+			ID:      m.ID,
+			Inviter: m.Inviter,
+			Info:    m.Info,
+		})
 	}
-
-	signedDocument := concrnt.SignedDocument{
-		Document: entity.Document.Document,
-		Proof:    proof,
-	}
-
-	return &domain.Entity{
-		ID:             entity.ID,
-		Domain:         entity.Domain,
-		Alias:          entity.Alias,
-		TagString:      entity.Tag,
-		SignedDocument: &signedDocument,
-	}, nil
-}
-
-func (r *Repository) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
-	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.GetEntityByAlias")
-	defer span.End()
-
-	entity, err := gorm.G[models.Entity](r.db).
-		Joins(clause.Has("Document"), nil).
-		Where("entities.alias = ?", alias).
-		Take(ctx)
-	if err != nil {
-		span.RecordError(err)
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, domain.NotFoundError{Resource: "entity"}
-		}
-		return nil, err
-	}
-
-	var proof concrnt.Proof
-	err = json.Unmarshal([]byte(entity.Document.Proof), &proof)
-	if err != nil {
-		return nil, err
-	}
-
-	signedDocument := concrnt.SignedDocument{
-		Document: entity.Document.Document,
-		Proof:    proof,
-	}
-
-	return &domain.Entity{
-		ID:             entity.ID,
-		Domain:         entity.Domain,
-		Alias:          entity.Alias,
-		TagString:      entity.Tag,
-		SignedDocument: &signedDocument,
-	}, nil
+	return result, nil
 }

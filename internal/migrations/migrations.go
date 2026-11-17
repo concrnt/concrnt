@@ -36,6 +36,28 @@ func NewMigrator(repo Repository, lease lease.Lease) *Migrator {
 	}
 }
 
+type Migratable interface {
+	Migrate() error
+}
+
+func Migrate(ctx context.Context, lease lease.Lease, migratables ...Migratable) error {
+
+	release, err := lease.Acquire(ctx, leaseKey)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	for _, m := range migratables {
+		err := m.Migrate()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (m *Migrator) Do(ctx context.Context, version string) error {
 
 	if !semver.IsValid(version) {

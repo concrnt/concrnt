@@ -83,12 +83,12 @@ var createAccountCmd = &cobra.Command{
 		// 登録制限は適用しない
 		op.GlobalConfig.Registration = "open"
 
-		entityMetaRepo := pgentitymeta.New(op.DB, op.Client, op.GlobalConfig)
+		entityMetaRepo := pgentitymeta.New(op.DB)
 		recordRepo := pgrecord.New(op.DB)
-		serverRepo := pgserver.NewServerRepository(&op.GlobalConfig, op.DB, op.Client)
+		serverRepo := pgserver.New(&op.GlobalConfig, op.DB, op.Client)
 		serverUC := server.New(serverRepo, &op.GlobalConfig, concrnt.SoftwareInfo{}, service.NewModuleManager(map[string]string{}, nil), op.Client)
 		recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &op.GlobalConfig, op.Client, nopSignal{}, nopPolicy{}, nopJobQueue{}, nil)
-		residenceUC := residence.New(entityMetaRepo, recordUC, &op.GlobalConfig)
+		residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &op.GlobalConfig)
 
 		if err := residenceUC.Register(cmd.Context(), "", req); err != nil {
 			return fmt.Errorf("failed to create account: %w", err)
@@ -97,7 +97,7 @@ var createAccountCmd = &cobra.Command{
 		// Registerはinviterをinviteトークンからのみ導出するため、管理者が
 		// 明示した--inviterはここで直接metaへ反映する(conctlはDB直結の信頼経路)
 		if inviter != nil {
-			if err := entityMetaRepo.SaveMeta(cmd.Context(), domain.EntityMeta{
+			if err := entityMetaRepo.Save(cmd.Context(), domain.EntityMeta{
 				ID:      identity.CCID,
 				Inviter: inviter,
 				Info:    info,

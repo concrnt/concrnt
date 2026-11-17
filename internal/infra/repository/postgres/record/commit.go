@@ -10,7 +10,6 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
 
@@ -18,7 +17,7 @@ func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) 
 	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
 	defer span.End()
 
-	var commitLog models.CommitLog
+	var commitLog CommitLog
 	err := r.db.WithContext(ctx).
 		Select("id").
 		Where("id = ?", id).
@@ -50,7 +49,7 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		return err
 	}
 
-	commitLog := models.CommitLog{
+	commitLog := CommitLog{
 		ID:       id,
 		IP:       ip,
 		Document: document,
@@ -78,7 +77,7 @@ func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.R
 		return err
 	}
 
-	if err := db.Model(&models.CommitLog{}).
+	if err := db.Model(&CommitLog{}).
 		Where("id = ?", documentID).
 		Update("gc_candidate", true).Error; err != nil {
 		span.RecordError(err)
@@ -92,7 +91,7 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
 	defer span.End()
 
-	var commitLogs []models.CommitLog
+	var commitLogs []CommitLog
 	err := r.db.WithContext(ctx).
 		Where("owner = ?", owner).
 		Order("c_date ASC").
@@ -123,9 +122,9 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryCommitLogs")
 	defer span.End()
 
-	var commitLogs []models.CommitLog
+	var commitLogs []CommitLog
 
-	query := r.db.WithContext(ctx).Model(&models.CommitLog{})
+	query := r.db.WithContext(ctx).Model(&CommitLog{})
 
 	if owner != "" {
 		query = query.Where("owner = ?", owner)

@@ -17,7 +17,7 @@ func TestLeaseAcquire(t *testing.T) {
 	t.Cleanup(cleanup)
 
 	ctx := context.Background()
-	l := NewLease(db)
+	l := New(db)
 
 	release, err := l.Acquire(ctx, "a")
 	require.NoError(t, err)

@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -21,6 +20,7 @@ import (
 func TestQueryCommitLogs(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
 	repo := New(db)
@@ -48,7 +48,7 @@ func TestQueryCommitLogs(t *testing.T) {
 
 	cdate := func(id string) time.Time {
 		t.Helper()
-		var cl models.CommitLog
+		var cl CommitLog
 		require.NoError(t, db.Where("id = ?", id).Take(&cl).Error)
 		return cl.CDate
 	}
@@ -117,7 +117,7 @@ func TestQueryCommitLogs(t *testing.T) {
 	})
 
 	t.Run("gc candidates are still replicated", func(t *testing.T) {
-		require.NoError(t, db.Model(&models.CommitLog{}).Where("id = ?", "a-1").Update("gc_candidate", true).Error)
+		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "a-1").Update("gc_candidate", true).Error)
 		rows, err := repo.QueryCommitLogs(ctx, userA, nil, nil, 10, "asc")
 		require.NoError(t, err)
 		require.Equal(t, []string{"a-1", "a-2"}, ids(rows))
@@ -126,7 +126,7 @@ func TestQueryCommitLogs(t *testing.T) {
 	t.Run("desc with id tie-break", func(t *testing.T) {
 		// give b-1 and a-2 the same receipt time so only the id decides
 		tie := cdate("a-2")
-		require.NoError(t, db.Model(&models.CommitLog{}).Where("id = ?", "b-1").Update("c_date", tie).Error)
+		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "b-1").Update("c_date", tie).Error)
 
 		rows, err := repo.QueryCommitLogs(ctx, "", nil, nil, 10, "desc")
 		require.NoError(t, err)

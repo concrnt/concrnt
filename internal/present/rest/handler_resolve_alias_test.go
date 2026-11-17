@@ -18,21 +18,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// aliasResidenceRepo serves one entity by alias and nothing by CCID.
-type aliasResidenceRepo struct {
-	record.EntityRepository
+// aliasEntityRepo serves one entity by alias and nothing by CCID; other
+// record.Repository calls go to the embedded repo.
+type aliasEntityRepo struct {
+	record.Repository
 	alias  string
 	entity *domain.Entity
 }
 
-func (r aliasResidenceRepo) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
+func (r aliasEntityRepo) GetEntityByAlias(ctx context.Context, alias string) (*domain.Entity, error) {
 	if alias == r.alias {
 		return r.entity, nil
 	}
 	return nil, domain.ErrNotFound
 }
 
-func (r aliasResidenceRepo) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+func (r aliasEntityRepo) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
 	return nil, domain.ErrNotFound
 }
 
@@ -42,10 +43,10 @@ func (r aliasResidenceRepo) GetEntityByCCID(ctx context.Context, ccid string) (*
 func TestResolveAliasServesEntityDocument(t *testing.T) {
 	cfg := domain.Config{FQDN: "example.com"}
 	sd := &concrnt.SignedDocument{Document: `{"kind":"entity"}`}
-	repo := aliasResidenceRepo{alias: "alice.example.net", entity: &domain.Entity{ID: "con1alice", Domain: "example.com", SignedDocument: sd}}
+	repo := aliasEntityRepo{alias: "alice.example.net", entity: &domain.Entity{ID: "con1alice", Domain: "example.com", SignedDocument: sd}}
 	h := &Handler{
 		config: cfg,
-		record: record.New(nil, repo, nil, &cfg, nil, nil, nil, nil, nil),
+		record: record.New(repo, nil, nil, &cfg, nil, nil, nil, nil, nil),
 	}
 
 	e := echo.New()
@@ -111,7 +112,7 @@ func TestResolveAliasWithKeyLooksUpCanonicalOwner(t *testing.T) {
 	sd := &concrnt.SignedDocument{Document: `{"kind":"record","key":"cckv://con1alice/tipjar"}`}
 	repo := &aliasKeyRecordRepo{key: "cckv://con1alice/tipjar", sd: sd}
 	chunklineRepo := &aliasKeyChunklineRepo{key: "cckv://con1alice/tipjar"}
-	recordUC := record.New(repo, aliasResidenceRepo{alias: "alice.example.net", entity: entity}, nil, &cfg, nil, nil, allowAllPolicy{}, nil, nil)
+	recordUC := record.New(aliasEntityRepo{Repository: repo, alias: "alice.example.net", entity: entity}, nil, nil, &cfg, nil, nil, allowAllPolicy{}, nil, nil)
 	h := &Handler{
 		config:    cfg,
 		record:    recordUC,

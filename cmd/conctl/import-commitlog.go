@@ -73,7 +73,7 @@ var importCommitlogCmd = &cobra.Command{
 		// 1. Restore entity metas first (directly against Postgres) so local
 		//    entity commits pass their registration check on the server.
 		if metasPath != "" {
-			entityMetaRepo := pgentitymeta.New(op.DB, op.Client, op.GlobalConfig)
+			entityMetaRepo := pgentitymeta.New(op.DB)
 			f, err := os.Open(metasPath)
 			if err != nil {
 				return fmt.Errorf("failed to open metas file: %w", err)
@@ -97,7 +97,7 @@ var importCommitlogCmd = &cobra.Command{
 					metaOK++
 					continue
 				}
-				if err := entityMetaRepo.SaveMeta(ctx, meta); err != nil {
+				if err := entityMetaRepo.Save(ctx, meta); err != nil {
 					failed++
 					fmt.Fprintf(os.Stderr, "metas line %d (%s): failed to save: %v\n", lineNo, meta.ID, err)
 					continue

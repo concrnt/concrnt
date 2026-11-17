@@ -6,19 +6,23 @@ import (
 	"gorm.io/gorm"
 )
 
-type StateRepository struct {
+type Repository struct {
 	db *gorm.DB
 }
 
-func NewStateRepository(
+func New(
 	db *gorm.DB,
-) *StateRepository {
-	return &StateRepository{
+) *Repository {
+	return &Repository{
 		db: db,
 	}
 }
 
-func (r *StateRepository) GetState(ctx context.Context, name string) (string, error) {
+func (r *Repository) Migrate() error {
+	return r.db.AutoMigrate(&State{})
+}
+
+func (r *Repository) GetState(ctx context.Context, name string) (string, error) {
 	var state string
 	err := gorm.G[string](r.db).Raw("SELECT value FROM states WHERE name = ?", name).Scan(ctx, &state)
 	if err != nil {
@@ -28,7 +32,7 @@ func (r *StateRepository) GetState(ctx context.Context, name string) (string, er
 	return state, nil
 }
 
-func (r *StateRepository) SetState(ctx context.Context, name string, value string) error {
+func (r *Repository) SetState(ctx context.Context, name string, value string) error {
 	err := gorm.G[any](r.db).Exec(
 		ctx,
 		"INSERT INTO states (name, value) VALUES (?, ?) ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value",

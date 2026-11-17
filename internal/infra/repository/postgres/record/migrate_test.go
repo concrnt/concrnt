@@ -1,29 +1,27 @@
-package database_test
+package record
 
 import (
 	"strings"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/infra/database"
-	"github.com/concrnt/concrnt/internal/infra/database/models"
 	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
-// MigratePostgres must succeed on a fresh database and be re-runnable on an
-// already-migrated one (the server runs it at every start). testutil.CreateDB
-// discards the migration error, so this is the explicit check that every
-// table — including the ones listed after models.Acked — exists.
-func TestMigratePostgresIsIdempotent(t *testing.T) {
+// Migrate must succeed on a fresh database and be re-runnable on an
+// already-migrated one (the server runs it at every start), and every table —
+// including the ones listed after Acked — must exist afterwards.
+func TestMigrateIsIdempotent(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 
-	require.NoError(t, database.MigratePostgres(db))
+	repo := New(db)
+	require.NoError(t, repo.Migrate())
+	require.NoError(t, repo.Migrate())
 
 	for _, model := range []any{
-		&models.CommitLog{}, &models.Record{}, &models.RecordKey{}, &models.Association{},
-		&models.Ack{}, &models.Acked{}, &models.Server{}, &models.Entity{}, &models.EntityMeta{},
-		&models.Subscription{}, &models.AbuseReport{},
+		&CommitLog{}, &Record{}, &RecordKey{}, &Association{},
+		&Ack{}, &Acked{}, &Entity{},
 	} {
 		require.True(t, db.Migrator().HasTable(model), "table for %T must exist after migration", model)
 	}
