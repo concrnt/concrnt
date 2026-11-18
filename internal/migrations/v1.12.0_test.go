@@ -93,9 +93,9 @@ func TestMigrateFoldsRecordsIntoRecordKeys(t *testing.T) {
 	// migration
 	repo := pgrecord.New(db)
 	require.NoError(t, repo.Migrate())
-	require.NoError(t, foldRecordsIntoRecordKeys(WithDB(ctx, db)))
+	require.NoError(t, foldRecordsIntoRecordKeys(context.WithValue(ctx, PostgresKey, db)))
 	require.NoError(t, repo.Migrate())
-	require.NoError(t, foldRecordsIntoRecordKeys(WithDB(ctx, db)), "re-running the migration is a no-op")
+	require.NoError(t, foldRecordsIntoRecordKeys(context.WithValue(ctx, PostgresKey, db)), "re-running the migration is a no-op")
 
 	require.True(t, db.Migrator().HasTable("records"), "records is left for the operator to drop")
 	require.False(t, db.Migrator().HasIndex(&pgrecord.RecordKey{}, "idx_record_keys_parent_id_record_id"))
@@ -156,6 +156,6 @@ func TestMigrateFoldsRecordsIntoRecordKeys(t *testing.T) {
 		require.True(t, applied)
 		require.NoError(t, tx.Commit(ctx))
 	}
-	require.NoError(t, foldRecordsIntoRecordKeys(WithDB(ctx, db)))
+	require.NoError(t, foldRecordsIntoRecordKeys(context.WithValue(ctx, PostgresKey, db)))
 	require.False(t, gc("profile-new"), "the retained version written after the migration stays served")
 }

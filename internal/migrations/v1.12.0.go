@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+
+	"gorm.io/gorm"
 )
 
 func init() {
@@ -31,17 +33,21 @@ const foldRecordsBatchSize = 5000
 // records and expect the key rows to point there. The database must have run
 // v1.11.11 before: that release sets net.concrnt.version, and without it
 // Migrator.Do takes the database for a fresh one and skips this migration.
+//
+// A server without a postgres database (no PostgresKey in ctx) has nothing
+// to migrate.
 func foldRecordsIntoRecordKeys(ctx context.Context) error {
-	db, err := dbFromContext(ctx)
-	if err != nil {
-		return err
+	db, ok := ctx.Value(PostgresKey).(*gorm.DB)
+	if !ok || db == nil {
+		return nil
 	}
+	db = db.WithContext(ctx)
 
 	if !db.Migrator().HasTable("records") {
 		return nil
 	}
 	var legacyForeignKeys []string
-	err = db.Raw(`
+	err := db.Raw(`
 SELECT conname FROM pg_constraint
 WHERE contype = 'f'
   AND conrelid = 'record_keys'::regclass
