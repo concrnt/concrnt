@@ -228,3 +228,18 @@ func mustJSON(t *testing.T, v any) string {
 	require.NoError(t, err)
 	return string(b)
 }
+
+// The counts of a target are grouped by the associations' schema, not the
+// target record's own (record_keys carries a schema column too).
+func TestAssociatedRecordCountsBySchema(t *testing.T) {
+	f := newRecordKeysFixture(t)
+	post := "cckv://" + recordKeysOwner + "/posts/1"
+	at := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	f.commitRecord("counts-post", post, at, nil, nil)
+	f.associate("counts-like-1", post, at.Add(time.Second))
+	f.associate("counts-like-2", post, at.Add(2*time.Second))
+
+	counts, err := f.repo.GetAssociatedRecordCountsBySchema(f.ctx, post)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int64{"https://schema.example/like.json": 2}, counts)
+}

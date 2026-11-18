@@ -151,10 +151,10 @@ func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targ
 
 	err := r.db.WithContext(ctx).
 		Model(&Association{}).
-		Select("schema, COUNT(*) AS count").
+		Select("associations.schema AS schema, COUNT(*) AS count").
 		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
 		Where("rk.uri = ?", targetURI).
-		Group("schema").
+		Group("associations.schema").
 		Scan(&counts).Error
 
 	if err != nil {
