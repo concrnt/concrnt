@@ -85,3 +85,32 @@ func TestProbeReadyReflectsBackendsAndDrain(t *testing.T) {
 	code, _ = probe(t, e, "/health")
 	require.Equal(t, http.StatusOK, code)
 }
+
+func TestProbeReadyNamesStartupPhase(t *testing.T) {
+	readiness := health.NewReadiness(time.Second)
+	readiness.Add("postgres", func(ctx context.Context) error { return nil })
+	e := echo.New()
+	h := NewProbeHandler(health.NewWatchdog(), readiness)
+	h.RegisterRoutes(e)
+
+	// not ready with healthy backends, yet alive: a long migration must not
+	// get the process restarted
+	h.Starting("data-migration")
+	code, report := probe(t, e, "/ready")
+	require.Equal(t, http.StatusServiceUnavailable, code)
+	require.Equal(t, "starting", report.Status)
+	require.Equal(t, "data-migration", report.Phase)
+	require.Empty(t, report.Checks)
+	code, _ = probe(t, e, "/health")
+	require.Equal(t, http.StatusOK, code)
+
+	h.Starting("wiring")
+	_, report = probe(t, e, "/ready")
+	require.Equal(t, "wiring", report.Phase)
+
+	h.Started()
+	code, report = probe(t, e, "/ready")
+	require.Equal(t, http.StatusOK, code)
+	require.Empty(t, report.Phase)
+	require.Equal(t, map[string]string{"postgres": "ok"}, report.Checks)
+}

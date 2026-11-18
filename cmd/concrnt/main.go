@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -186,12 +187,70 @@ func main() {
 	serverRepo := pgserver.New(&domainConfig, db, cl)
 	stateRepo := pgstate.New(db)
 
+	sqlDB, err := db.DB()
+	if err != nil {
+		panic("failed to get sql.DB: " + err.Error())
+	}
+	observeDatabase(sqlDB)
+
+	watchdog := health.NewWatchdog()
+
+	readiness := health.NewReadiness(readinessTimeout)
+	readiness.Add("postgres", sqlDB.PingContext)
+	readiness.Add("redis", func(ctx context.Context) error {
+		return redis.Ping(ctx).Err()
+	})
+	readiness.Add("memcached", func(ctx context.Context) error {
+		return mc.Ping()
+	})
+
+	probes := rest.NewProbeHandler(watchdog, readiness)
+	probes.Starting("schema-migration")
+
+	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
+	if internalPort == "" {
+		internalPort = "8001"
+	}
+
+	// The internal listener opens before the migrations so that /ready and
+	// /metrics answer while they run; the routes that need the rest of the
+	// wiring are swapped in afterwards, since echo's router cannot take
+	// routes once it is serving.
+	bootstrap := echo.NewWithConfig(echoConfig)
+	bootstrap.GET("/metrics", echoprometheus.NewHandler())
+	probes.RegisterRoutes(bootstrap)
+
+	var internalHandler atomic.Pointer[echo.Echo]
+	internalHandler.Store(bootstrap)
+
+	start := func(ctx context.Context, address string, handler http.Handler, done chan<- error) {
+		done <- echo.StartConfig{
+			Address:         address,
+			HideBanner:      true,
+			HidePort:        true,
+			GracefulTimeout: 15 * time.Second,
+			BeforeServeFunc: func(s *http.Server) error {
+				// repository imports and proxied uploads may legitimately
+				// take longer than echo's default 30s whole-request timeout
+				s.ReadTimeout = 0
+				s.ReadHeaderTimeout = 10 * time.Second
+				return nil
+			},
+		}.Start(ctx, handler)
+	}
+
+	internalDone := make(chan error, 1)
+	go start(context.Background(), ":"+internalPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		internalHandler.Load().ServeHTTP(w, r)
+	}), internalDone)
+
 	migrationLease := pglease.New(db)
 	err = migrations.Migrate(ctx, migrationLease, abuseRepo, entityMetaRepo, notificationRepo, recordRepo, serverRepo, stateRepo)
 	if err != nil {
 		panic("failed to migrate database: " + err.Error())
 	}
 
+	probes.Starting("data-migration")
 	migrator := migrations.NewMigrator(stateRepo, migrationLease)
 
 	err = migrator.Do(context.WithValue(ctx, migrations.PostgresKey, db), version)
@@ -199,17 +258,12 @@ func main() {
 		panic("failed to run migrations: " + err.Error())
 	}
 
-	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
-	if internalPort == "" {
-		internalPort = "8001"
-	}
+	probes.Starting("wiring")
 
 	clustered := conf.Concrnt.Cluster.Enable
 	if clustered && conf.Concrnt.Cluster.ElectorEndpoint == "" {
 		panic("concrnt.cluster.enable requires concrnt.cluster.electorEndpoint")
 	}
-
-	watchdog := health.NewWatchdog()
 
 	var elector cluster.Elector
 	var discovery worker.PeerDiscovery // nil in standalone mode: no peers to poll
@@ -355,51 +409,19 @@ func main() {
 
 	internal := echo.NewWithConfig(echoConfig)
 	internal.GET("/metrics", echoprometheus.NewHandler())
-
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
-	}
-	observeDatabase(sqlDB)
-
-	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("postgres", sqlDB.PingContext)
-	readiness.Add("redis", func(ctx context.Context) error {
-		return redis.Ping(ctx).Err()
-	})
-	readiness.Add("memcached", func(ctx context.Context) error {
-		return mc.Ping()
-	})
-
-	probes := rest.NewProbeHandler(watchdog, readiness)
 	probes.RegisterRoutes(internal)
 
 	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
 	coordination.RegisterRoutes(internal)
 
+	internalHandler.Store(internal)
+
 	apiCtx, stopAPI := context.WithCancel(context.Background())
 	defer stopAPI()
 
-	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
-		done <- echo.StartConfig{
-			Address:         address,
-			HideBanner:      true,
-			HidePort:        true,
-			GracefulTimeout: 15 * time.Second,
-			BeforeServeFunc: func(s *http.Server) error {
-				// repository imports and proxied uploads may legitimately
-				// take longer than echo's default 30s whole-request timeout
-				s.ReadTimeout = 0
-				s.ReadHeaderTimeout = 10 * time.Second
-				return nil
-			},
-		}.Start(ctx, handler)
-	}
-
 	apiDone := make(chan error, 1)
-	internalDone := make(chan error, 1)
-	go start(context.Background(), ":"+internalPort, internal, internalDone)
 	go start(apiCtx, ":8000", e, apiDone)
+	probes.Started()
 
 	select {
 	case <-ctx.Done():
