@@ -9,7 +9,7 @@ import (
 )
 
 func init() {
-	migrations["v1.12.0"] = foldRecordsIntoRecordKeys
+	migrations["v1.12.0-beta.0"] = foldRecordsIntoRecordKeys
 }
 
 // foldRecordsBatchSize bounds one backfill UPDATE, so the migration of a
