@@ -511,13 +511,13 @@ func main() {
 	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
 	coordination.RegisterRoutes(internal)
 
-	// one StartConfig per listener, each with its own context: shutdown is
-	// staged by the order the contexts are cancelled in, and Start returns
-	// once its server has finished shutting down
+	// the public listener gets its own context so shutdown can be staged
+	// (drain first, then stop); Start returns once the server has finished
+	// shutting down. the internal listener only carries probes, scrapes and
+	// coordination calls that their callers retry anyway, so it is never
+	// shut down and simply dies with the process
 	publicCtx, stopPublic := context.WithCancel(context.Background())
 	defer stopPublic()
-	internalCtx, stopInternal := context.WithCancel(context.Background())
-	defer stopInternal()
 
 	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
 		done <- echo.StartConfig{
@@ -537,7 +537,7 @@ func main() {
 
 	publicDone := make(chan error, 1)
 	internalDone := make(chan error, 1)
-	go start(internalCtx, ":"+internalPort, internal, internalDone)
+	go start(context.Background(), ":"+internalPort, internal, internalDone)
 	go start(publicCtx, ":8000", e, publicDone)
 
 	select {
@@ -559,20 +559,12 @@ func main() {
 
 	if clustered {
 		// keep serving briefly so the endpoint controller stops routing to
-		// this pod before connections are closed; the internal listener stays
-		// up through this window so /ready keeps answering 503
+		// this pod before connections are closed
 		time.Sleep(3 * time.Second)
 	}
 
 	stopPublic()
 	if err := <-publicDone; err != nil {
 		slog.Error("failed to shut down gracefully", slog.String("error", err.Error()))
-	}
-
-	// last: peers keep getting coordination answers until the public API is
-	// fully drained
-	stopInternal()
-	if err := <-internalDone; err != nil {
-		slog.Error("failed to shut down internal listener", slog.String("error", err.Error()))
 	}
 }
