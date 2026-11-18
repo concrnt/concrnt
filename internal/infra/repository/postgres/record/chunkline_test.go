@@ -52,10 +52,10 @@ func TestChunklineRepositoryUsesRecordCreatedAt(t *testing.T) {
 	require.True(t, body[1].Timestamp.Equal(createdAt10))
 }
 
-// LoadLocalBody must judge window coverage and emit timestamps by the
-// record_created_at column — the column its queries filter and order by — not
-// the joined records.created_at, which can diverge (e.g. backdated records).
-func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
+// A chunk window holding more records than defaultChunkSize is served whole:
+// LoadLocalBody notices that its limited first query did not reach the window
+// start and scans the window.
+func TestChunklineLoadLocalBodyCoversFullWindow(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 	require.NoError(t, New(db).Migrate())
@@ -75,20 +75,12 @@ func TestChunklineLoadLocalBodySurvivesRecordCreatedAtDivergence(t *testing.T) {
 		createChunklineRecord(t, ctx, recordRepo, id, fmt.Sprintf("%s/%s", parentURI, id), createdAt)
 	}
 
-	// Backdate the joined records.created_at of the limited query's last
-	// member (the oldest of the top defaultChunkSize records) to before the
-	// window start. The window-coverage guard must ignore this diverged
-	// column, or the oldest record in the window gets dropped.
-	backdated := time.Unix(18*600, 0).UTC()
-	require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "div-record-01").Update("created_at", backdated).Error)
-
 	body, err := chunklineRepo.LoadLocalBody(ctx, parentURI, 20)
 	require.NoError(t, err)
 	require.Len(t, body, count)
 
-	// emitted timestamps must come from record_created_at as well
 	for _, item := range body {
-		require.True(t, item.Timestamp.After(time.Unix(20*600, 0)), "timestamp %v must be record_created_at, not the backdated created_at", item.Timestamp)
+		require.True(t, item.Timestamp.After(time.Unix(20*600, 0)), "timestamp %v must lie in chunk 20", item.Timestamp)
 	}
 }
 

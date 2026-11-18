@@ -4,8 +4,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/concrnt/concrnt/internal/testutil"
 	"github.com/stretchr/testify/require"
+
+	"github.com/concrnt/concrnt/internal/testutil"
 )
 
 // Migrate must succeed on a fresh database and be re-runnable on an
@@ -20,7 +21,7 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	require.NoError(t, repo.Migrate())
 
 	for _, model := range []any{
-		&CommitLog{}, &Record{}, &RecordKey{}, &Association{},
+		&CommitLog{}, &RecordKey{}, &Association{},
 		&Ack{}, &Acked{}, &Entity{},
 	} {
 		require.True(t, db.Migrator().HasTable(model), "table for %T must exist after migration", model)

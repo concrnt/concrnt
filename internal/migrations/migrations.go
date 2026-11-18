@@ -2,12 +2,14 @@ package migrations
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"maps"
 	"slices"
 	"sort"
 
 	"golang.org/x/mod/semver"
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/internal/usecase/lease"
 )
@@ -17,7 +19,28 @@ const VERSION_KEY = "net.concrnt.version"
 // leaseKey serializes the migrators of replicas starting at the same time.
 const leaseKey = "net.concrnt.migration"
 
+// migrations maps a version to the migration that brings the data up to
+// it. A migration gets what it works on (the database, ...) from ctx, put
+// there by the caller of Migrator.Do (WithDB).
 var migrations = make(map[string]func(ctx context.Context) error)
+
+type ctxKey int
+
+const dbCtxKey ctxKey = iota
+
+// WithDB returns ctx carrying the database the migrations run against.
+func WithDB(ctx context.Context, db *gorm.DB) context.Context {
+	return context.WithValue(ctx, dbCtxKey, db)
+}
+
+// dbFromContext returns the database WithDB put into ctx.
+func dbFromContext(ctx context.Context) (*gorm.DB, error) {
+	db, ok := ctx.Value(dbCtxKey).(*gorm.DB)
+	if !ok || db == nil {
+		return nil, errors.New("migrations: no database in context (use WithDB)")
+	}
+	return db.WithContext(ctx), nil
+}
 
 type Repository interface {
 	GetState(ctx context.Context, name string) (string, error)

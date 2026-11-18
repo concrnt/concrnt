@@ -163,18 +163,14 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return nil, err
 	}
 
-	// History is only kept for what asked for it: a deleted document with
-	// onUpdate=retain keeps its commit and, with it, this delete's (the
-	// replay needs both); everything else is flagged for gc once the
-	// backdate window has passed (the replay guard then holds on its own).
-	deleteRetained := false
+	// Every deleted document is flagged for gc, onUpdate=retain included:
+	// retain keeps a version readable while its key moves on, not after it
+	// is deleted. A flagged commit is no longer served by ccfs and is
+	// collected once the backdate window has passed (the replay guard then
+	// holds on its own); so is this delete's own commit.
 	deletedAny := false
-	flagDeleted := func(deleted *concrnt.SignedDocument, onUpdate *string) error {
+	flagDeleted := func(deleted *concrnt.SignedDocument) error {
 		deletedAny = true
-		if onUpdate != nil && *onUpdate == "retain" {
-			deleteRetained = true
-			return nil
-		}
 		deletedID, err := deleted.CDID()
 		if err != nil {
 			return err
@@ -236,7 +232,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					return nil, err
 				}
 
-				if err := flagDeleted(targetSD, targetDoc.OnUpdate); err != nil {
+				if err := flagDeleted(targetSD); err != nil {
 					span.RecordError(err)
 					return nil, err
 				}
@@ -261,7 +257,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 					return nil, err
 				}
 
-				if err := flagDeleted(targetSD, nil); err != nil {
+				if err := flagDeleted(targetSD); err != nil {
 					span.RecordError(err)
 					return nil, err
 				}
@@ -371,7 +367,7 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 				return nil, err
 			}
 
-			if err := flagDeleted(refSD, refDoc.OnUpdate); err != nil {
+			if err := flagDeleted(refSD); err != nil {
 				span.RecordError(err)
 				return nil, err
 			}
@@ -488,11 +484,9 @@ func (uc *Usecase) deleteRecord(ctx context.Context, tx RepositoryTx, ip string,
 		return &commitApplyResult{result: &sd, noop: true}, nil
 	}
 
-	if !deleteRetained {
-		if err := uc.repo.MarkCommitLogGcCandidate(ctx, tx, documentID); err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
+	if err := uc.repo.MarkCommitLogGcCandidate(ctx, tx, documentID); err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 
 	// targets are URI-ordered, so with includeSelf the base record itself

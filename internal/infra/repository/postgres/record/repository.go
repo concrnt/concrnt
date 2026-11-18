@@ -47,7 +47,6 @@ func New(db *gorm.DB) *Repository {
 func (r *Repository) Migrate() error {
 	return r.db.AutoMigrate(
 		&CommitLog{},
-		&Record{},
 		&RecordKey{},
 		&Association{},
 		&Ack{},

@@ -53,8 +53,7 @@ func seedDeleteUserState(t *testing.T, db *gorm.DB) deleteUserState {
 		recordID := "record-" + ccid
 		key := "cckv://" + ccid + "/posts/1"
 		commit(recordID, ccid, concrnt.Document[map[string]string]{Kind: "record", Key: key, Value: map[string]string{"body": "hi"}, Author: ccid, Schema: "https://example.com/post.json", CreatedAt: st.at})
-		require.NoError(t, db.WithContext(ctx).Create(&pgrecord.Record{DocumentID: recordID, Owner: ccid, Author: ccid, Schema: "https://example.com/post.json", CreatedAt: st.at}).Error)
-		require.NoError(t, db.WithContext(ctx).Create(&pgrecord.RecordKey{URI: key, RecordID: &recordID, RecordCreatedAt: &st.at}).Error)
+		require.NoError(t, db.WithContext(ctx).Create(&pgrecord.RecordKey{URI: key, RecordID: &recordID, Owner: ccid, Author: ccid, Schema: "https://example.com/post.json", RecordCreatedAt: &st.at}).Error)
 
 		require.NoError(t, db.WithContext(ctx).Create(&pgnotification.Subscription{VendorID: "vendor", Owner: ccid, Schemas: pq.StringArray{}, Prefixes: pq.StringArray{}, Subscription: "{}"}).Error)
 	}
@@ -121,7 +120,7 @@ func TestDeleteUser(t *testing.T) {
 	require.Zero(t, count(&pgrecord.Entity{}, "id = ?", st.alice))
 	require.Zero(t, count(&pgentitymeta.EntityMeta{}, "id = ?", st.alice))
 	require.Zero(t, count(&pgnotification.Subscription{}, "owner = ?", st.alice))
-	require.Zero(t, count(&pgrecord.Record{}, "owner = ?", st.alice))
+	require.Zero(t, count(&pgrecord.RecordKey{}, "owner = ?", st.alice))
 	require.Zero(t, count(&pgrecord.RecordKey{}, "uri LIKE ?", "cckv://"+st.alice+"/%"))
 	require.Empty(t, ids(&pgrecord.Ack{}, `"from" = ?`, st.alice), "alice's own ack")
 	require.Empty(t, ids(&pgrecord.Acked{}, `"to" = ?`, st.alice), "acked holding addressed to alice")
@@ -131,7 +130,7 @@ func TestDeleteUser(t *testing.T) {
 	require.EqualValues(t, 1, count(&pgrecord.Entity{}, "id = ?", st.bob))
 	require.EqualValues(t, 1, count(&pgentitymeta.EntityMeta{}, "id = ?", st.bob))
 	require.EqualValues(t, 1, count(&pgnotification.Subscription{}, "owner = ?", st.bob))
-	require.EqualValues(t, 1, count(&pgrecord.Record{}, "owner = ?", st.bob))
+	require.EqualValues(t, 1, count(&pgrecord.RecordKey{}, "owner = ?", st.bob))
 	require.Equal(t, []string{"ack-" + st.bob + "-" + st.alice}, ids(&pgrecord.Ack{}, `"from" = ?`, st.bob), "bob's ack to alice")
 	require.Equal(t, []string{"acked-" + st.alice + "-" + st.bob}, ids(&pgrecord.Acked{}, `"to" = ?`, st.bob), "alice's acked holding on bob")
 

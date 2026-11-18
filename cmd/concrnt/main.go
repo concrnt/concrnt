@@ -194,7 +194,7 @@ func main() {
 
 	migrator := migrations.NewMigrator(stateRepo, migrationLease)
 
-	err = migrator.Do(ctx, version)
+	err = migrator.Do(migrations.WithDB(ctx, db), version)
 	if err != nil {
 		panic("failed to run migrations: " + err.Error())
 	}
