@@ -53,6 +53,11 @@ type CommitLog struct {
 //   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup;
 //     used by pgrecord.Repository.GetSignedDocument,
 //     GetHierarchicalRecordPolicies and DeleteRecordByDocumentID.
+//   - idx_record_keys_uri_pattern (uri text_pattern_ops): URI prefix
+//     matches (uri LIKE 'prefix%'), which the unique index cannot serve
+//     under a non-C collation; used by pgrecord.Repository.QueryByPrefix,
+//     QueryRecordSubtree and the owner-root branches of QueryByParent and
+//     QueryByParentOrderByKey.
 //   - idx_record_keys_parent_created_at_record_id
 //     (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL
 //     AND record_created_at IS NOT NULL: parent listings and timeline/chunkline
@@ -74,7 +79,7 @@ type CommitLog struct {
 type RecordKey struct {
 	ID       int64     `json:"id" gorm:"primaryKey;autoIncrement"`
 	ParentID *int64    `json:"parentID" gorm:"index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
-	URI      string    `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2"`
+	URI      string    `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2;index:idx_record_keys_uri_pattern,expression:uri text_pattern_ops"`
 	RecordID *string   `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_created_at_record_id,priority:3,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_schema_created_at_record_id,priority:3;index:idx_record_keys_author_created_at_record_id,priority:3"`
 	Document CommitLog `json:"-" gorm:"foreignKey:RecordID;references:ID;constraint:OnDelete:CASCADE;"`
 
