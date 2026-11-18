@@ -65,6 +65,16 @@ func (r *Repository) SaveEntityTrust(ctx context.Context, scores map[string]floa
 	ctx, span := tracer.Start(ctx, "Repository.Record.SaveEntityTrust")
 	defer span.End()
 
+	// nobody holds trust (no seeds): clearing needs no join, and with
+	// nothing to clear it reads only the partial index
+	if len(scores) == 0 {
+		err := r.db.WithContext(ctx).Exec("UPDATE entities SET trust = 0 WHERE trust > 0").Error
+		if err != nil {
+			span.RecordError(err)
+		}
+		return err
+	}
+
 	ids := make(pq.StringArray, 0, len(scores))
 	values := make(pq.Float64Array, 0, len(scores))
 	for id, score := range scores {

@@ -285,7 +285,7 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	trustUC := trust.New(recordRepo, &domainConfig, redisKVS)
+	trustUC := trust.New(recordRepo, &domainConfig)
 	recordUC.SetIngestLimiter(ratelimit.New(redisKVS), trustUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
@@ -342,6 +342,9 @@ func main() {
 		chunklineGateway.StartWorker(leadCtx, leaderSub)
 		if notificationReactor != nil {
 			notificationReactor.Start(leadCtx)
+		}
+		if domainConfig.IngestLimit.ScalesWithTrust() {
+			trustUC.StartRecomputing(leadCtx)
 		}
 	})
 

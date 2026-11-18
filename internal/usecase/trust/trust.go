@@ -19,14 +19,12 @@ import (
 )
 
 const (
-	// recomputeInterval is how often the entities' scores are recomputed,
-	// by whichever replica gets to it first.
+	// recomputeInterval is how often the leader recomputes the entities'
+	// scores.
 	recomputeInterval = 5 * time.Minute
 	// reloadInterval is how stale a replica's copy of the domain scores may
 	// get before it reads them again.
 	reloadInterval = time.Minute
-
-	recomputeLockKey = "trust-recompute"
 )
 
 // AckEdge is a local user's acknowledgement, with the domain its target
@@ -50,15 +48,9 @@ type Repository interface {
 	GetDomainTrust(ctx context.Context) (map[string]float64, error)
 }
 
-// Lock lets one replica at a time take a turn; implemented by usecase.KVS.
-type Lock interface {
-	SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
-}
-
 type Usecase struct {
 	repo   Repository
 	config *domain.Config
-	lock   Lock
 	now    func() time.Time
 
 	mu         sync.Mutex
@@ -67,10 +59,31 @@ type Usecase struct {
 	refreshing bool
 }
 
-// New wires the usecase. lock may be nil (a single process, tests), in which
-// case every refresh recomputes.
-func New(repo Repository, config *domain.Config, lock Lock) *Usecase {
-	return &Usecase{repo: repo, config: config, lock: lock, now: time.Now}
+func New(repo Repository, config *domain.Config) *Usecase {
+	return &Usecase{repo: repo, config: config, now: time.Now}
+}
+
+// StartRecomputing recomputes the entities' scores now and then every
+// recomputeInterval, until ctx is cancelled. It is a singleton worker: run it
+// on the cluster's leader only, with the leadership context.
+func (uc *Usecase) StartRecomputing(ctx context.Context) {
+	go uc.recomputeEvery(ctx, recomputeInterval)
+}
+
+func (uc *Usecase) recomputeEvery(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		if err := uc.Recompute(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("failed to recompute entity trust", slog.String("error", err.Error()))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // DomainTrust is how much this server trusts domain, from 0 (nobody trusted
@@ -78,8 +91,8 @@ func New(repo Repository, config *domain.Config, lock Lock) *Usecase {
 // worth of trust between them).
 //
 // It never waits on the database: it answers from the scores last read and,
-// when those are stale, starts refreshing them in the background. Until the
-// first refresh finishes every domain scores 0.
+// when those are stale, starts reading them again in the background. Until
+// the first read finishes every domain scores 0.
 func (uc *Usecase) DomainTrust(ctx context.Context, domainName string) float64 {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
@@ -96,14 +109,13 @@ func (uc *Usecase) DomainTrust(ctx context.Context, domainName string) float64 {
 	return uc.domains[domainName]
 }
 
-// Refresh recomputes the entities' scores if they are due and no other
-// replica has taken the turn, then reads the domain scores. On failure the
-// scores read before stay in use.
+// Refresh reads the domain scores, as stored by the latest recomputation. On
+// failure the scores read before stay in use.
 func (uc *Usecase) Refresh(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "Usecase.Trust.Refresh")
 	defer span.End()
 
-	domains, err := uc.refresh(ctx)
+	domains, err := uc.load(ctx)
 
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
@@ -117,21 +129,7 @@ func (uc *Usecase) Refresh(ctx context.Context) error {
 	return nil
 }
 
-func (uc *Usecase) refresh(ctx context.Context) (map[string]float64, error) {
-	due := true
-	if uc.lock != nil {
-		won, err := uc.lock.SetNX(ctx, recomputeLockKey, "1", recomputeInterval)
-		if err != nil {
-			return nil, err
-		}
-		due = won
-	}
-	if due {
-		if err := uc.Recompute(ctx); err != nil {
-			return nil, err
-		}
-	}
-
+func (uc *Usecase) load(ctx context.Context) (map[string]float64, error) {
 	totals, err := uc.repo.GetDomainTrust(ctx)
 	if err != nil {
 		return nil, err

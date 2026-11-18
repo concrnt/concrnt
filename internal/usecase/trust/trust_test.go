@@ -74,20 +74,7 @@ func (r *stubRepo) counts() (saves, loads int) {
 	return r.saves, r.loads
 }
 
-// stubLock grants the turn when free is set.
-type stubLock struct {
-	free bool
-	keys []string
-	ttl  time.Duration
-}
-
-func (l *stubLock) SetNX(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
-	l.keys = append(l.keys, key)
-	l.ttl = ttl
-	return l.free, nil
-}
-
-// newTrustUsecase wires a usecase without a lock, whose seeds are local.
+// newTrustUsecase wires a usecase whose seeds are local.
 func newTrustUsecase(repo *stubRepo, seeds ...string) *Usecase {
 	repo.seeds = seeds
 	if repo.domainOf == nil {
@@ -96,11 +83,16 @@ func newTrustUsecase(repo *stubRepo, seeds ...string) *Usecase {
 	for _, seed := range seeds {
 		repo.domainOf[seed] = "example.com"
 	}
-	return New(repo, &domain.Config{FQDN: "example.com"}, nil)
+	return New(repo, &domain.Config{FQDN: "example.com"})
 }
 
+// refresh recomputes, as the leader does on its schedule, and reads the
+// result, as every replica does.
 func refresh(t *testing.T, uc *Usecase) {
 	t.Helper()
+	if err := uc.Recompute(context.Background()); err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
 	if err := uc.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
@@ -201,33 +193,65 @@ func TestRemoteSeedMakesItsDomainFullyTrusted(t *testing.T) {
 	requireTrust(t, uc, "remote.example.net", 1)
 }
 
-// With several replicas only the one that gets the turn recomputes; the
-// others just read what it stored.
-func TestOnlyTheReplicaHoldingTheTurnRecomputes(t *testing.T) {
+// Only the leader recomputes; every other replica just reads what it stored.
+func TestRefreshReadsStoredScoresWithoutRecomputing(t *testing.T) {
 	repo := &stubRepo{
 		edges:    []AckEdge{{From: "seed", To: "r", ToDomain: "remote.example.net"}},
 		domainOf: map[string]string{"r": "remote.example.net"},
-		stored:   map[string]float64{"r": 0.25}, // another replica's result
+		stored:   map[string]float64{"r": 0.25}, // the leader's result
 	}
 	uc := newTrustUsecase(repo, "seed")
-	lock := &stubLock{}
-	uc.lock = lock
 
-	refresh(t, uc)
+	if err := uc.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
 	if saves, _ := repo.counts(); saves != 0 {
-		t.Fatalf("recomputed %d times without the turn", saves)
+		t.Fatalf("recomputed %d times, want none", saves)
 	}
 	requireTrust(t, uc, "remote.example.net", 0.25)
-	if len(lock.keys) != 1 || lock.keys[0] != recomputeLockKey || lock.ttl != recomputeInterval {
-		t.Fatalf("lock asked for %v ttl %v", lock.keys, lock.ttl)
+}
+
+// The leader's worker recomputes at once and then on its interval, and stops
+// when leadership is lost.
+func TestRecomputingRunsUntilLeadershipIsLost(t *testing.T) {
+	repo := &stubRepo{edges: []AckEdge{{From: "seed", To: "r", ToDomain: "remote.example.net"}}}
+	uc := newTrustUsecase(repo, "seed")
+
+	saves := func() int {
+		n, _ := repo.counts()
+		return n
+	}
+	waitForSaves := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for saves() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("recomputed %d times, want at least %d", saves(), want)
+			}
+			time.Sleep(time.Millisecond)
+		}
 	}
 
-	lock.free = true
-	refresh(t, uc)
-	if saves, _ := repo.counts(); saves != 1 {
-		t.Fatalf("recomputed %d times with the turn, want 1", saves)
+	leadCtx, loseLeadership := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		uc.recomputeEvery(leadCtx, 5*time.Millisecond)
+		close(done)
+	}()
+
+	waitForSaves(3)
+
+	loseLeadership()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("worker still running after leadership was lost")
 	}
-	requireTrust(t, uc, "remote.example.net", damping)
+	stopped := saves()
+	time.Sleep(30 * time.Millisecond)
+	if saves() != stopped {
+		t.Fatalf("recomputed after leadership was lost")
+	}
 }
 
 // DomainTrust never waits on the repository: stale scores are served while a
@@ -256,7 +280,11 @@ func TestDomainTrustRefreshesInTheBackgroundWhenStale(t *testing.T) {
 		}
 	}
 
-	// nothing read yet: answers 0 and starts the first refresh
+	if err := uc.Recompute(context.Background()); err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+
+	// nothing read yet: answers 0 and starts the first read
 	requireTrust(t, uc, "remote.example.net", 0)
 	waitForLoads(1)
 	requireTrust(t, uc, "remote.example.net", damping)
@@ -267,9 +295,9 @@ func TestDomainTrustRefreshesInTheBackgroundWhenStale(t *testing.T) {
 	}
 	waitForLoads(1)
 
-	// stale: the old score is served, and one refresh picks up the change
+	// stale: the old score is served, and one read picks up the change
 	repo.mu.Lock()
-	repo.edges = nil
+	repo.stored = nil
 	repo.mu.Unlock()
 	now = now.Add(reloadInterval)
 	for range 100 {
