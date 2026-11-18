@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -212,18 +211,11 @@ func main() {
 		internalPort = "8001"
 	}
 
-	// The internal listener opens before the migrations so that /ready and
-	// /metrics answer while they run; the routes that need the rest of the
-	// wiring are swapped in afterwards, since echo's router cannot take
-	// routes once it is serving.
-	bootstrap := echo.NewWithConfig(echoConfig)
-	bootstrap.GET("/metrics", echoprometheus.NewHandler())
-	probes.RegisterRoutes(bootstrap)
+	internal := echo.NewWithConfig(echoConfig)
+	internal.GET("/metrics", echoprometheus.NewHandler())
+	probes.RegisterRoutes(internal)
 
-	var internalHandler atomic.Pointer[echo.Echo]
-	internalHandler.Store(bootstrap)
-
-	start := func(ctx context.Context, address string, handler http.Handler, done chan<- error) {
+	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
 		done <- echo.StartConfig{
 			Address:         address,
 			HideBanner:      true,
@@ -239,10 +231,10 @@ func main() {
 		}.Start(ctx, handler)
 	}
 
+	// opens before the migrations so that /ready and /metrics answer while
+	// they run
 	internalDone := make(chan error, 1)
-	go start(context.Background(), ":"+internalPort, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		internalHandler.Load().ServeHTTP(w, r)
-	}), internalDone)
+	go start(context.Background(), ":"+internalPort, internal, internalDone)
 
 	migrationLease := pglease.New(db)
 	err = migrations.Migrate(ctx, migrationLease, abuseRepo, entityMetaRepo, notificationRepo, recordRepo, serverRepo, stateRepo)
@@ -407,14 +399,17 @@ func main() {
 		})
 	}
 
-	internal := echo.NewWithConfig(echoConfig)
-	internal.GET("/metrics", echoprometheus.NewHandler())
-	probes.RegisterRoutes(internal)
+	coordinationDone := make(chan error, 1)
+	if clustered {
+		coordinationPort := os.Getenv("CONCRNT_COORDINATION_PORT")
+		if coordinationPort == "" {
+			coordinationPort = "8003"
+		}
 
-	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
-	coordination.RegisterRoutes(internal)
-
-	internalHandler.Store(internal)
+		coordination := echo.NewWithConfig(echoConfig)
+		rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector).RegisterRoutes(coordination)
+		go start(context.Background(), ":"+coordinationPort, coordination, coordinationDone)
+	}
 
 	apiCtx, stopAPI := context.WithCancel(context.Background())
 	defer stopAPI()
@@ -430,6 +425,9 @@ func main() {
 		os.Exit(1)
 	case err := <-internalDone:
 		slog.Error("internal listener stopped unexpectedly", slog.String("error", err.Error()))
+		os.Exit(1)
+	case err := <-coordinationDone:
+		slog.Error("coordination listener stopped unexpectedly", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 

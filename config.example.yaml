@@ -9,11 +9,11 @@ concrnt:
   # it is handy to generate these info with concurrent.world devtool
   layer: concrnt-mainnet
   debug: false
-  # note: the internal (operational) listener — /health, /ready, the
-  # Prometheus /metrics endpoint and the replica-to-replica coordination
-  # API — listens on :8001 (override with the CONCRNT_INTERNAL_PORT
-  # environment variable). point liveness/readiness probes and the metrics
-  # scraper there and do NOT expose it outside the cluster.
+  # note: the internal (operational) listener — /health, /ready and the
+  # Prometheus /metrics endpoint — listens on :8001 (override with the
+  # CONCRNT_INTERNAL_PORT environment variable). point liveness/readiness
+  # probes and the metrics scraper there and do NOT expose it outside the
+  # cluster.
   #
   # cluster enables running multiple replicas (e.g. on kubernetes).
   # leave it out for a single instance / docker compose.
@@ -26,6 +26,10 @@ concrnt:
   #   # via a headless service). other backends can implement the same
   #   # protocol. required when enable is true.
   #   electorEndpoint: "http://127.0.0.1:8002"
+  #
+  # with cluster enabled, the replica-to-replica coordination API listens on
+  # :8003 (override with the CONCRNT_COORDINATION_PORT environment variable).
+  # replicas must reach each other there; do NOT expose it outside the cluster.
 
 backends:
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"

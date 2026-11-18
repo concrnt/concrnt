@@ -38,8 +38,9 @@ type LeaderState interface {
 // SubscriberCoordinationHandler serves the replica-to-replica API that keeps
 // the cluster's single federation Subscriber fed with every replica's
 // realtime demand: workers forward and query subscription state here, and the
-// leader polls each replica's local demand. Mount it only on the internal
-// listener — these endpoints must not be reachable from outside the cluster.
+// leader polls each replica's local demand. Mount it only on the
+// coordination listener — these endpoints must not be reachable from outside
+// the cluster.
 type SubscriberCoordinationHandler struct {
 	local     LocalDemand
 	aggregate AggregateDemand

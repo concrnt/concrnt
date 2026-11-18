@@ -11,11 +11,11 @@
 //
 // Configuration (environment variables):
 //
-//	ADVERTISE_URL    (required) this replica's concrnt internal base URL,
-//	                 e.g. http://$(POD_IP):8001 — stored as the lease holder
+//	ADVERTISE_URL    (required) this replica's concrnt coordination base URL,
+//	                 e.g. http://$(POD_IP):8003 — stored as the lease holder
 //	                 identity so peers learn the leader's address
 //	HEADLESS_SERVICE (required) DNS name resolving to every replica
-//	PEER_PORT        concrnt internal port for peer URLs (default 8001)
+//	PEER_PORT        concrnt coordination port for peer URLs (default 8003)
 //	LEASE_NAME       lease object name (default concrnt-leader)
 //	LISTEN           listen address (default :8002)
 //	POD_NAMESPACE    lease namespace (default: serviceaccount namespace file)
@@ -84,7 +84,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	peerPort, err := strconv.Atoi(getenv("PEER_PORT", "8001"))
+	peerPort, err := strconv.Atoi(getenv("PEER_PORT", "8003"))
 	if err != nil {
 		slog.Error("invalid PEER_PORT", slog.String("error", err.Error()))
 		os.Exit(1)
