@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/concrnt/concrnt/impl/interop"
@@ -49,8 +49,7 @@ func newGatewayProxy(t *testing.T, backendHost string, backendPort int) *httptes
 	proxy.Transport = otelhttp.NewTransport(http.DefaultTransport)
 
 	e := echo.New()
-	e.HideBanner = true
-	e.Any("/*", func(c echo.Context) error {
+	e.Any("/*", func(c *echo.Context) error {
 		c.Request().Header.Del(interop.RequesterHeader)
 		c.Request().Header.Del(interop.RequesterTagHeader)
 		proxy.ServeHTTP(c.Response(), c.Request())

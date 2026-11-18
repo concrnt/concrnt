@@ -16,8 +16,9 @@ require (
 	github.com/go-yaml/yaml v2.1.0+incompatible
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/labstack/echo-contrib v0.50.1
-	github.com/labstack/echo/v4 v4.16.4
+	github.com/labstack/echo-contrib/v5 v5.0.1
+	github.com/labstack/echo-otel/v5 v5.0.0
+	github.com/labstack/echo/v5 v5.4.6
 	github.com/lib/pq v1.12.3
 	github.com/ory/dockertest v3.3.5+incompatible
 	github.com/patrickmn/go-cache v2.1.0+incompatible
@@ -30,7 +31,6 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	github.com/zeebo/xxh3 v1.1.0
 	gitlab.com/yawning/secp256k1-voi v0.0.0-20230925100816-f2616030848b
-	go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho v0.71.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.47.0
@@ -160,7 +160,6 @@ require (
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
-	github.com/labstack/gommon v0.5.0 // indirect
 	github.com/linxGnu/grocksdb v1.10.8 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
@@ -192,8 +191,6 @@ require (
 	github.com/tendermint/go-amino v0.16.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
-	github.com/valyala/bytebufferpool v1.0.0 // indirect
-	github.com/valyala/fasttemplate v1.2.2 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	gitlab.com/yawning/tuplehash v0.0.0-20230713102510-df83abbf9a02 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect

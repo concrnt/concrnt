@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/pkg/errors"
 	"github.com/xinguang/go-recaptcha"
 	"go.opentelemetry.io/otel"
@@ -45,7 +45,7 @@ func NewAuthMiddleware(
 }
 
 func (s *AuthMiddleware) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		ctx, span := tracer.Start(c.Request().Context(), "Auth.Service.IdentifyIdentity")
 		defer span.End()
 
@@ -217,7 +217,7 @@ func (s *AuthMiddleware) IdentifyIdentity(next echo.HandlerFunc) echo.HandlerFun
 // If verification is successful, it sets a flag in the context.
 func Recaptcha(validator *recaptcha.ReCAPTCHA) echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			ctx, span := tracer.Start(c.Request().Context(), "Auth.Service.Recaptcha")
 			defer span.End()
 

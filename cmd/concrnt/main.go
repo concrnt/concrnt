@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,19 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/SherClockHolmes/webpush-go"
-	"github.com/labstack/echo-contrib/echoprometheus"
-	"github.com/labstack/echo/v4"
-	echomiddleware "github.com/labstack/echo/v4/middleware"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/labstack/echo-contrib/v5/echoprometheus"
+	"github.com/labstack/echo/v5"
+	echomiddleware "github.com/labstack/echo/v5/middleware"
 	"github.com/xinguang/go-recaptcha"
-	"go.opentelemetry.io/contrib/instrumentation/github.com/labstack/echo/otelecho"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
@@ -52,14 +46,8 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/residence"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/usecase/subscription"
-	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/internal/worker"
 )
-
-// readinessTimeout bounds one /ready sweep. The kubelet gives a probe one
-// second by default, so a backend that has not answered by then must
-// already be reported as down inside that window.
-const readinessTimeout = 800 * time.Millisecond
 
 var (
 	version      = "unknown"
@@ -68,30 +56,14 @@ var (
 	goVersion    = "unknown"
 )
 
-type CustomHandler struct {
-	slog.Handler
-}
-
-func (h *CustomHandler) Handle(ctx context.Context, r slog.Record) error {
-
-	r.AddAttrs(slog.String("type", "app"))
-
-	span := trace.SpanFromContext(ctx)
-	if span.SpanContext().IsValid() {
-		r.AddAttrs(slog.String("traceID", span.SpanContext().TraceID().String()))
-		r.AddAttrs(slog.String("spanID", span.SpanContext().SpanID().String()))
-	}
-
-	return h.Handler.Handle(ctx, r)
-}
+const readinessTimeout = 800 * time.Millisecond
 
 func main() {
 
-	lh := &CustomHandler{Handler: slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	logger := slog.New(&traceHandler{slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
-	})}
-	slogger := slog.New(lh)
-	slog.SetDefault(slogger)
+	})})
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -118,65 +90,67 @@ func main() {
 		slog.String("layer", domainConfig.Layer),
 	)
 
-	e := echo.New()
-	e.HideBanner = true
-	e.HidePort = true
-
-	e.Use(echomiddleware.Recover())
-
-	// HTTP metrics are collected on the public listener only; they are served
-	// from /metrics on the internal listener below, which carries no
-	// middleware, so probe and coordination traffic never shows up in them
-	e.Use(echoprometheus.NewMiddlewareWithConfig(echoprometheus.MiddlewareConfig{
-		Namespace: "concrnt",
-		LabelFuncs: map[string]echoprometheus.LabelValueFunc{
-			// which service answered: proxied requests carry the target
-			// service's name in the cc-service header set by rest.Proxy;
-			// everything else is handled in-process
-			"service": func(c echo.Context, err error) string {
-				if service := c.Response().Header().Get("cc-service"); service != "" {
-					return service
-				}
-				return "concrnt"
-			},
-		},
-		Skipper: func(c echo.Context) bool {
-			// long-lived websocket upgrades would skew the duration histogram
-			return c.Request().Header.Get("Upgrade") == "websocket"
-		},
-	}))
-
-	if conf.Observability.EnableTrace {
-		cleanup, err := utils.SetupTraceProvider(conf.Observability.TraceEndpoint, conf.Concrnt.FQDN+"/ccapi", version)
-		if err != nil {
-			panic(err)
-		}
-		defer cleanup()
-
-		e.Use(otelecho.Middleware(conf.Concrnt.FQDN))
-
-		e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-			return func(c echo.Context) error {
-				span := trace.SpanFromContext(c.Request().Context())
-				c.Response().Header().Set("trace-id", span.SpanContext().TraceID().String())
-				return next(c)
+	defaultErrorHandler := echo.DefaultHTTPErrorHandler(false)
+	echoConfig := echo.Config{
+		Logger:     logger,
+		Filesystem: echo.NewDefaultFS("/"),
+		HTTPErrorHandler: func(c *echo.Context, err error) {
+			if res, _ := echo.UnwrapResponse(c.Response()); res != nil && res.Committed {
+				return
 			}
-		})
+			ctx := c.Request().Context()
+			var panicked *echomiddleware.PanicStackError
+			if errors.As(err, &panicked) {
+				logger.ErrorContext(ctx, "panic recovered",
+					slog.String("error", panicked.Err.Error()),
+					slog.String("stack", string(panicked.Stack)),
+				)
+			} else if code := echo.StatusCode(err); code == 0 || code >= http.StatusInternalServerError {
+				logger.ErrorContext(ctx, "request failed", slog.String("error", err.Error()))
+			}
+			defaultErrorHandler(c, err)
+		},
 	}
 
-	e.Use(echomiddleware.LoggerWithConfig(echomiddleware.LoggerConfig{
-		Skipper: func(c echo.Context) bool {
+	e := echo.NewWithConfig(echoConfig)
+
+	e.Use(echomiddleware.Recover())
+	setupMetrics(e)
+
+	if conf.Observability.EnableTrace {
+		cleanup := setupTrace(e, conf.Observability.TraceEndpoint, conf.Concrnt.FQDN, version)
+		defer cleanup()
+	}
+
+	e.Use(echomiddleware.RequestLoggerWithConfig(echomiddleware.RequestLoggerConfig{
+		Skipper: func(c *echo.Context) bool {
 			return c.Path() == "/.well-known/concrnt"
 		},
-		Format: `{"time":"${time_rfc3339_nano}",${custom},"remote_ip":"${remote_ip}",` +
-			`"host":"${host}","method":"${method}","uri":"${uri}","status":${status},` +
-			`"error":"${error}","latency":${latency},"latency_human":"${latency_human}",` +
-			`"bytes_in":${bytes_in},"bytes_out":${bytes_out}}` + "\n",
-		CustomTagFunc: func(c echo.Context, buf *bytes.Buffer) (int, error) {
-			span := trace.SpanFromContext(c.Request().Context())
-			fmt.Fprintf(buf, "\"%s\":\"%s\"", "traceID", span.SpanContext().TraceID().String())
-			fmt.Fprintf(buf, ",\"%s\":\"%s\"", "spanID", span.SpanContext().SpanID().String())
-			return 0, nil
+		HandleError:      true,
+		LogLatency:       true,
+		LogRemoteIP:      true,
+		LogHost:          true,
+		LogMethod:        true,
+		LogURI:           true,
+		LogStatus:        true,
+		LogContentLength: true,
+		LogResponseSize:  true,
+		LogValuesFunc: func(c *echo.Context, v echomiddleware.RequestLoggerValues) error {
+			attrs := []slog.Attr{
+				slog.String("remote_ip", v.RemoteIP),
+				slog.String("host", v.Host),
+				slog.String("method", v.Method),
+				slog.String("uri", v.URI),
+				slog.Int("status", v.Status),
+				slog.Duration("latency", v.Latency),
+				slog.String("bytes_in", v.ContentLength),
+				slog.Int64("bytes_out", v.ResponseSize),
+			}
+			if v.Error != nil {
+				attrs = append(attrs, slog.String("error", v.Error.Error()))
+			}
+			logger.LogAttrs(c.Request().Context(), slog.LevelInfo, "request", attrs...)
+			return nil
 		},
 	}))
 
@@ -187,21 +161,7 @@ func main() {
 		GoVersion:    goVersion,
 	}
 
-	// the usual *_build_info shape: a constant 1 whose labels carry the build
-	// identity, so dashboards can filter and join on the running version
-	buildInfo := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "concrnt",
-		Name:      "build_info",
-		Help:      "Build information of the running concrnt; the value is always 1.",
-		ConstLabels: prometheus.Labels{
-			"version":       version,
-			"go_version":    goVersion,
-			"build_time":    buildTime,
-			"build_machine": buildMachine,
-		},
-	})
-	buildInfo.Set(1)
-	prometheus.MustRegister(buildInfo)
+	observeBuildInfo()
 
 	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
 	if err != nil {
@@ -239,8 +199,6 @@ func main() {
 		panic("failed to run migrations: " + err.Error())
 	}
 
-	// the internal (operational) listener port, alongside the fixed public
-	// :8000; never expose it outside the cluster
 	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
 	if internalPort == "" {
 		internalPort = "8001"
@@ -251,7 +209,6 @@ func main() {
 		panic("concrnt.cluster.enable requires concrnt.cluster.electorEndpoint")
 	}
 
-	// every long-running loop reports here; a stalled one fails liveness
 	watchdog := health.NewWatchdog()
 
 	var elector cluster.Elector
@@ -284,8 +241,6 @@ func main() {
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)
 
-	// web push is gated on VAPID keys; without them neither the reactor nor
-	// the out-of-band counter-reset push exist
 	var webpushOpts *webpush.Options
 	if conf.Integrations.VapidPublicKey != "" && conf.Integrations.VapidPrivateKey != "" {
 		webpushOpts = &webpush.Options{
@@ -293,14 +248,7 @@ func main() {
 			VAPIDPublicKey:  conf.Integrations.VapidPublicKey,
 			VAPIDPrivateKey: conf.Integrations.VapidPrivateKey,
 			TTL:             30,
-			// webpush-go zero-pads every message up to RecordSize, so the wire
-			// body is always exactly RecordSize regardless of payload length.
-			// The default (4096) base64-encodes to ~5.5KB, which overflows the
-			// 4096-byte FCM/APNs data limit at webpush-relay and gets its
-			// encrypted payload dropped. 2048 keeps the base64 body (~2.7KB)
-			// within that limit while leaving ~1.9KB of plaintext room — ample
-			// for the minimal notification payload (see NotificationReactor).
-			RecordSize: 2048,
+			RecordSize:      2048, // keeps the base64 body under the 4096-byte FCM/APNs limit
 		}
 	}
 	var notificationPusher notification.Pusher
@@ -311,37 +259,13 @@ func main() {
 	notificationUC := notification.New(notificationRepo, redisKVS, notificationPusher)
 
 	leaderSub := worker.NewLeaderSubscriber(&domainConfig, cl, redisPubsub, discovery, watchdog)
+	observeLeaderSubscriber(leaderSub)
 	workerSub := worker.NewWorkerSubscriber(elector)
 	subscriber := worker.NewSubscriberManager(elector, leaderSub, workerSub)
 
 	subscriptionUC := subscription.New(subscriber, redisPubsub)
+	observeSubscription(subscriptionUC)
 	leaderSub.RegisterClient(subscriptionUC)
-
-	// sampled at scrape time; the replica-local client socket count, and the
-	// federation subscriber's peer hosts (non-zero only on the leader)
-	prometheus.MustRegister(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-		Namespace: "concrnt",
-		Name:      "realtime_connections",
-		Help:      "Realtime websocket connections from clients currently open on this replica.",
-	}, func() float64 {
-		return float64(subscriptionUC.SessionCount())
-	}))
-	peerOpts := func(state string) prometheus.GaugeOpts {
-		return prometheus.GaugeOpts{
-			Namespace:   "concrnt",
-			Name:        "peer_connections",
-			Help:        "Peer realtime hosts the federation subscriber keeps websockets to: desired (demanded) vs current (websocket established).",
-			ConstLabels: prometheus.Labels{"state": state},
-		}
-	}
-	prometheus.MustRegister(prometheus.NewGaugeFunc(peerOpts("desired"), func() float64 {
-		desired, _ := leaderSub.ConnectionCounts()
-		return float64(desired)
-	}))
-	prometheus.MustRegister(prometheus.NewGaugeFunc(peerOpts("current"), func() float64 {
-		_, current := leaderSub.ConnectionCounts()
-		return float64(current)
-	}))
 
 	chunklineGateway := gateway.NewChunklineGateway(cl, mc, subscriber, redisPubsub)
 	chunklineUC := chunkline.New(chunklineRepo, chunklineGateway, redisKVS, recordUC)
@@ -356,9 +280,6 @@ func main() {
 
 	var notificationReactor *worker.NotificationReactor
 	if webpushOpts != nil {
-		// cross-replica push dedup only matters when a leadership handover can
-		// overlap two reactors; standalone deployments skip the redis round
-		// trip per notification
 		var notificationDeduper worker.NotificationDeduper
 		if clustered {
 			notificationDeduper = pubsub.NewRedisDeduper(redis)
@@ -366,9 +287,6 @@ func main() {
 		notificationReactor = worker.NewNotificationReactor(notificationUC, subscriptionUC, notificationDeduper, *webpushOpts, watchdog)
 	}
 
-	// singleton workers run only while this replica holds the leadership: the
-	// federation subscriber (one peer websocket per remote host for the
-	// whole cluster), the chunkline cache updater, and the push reactor
 	go elector.Run(ctx, func(leadCtx context.Context) {
 		leaderSub.Start(leadCtx)
 		chunklineGateway.StartWorker(leadCtx, leaderSub)
@@ -419,34 +337,31 @@ func main() {
 	proxy := rest.NewProxy(conf.Services, authMiddleware.IdentifyIdentity)
 	proxy.RegisterRoutes(e)
 
-	static := e.Group("", echomiddleware.CORS())
+	static := e.Group("", echomiddleware.CORS("*"))
+	staticFiles := conf.Static.WithDefaults()
+	for route, path := range map[string]string{
+		"/tos":               staticFiles.TOS,
+		"/code-of-conduct":   staticFiles.CodeOfConduct,
+		"/register-template": staticFiles.RegisterTemplate,
+		"/robots.txt":        staticFiles.RobotsTxt,
+	} {
+		static.GET(route, func(c *echo.Context) error {
+			return c.File(path)
+		})
+		static.OPTIONS(route, func(c *echo.Context) error {
+			return c.NoContent(http.StatusOK)
+		})
+	}
 
-	rest.RegisterStaticFiles(static, conf.Static)
-
-	// the internal listener carries everything operational — liveness and
-	// readiness probes, the Prometheus scrape endpoint, and the
-	// replica-to-replica subscriber coordination API. it must never be
-	// exposed outside the cluster.
-	internal := echo.New()
-	internal.HideBanner = true
-	internal.HidePort = true
-
+	internal := echo.NewWithConfig(echoConfig)
 	internal.GET("/metrics", echoprometheus.NewHandler())
 
 	sqlDB, err := db.DB()
 	if err != nil {
 		panic("failed to get sql.DB: " + err.Error())
 	}
+	observeDatabase(sqlDB)
 
-	// connection pool usage (go_sql_*): the pool is small, so saturation
-	// and wait time are the first thing to check when everything gets slow
-	prometheus.MustRegister(collectors.NewDBStatsCollector(sqlDB, "concrnt"))
-
-	// every backend the public API needs gates readiness: postgres holds
-	// the data, redis carries delivery jobs and realtime events, memcached
-	// serves the timeline chunks. the sweep stays under the kubelet's probe
-	// timeout so a hung backend reads as "down" rather than as a timed-out
-	// probe with no body
 	readiness := health.NewReadiness(readinessTimeout)
 	readiness.Add("postgres", sqlDB.PingContext)
 	readiness.Add("redis", func(ctx context.Context) error {
@@ -462,56 +377,51 @@ func main() {
 	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
 	coordination.RegisterRoutes(internal)
 
-	go func() {
-		if err := internal.Start(":" + internalPort); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			// the probes target this listener, so a dead internal listener
-			// gets the process restarted by its supervisor; the public API
-			// keeps serving in the meantime
-			slog.Error("internal listener stopped unexpectedly", slog.String("error", err.Error()))
-		}
-	}()
+	apiCtx, stopAPI := context.WithCancel(context.Background())
+	defer stopAPI()
 
-	var serverFailed atomic.Bool
-	go func() {
-		if err := e.Start(":8000"); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("server stopped unexpectedly", slog.String("error", err.Error()))
-			serverFailed.Store(true)
-			stop()
-		}
-	}()
+	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
+		done <- echo.StartConfig{
+			Address:         address,
+			HideBanner:      true,
+			HidePort:        true,
+			GracefulTimeout: 15 * time.Second,
+			BeforeServeFunc: func(s *http.Server) error {
+				// repository imports and proxied uploads may legitimately
+				// take longer than echo's default 30s whole-request timeout
+				s.ReadTimeout = 0
+				s.ReadHeaderTimeout = 10 * time.Second
+				return nil
+			},
+		}.Start(ctx, handler)
+	}
 
-	<-ctx.Done()
+	apiDone := make(chan error, 1)
+	internalDone := make(chan error, 1)
+	go start(context.Background(), ":"+internalPort, internal, internalDone)
+	go start(apiCtx, ":8000", e, apiDone)
+
+	select {
+	case <-ctx.Done():
+	case err := <-apiDone:
+		slog.Error("server stopped unexpectedly", slog.String("error", err.Error()))
+		os.Exit(1)
+	case err := <-internalDone:
+		slog.Error("internal listener stopped unexpectedly", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
 
 	slog.Info("shutting down")
 	probes.Drain()
 
 	if clustered {
 		// keep serving briefly so the endpoint controller stops routing to
-		// this pod before connections are closed; the internal listener stays
-		// up through this window so /ready keeps answering 503
+		// this pod before connections are closed
 		time.Sleep(3 * time.Second)
 	}
 
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancelShutdown()
-
-	if err := e.Shutdown(shutdownCtx); err != nil {
+	stopAPI()
+	if err := <-apiDone; err != nil {
 		slog.Error("failed to shut down gracefully", slog.String("error", err.Error()))
-	}
-
-	// Shutdown does not touch hijacked connections: this is what terminates
-	// the realtime websockets so clients reconnect to another replica
-	e.Close()
-
-	// last: peers keep getting coordination answers until the public API is
-	// fully drained
-	if err := internal.Shutdown(shutdownCtx); err != nil {
-		slog.Error("failed to shut down internal listener", slog.String("error", err.Error()))
-	}
-
-	if serverFailed.Load() {
-		// e.g. the listen address was already bound: exit non-zero so
-		// supervisors keying on exit status restart the process
-		os.Exit(1)
 	}
 }

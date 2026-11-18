@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/concrnt/concrnt/impl/tags"
 )
 
 func ReceiveGatewayAuthPropagation(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		ctx, span := tracer.Start(c.Request().Context(), "Auth.Service.ReceiveGatewayAuthPropagation")
 		defer span.End()
 

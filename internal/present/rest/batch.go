@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 )
 
 // maxBatchParts caps how many application/http parts a single batch request
@@ -28,7 +28,7 @@ type batchCustomHandler struct {
 }
 
 func batchHandler(app *echo.Echo, fqdn string, customHandlers ...batchCustomHandler) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		req := c.Request()
 		ct := req.Header.Get("Content-Type")
 		mediaType, params, err := mime.ParseMediaType(ct)
@@ -117,7 +117,7 @@ func batchHandler(app *echo.Echo, fqdn string, customHandlers ...batchCustomHand
 		// succeeded: its deferred Close would otherwise commit a 200
 		// response and swallow any parse-error status returned above.
 		c.Response().Header().Set("Content-Type", "multipart/mixed; boundary="+boundary)
-		mw := multipart.NewWriter(c.Response().Writer)
+		mw := multipart.NewWriter(c.Response())
 		mw.SetBoundary(boundary)
 		defer mw.Close()
 

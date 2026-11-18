@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/concrnt/concrnt/internal/infra/health"
 )
@@ -46,7 +46,7 @@ type probeReport struct {
 	Checks map[string]string `json:"checks,omitempty"`
 }
 
-func (h *ProbeHandler) handleHealth(c echo.Context) error {
+func (h *ProbeHandler) handleHealth(c *echo.Context) error {
 	report := probeReport{Status: "ok", Checks: map[string]string{}}
 	for name, loop := range h.watchdog.Loops(time.Now()) {
 		switch loop.State {
@@ -66,7 +66,7 @@ func (h *ProbeHandler) handleHealth(c echo.Context) error {
 	return c.JSON(http.StatusOK, report)
 }
 
-func (h *ProbeHandler) handleReady(c echo.Context) error {
+func (h *ProbeHandler) handleReady(c *echo.Context) error {
 	if h.draining.Load() {
 		return c.JSON(http.StatusServiceUnavailable, probeReport{Status: "draining"})
 	}

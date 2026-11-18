@@ -20,7 +20,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	chunklineuc "github.com/concrnt/concrnt/internal/usecase/chunkline"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/require"
 )
 
@@ -294,7 +294,7 @@ func TestBatchHandlerIgnoresPartAuthorization(t *testing.T) {
 
 	app := echo.New()
 	app.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			auth := c.Request().Header.Get("Authorization")
 			if strings.HasPrefix(auth, "Bearer ") {
 				ctx := context.WithValue(c.Request().Context(), requesterKey{}, strings.TrimPrefix(auth, "Bearer "))
@@ -303,7 +303,7 @@ func TestBatchHandlerIgnoresPartAuthorization(t *testing.T) {
 			return next(c)
 		}
 	})
-	app.GET("/whoami", func(c echo.Context) error {
+	app.GET("/whoami", func(c *echo.Context) error {
 		requester, _ := c.Request().Context().Value(requesterKey{}).(string)
 		if requester == "" {
 			requester = "guest"

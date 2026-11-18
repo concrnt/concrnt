@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/stretchr/testify/require"
 
 	"github.com/concrnt/concrnt"
@@ -58,7 +58,6 @@ func newRealtimeTestServer(t *testing.T) (*httptest.Server, *fakePubsub) {
 	ps := &fakePubsub{}
 	h := &Handler{subscribe: subscription.New(noopEnsurer{}, ps)}
 	e := echo.New()
-	e.HideBanner = true
 	e.GET("/realtime", h.handleRealtime)
 	srv := httptest.NewServer(e)
 	t.Cleanup(srv.Close)
