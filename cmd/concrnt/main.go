@@ -42,6 +42,7 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
+	"github.com/concrnt/concrnt/internal/usecase/ratelimit"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/usecase/residence"
 	"github.com/concrnt/concrnt/internal/usecase/server"
@@ -283,6 +284,7 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	recordUC.SetIngestLimiter(ratelimit.New(redisKVS))
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)

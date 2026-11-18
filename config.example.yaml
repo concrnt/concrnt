@@ -9,6 +9,13 @@ concrnt:
   # it is handy to generate these info with concurrent.world devtool
   layer: concrnt-mainnet
   debug: false
+  # ingestLimit rate-limits commits from other servers' users, in commits per
+  # minute. optional; a missing or zero entry leaves that bucket unlimited.
+  # local users, and what this server fetches on its own, are never limited.
+  # ingestLimit:
+  #   unknown: 20   # one bucket shared by all users this server has never seen
+  #   min: 300      # per remote domain
+  #
   # note: the internal (operational) listener — /health, /ready and the
   # Prometheus /metrics endpoint — listens on :8001 (override with the
   # CONCRNT_INTERNAL_PORT environment variable). point liveness/readiness

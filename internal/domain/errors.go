@@ -1,6 +1,9 @@
 package domain
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Machine-readable error codes carried on API error responses, namespaced
 // like the CCAPI endpoint keys. Both the code and the message are API
@@ -113,3 +116,29 @@ func (e ValidationError) Is(target error) bool {
 }
 
 var ErrValidation = ValidationError{}
+
+// RateLimitError rejects a request that exceeds a rate limit. RetryAfter is
+// how long the caller should wait before trying again.
+type RateLimitError struct {
+	Reason     string
+	RetryAfter time.Duration
+}
+
+func (e RateLimitError) Error() string {
+	if e.Reason == "" {
+		return "rate limit exceeded"
+	}
+	return fmt.Sprintf("rate limit exceeded: %s", e.Reason)
+}
+
+// Is enables errors.Is matching on RateLimitError.
+func (e RateLimitError) Is(target error) bool {
+	_, ok := target.(RateLimitError)
+	if ok {
+		return true
+	}
+	_, ok = target.(*RateLimitError)
+	return ok
+}
+
+var ErrRateLimit = RateLimitError{}

@@ -11,6 +11,7 @@ import (
 	"github.com/concrnt/concrnt/client"
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
+	"github.com/concrnt/concrnt/internal/usecase/ratelimit"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/utils"
 	"github.com/concrnt/concrnt/policy"
@@ -130,7 +131,21 @@ type Usecase struct {
 	policy PolicyService
 	jobs   usecase.JobQueue
 	kvs    usecase.KVS
+	ingest IngestLimiter
 	cache  *cache.Cache
+}
+
+// IngestLimiter is the rate limiter behind the ingest limit; implemented by
+// ratelimit.Limiter.
+type IngestLimiter interface {
+	Allow(ctx context.Context, key string, limit ratelimit.Limit) (ratelimit.Result, error)
+}
+
+// SetIngestLimiter turns on the ingest limit configured in
+// domain.Config.IngestLimit. Without a limiter (offline tooling, tests)
+// nothing is limited.
+func (uc *Usecase) SetIngestLimiter(limiter IngestLimiter) {
+	uc.ingest = limiter
 }
 
 func New(

@@ -154,7 +154,7 @@ func (uc *Usecase) Deliver(ctx context.Context, job DeliveryJob) error {
 			}
 			return uc.signal.Publish(ctx, job.ResolveURI, *job.Event)
 		case DeliveryLocalCommit:
-			_, err := uc.Commit(ctx, job.IP, job.Payload, domain.CommitModeExecute)
+			_, err := uc.commit(ctx, job.IP, job.Payload, domain.CommitModeExecute, false)
 			return err
 		default:
 			return nil
