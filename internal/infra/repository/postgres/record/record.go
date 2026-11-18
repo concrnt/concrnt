@@ -146,34 +146,47 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	}
 
 	cckv := uri
-	// the leaf layer of a version its key has moved on from: that version's
-	// own policy, not the one of the record now on the key
-	var retainedLeaf *policyTuple
+	// for a ccfs URI, the layer the version itself carries: a version is
+	// evaluated under its own policy, whether its key still points at it or
+	// has moved on from it (a version kept by onUpdate retain)
+	var leaf *policyTuple
 	if parsed.Scheme == "ccfs" {
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var rk RecordKey
+		var commitLog CommitLog
 		err = r.db.WithContext(ctx).
-			Select("uri").
-			Where("record_id = ?", parsed.CDID).
-			Take(&rk).Error
-		switch {
-		case err == nil:
-			cckv = rk.URI
-		case errors.Is(err, gorm.ErrRecordNotFound):
-			// a version kept by onUpdate retain lives only in its commit log;
-			// its stack is its key's ancestors plus its own policy
-			leafURI, leaf, err := r.retainedVersionLayer(ctx, parsed.CDID)
-			if err != nil {
-				span.RecordError(err)
-				return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
-			}
-			cckv = leafURI
-			retainedLeaf = leaf
-		default:
+			Select("document").
+			Where("id = ? AND NOT gc_candidate", parsed.CDID).
+			Take(&commitLog).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, domain.NotFoundError{Resource: uri}
+		}
+		if err != nil {
 			span.RecordError(err)
 			return nil, err
+		}
+		var doc concrnt.Document[any]
+		if err := json.Unmarshal([]byte(commitLog.Document), &doc); err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		if doc.Kind != "record" || doc.Key == "" {
+			return nil, domain.NotFoundError{Resource: uri}
+		}
+		cckv = doc.Key
+		leaf = &policyTuple{Uri: doc.Key}
+		if doc.Policy != nil {
+			policyBytes, err := json.Marshal(doc.Policy)
+			if err != nil {
+				span.RecordError(err)
+				return nil, err
+			}
+			policyStr := string(policyBytes)
+			leaf.Policy = &policyStr
+		}
+		if doc.Distributes != nil {
+			leaf.Distributions = *doc.Distributes
 		}
 	}
 
@@ -213,10 +226,10 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 			tupleMap[res.Uri] = res
 		}
 	}
-	if retainedLeaf != nil {
+	if leaf != nil {
 		delete(tupleMap, cckv)
-		if retainedLeaf.Policy != nil || len(retainedLeaf.Distributions) > 0 {
-			tupleMap[cckv] = *retainedLeaf
+		if leaf.Policy != nil || len(leaf.Distributions) > 0 {
+			tupleMap[cckv] = *leaf
 		}
 	}
 
@@ -250,43 +263,6 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	}
 
 	return policies, nil
-}
-
-// retainedVersionLayer reads a record version no key points at any more from
-// its commit log (only while it is not flagged for gc, i.e. it asked to be
-// retained and was not deleted) and returns the key it was written to and the
-// policy layer the version itself carries.
-func (r *Repository) retainedVersionLayer(ctx context.Context, documentID string) (string, *policyTuple, error) {
-	var commitLog CommitLog
-	err := r.db.WithContext(ctx).
-		Select("document").
-		Where("id = ? AND NOT gc_candidate", documentID).
-		Take(&commitLog).Error
-	if err != nil {
-		return "", nil, err
-	}
-
-	var doc concrnt.Document[any]
-	if err := json.Unmarshal([]byte(commitLog.Document), &doc); err != nil {
-		return "", nil, err
-	}
-	if doc.Kind != "record" || doc.Key == "" {
-		return "", nil, fmt.Errorf("commit %s is not a record version", documentID)
-	}
-
-	leaf := &policyTuple{Uri: doc.Key}
-	if doc.Policy != nil {
-		policyBytes, err := json.Marshal(doc.Policy)
-		if err != nil {
-			return "", nil, err
-		}
-		policyStr := string(policyBytes)
-		leaf.Policy = &policyStr
-	}
-	if doc.Distributes != nil {
-		leaf.Distributions = *doc.Distributes
-	}
-	return doc.Key, leaf, nil
 }
 
 func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrnt.SignedDocument, error) {

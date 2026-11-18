@@ -20,6 +20,7 @@ const leaseKey = "net.concrnt.migration"
 var migrations = make(map[string]func(ctx context.Context) error)
 
 type ContextKey string
+
 const PostgresKey ContextKey = "postgres"
 
 type Repository interface {
