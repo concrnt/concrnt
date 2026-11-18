@@ -47,6 +47,7 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/residence"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/usecase/subscription"
+	"github.com/concrnt/concrnt/internal/usecase/trust"
 	"github.com/concrnt/concrnt/internal/worker"
 )
 
@@ -284,7 +285,8 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	recordUC.SetIngestLimiter(ratelimit.New(redisKVS))
+	trustUC := trust.New(recordRepo, &domainConfig)
+	recordUC.SetIngestLimiter(ratelimit.New(redisKVS), trustUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)

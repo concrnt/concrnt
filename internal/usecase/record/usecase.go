@@ -132,6 +132,7 @@ type Usecase struct {
 	jobs   usecase.JobQueue
 	kvs    usecase.KVS
 	ingest IngestLimiter
+	trust  DomainTrust
 	cache  *cache.Cache
 }
 
@@ -141,11 +142,19 @@ type IngestLimiter interface {
 	Allow(ctx context.Context, key string, limit ratelimit.Limit) (ratelimit.Result, error)
 }
 
+// DomainTrust scores how much this server trusts a remote domain, from 0 to
+// 1; implemented by trust.Usecase.
+type DomainTrust interface {
+	DomainTrust(ctx context.Context, domain string) float64
+}
+
 // SetIngestLimiter turns on the ingest limit configured in
 // domain.Config.IngestLimit. Without a limiter (offline tooling, tests)
-// nothing is limited.
-func (uc *Usecase) SetIngestLimiter(limiter IngestLimiter) {
+// nothing is limited. trust may be nil, which leaves every remote domain at
+// the minimum limit.
+func (uc *Usecase) SetIngestLimiter(limiter IngestLimiter, trust DomainTrust) {
 	uc.ingest = limiter
+	uc.trust = trust
 }
 
 func New(

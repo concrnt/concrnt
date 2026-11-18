@@ -44,7 +44,7 @@ func newIngestUsecase(entities entityLookup, limiter *stubLimiter) (*Usecase, *r
 		IngestLimit: domain.IngestLimit{Unknown: 20, Min: 300},
 	}
 	uc := New(withEntities(repo, entities), nil, newTestServerUsecase(cfg), cfg, nil, nopSignalService{}, nopPolicyService{}, nil, nil)
-	uc.SetIngestLimiter(limiter)
+	uc.SetIngestLimiter(limiter, nil)
 	return uc, repo
 }
 
@@ -218,5 +218,41 @@ func TestIngestLimitZeroEntryIsUnlimited(t *testing.T) {
 	}
 	if len(limiter.calls) != 0 {
 		t.Fatalf("limiter calls = %v, want none", limiter.calls)
+	}
+}
+
+type stubTrust map[string]float64
+
+func (s stubTrust) DomainTrust(ctx context.Context, domainName string) float64 {
+	return s[domainName]
+}
+
+// The more this server trusts a domain, the larger its bucket.
+func TestIngestLimitSizesDomainBucketByTrust(t *testing.T) {
+	cases := map[string]struct {
+		trust DomainTrust
+		want  int
+	}{
+		"untrusted domain gets min":     {stubTrust{}, 300},
+		"fully trusted domain gets max": {stubTrust{"remote.example.net": 1}, 30000},
+		"partly trusted is in between":  {stubTrust{"remote.example.net": 0.5}, 3000},
+		"without a trust source":        {nil, 300},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			ccid, priv := newIdentity(t)
+			limiter := &stubLimiter{}
+			uc, _ := newIngestUsecase(remoteEntity(ccid), limiter)
+			uc.config.IngestLimit.Max = 30000
+			uc.SetIngestLimiter(limiter, c.trust)
+
+			sd := signedRecord(t, ccid, priv, time.Now())
+			if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+			if got := limiter.calls[ingestTestRemoteBucket]; got != ratelimit.PerMinute(c.want) {
+				t.Fatalf("domain bucket limit = %v, want %d/min", got, c.want)
+			}
+		})
 	}
 }

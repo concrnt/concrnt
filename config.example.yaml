@@ -14,7 +14,19 @@ concrnt:
   # local users, and what this server fetches on its own, are never limited.
   # ingestLimit:
   #   unknown: 20   # one bucket shared by all users this server has never seen
-  #   min: 300      # per remote domain
+  #   min: 30       # per remote domain this server does not trust
+  #   max: 3000     # per remote domain this server fully trusts
+  #   # how much a remote domain is trusted is worked out from whom this
+  #   # server's users acknowledge: the seeds are trusted outright, each user
+  #   # passes trust on to the users they acknowledge, and a domain is trusted
+  #   # as much as its users are, added up. without seeds every domain gets min.
+  #   trust:
+  #     seeds:
+  #       - con1...
+  #     # schemas of the acknowledgements that count. optional; all count
+  #     # when left out.
+  #     ackSchemas:
+  #       - https://schema.concrnt.world/a/follow.json
   #
   # note: the internal (operational) listener — /health, /ready and the
   # Prometheus /metrics endpoint — listens on :8001 (override with the

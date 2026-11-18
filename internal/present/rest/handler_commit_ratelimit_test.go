@@ -39,7 +39,7 @@ func (fullLimiter) Allow(ctx context.Context, key string, limit ratelimit.Limit)
 func TestCommitAnswers429WithRetryAfterWhenRateLimited(t *testing.T) {
 	cfg := domain.Config{FQDN: "example.com", IngestLimit: domain.IngestLimit{Unknown: 1}}
 	recordUC := record.New(strangerRecordRepo{}, nil, nil, &cfg, nil, nil, nil, nil, nil)
-	recordUC.SetIngestLimiter(fullLimiter{})
+	recordUC.SetIngestLimiter(fullLimiter{}, nil)
 	h := &Handler{config: cfg, record: recordUC}
 
 	docBytes, err := json.Marshal(concrnt.Document[any]{Kind: "record", Author: "con1stranger", CreatedAt: time.Now()})

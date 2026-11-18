@@ -185,7 +185,7 @@ func (uc *Usecase) commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 	}
 
 	if limited && requester != nil && requester.Domain != "" && !uc.IsLocalEntity(ctx, requester) {
-		if err := uc.limitIngest(ctx, "ingest:domain:"+requester.Domain, uc.config.IngestLimit.Min, "too many commits from "+requester.Domain); err != nil {
+		if err := uc.limitDomain(ctx, requester.Domain); err != nil {
 			span.RecordError(err)
 			return nil, err
 		}

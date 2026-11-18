@@ -25,6 +25,16 @@ func (uc *Usecase) limitUnknownAuthor(ctx context.Context, author string) error 
 	return uc.limitIngest(ctx, "ingest:unknown", uc.config.IngestLimit.Unknown, "too many commits from unknown users")
 }
 
+// limitDomain charges the bucket of a remote domain, sized by how much this
+// server trusts it.
+func (uc *Usecase) limitDomain(ctx context.Context, domainName string) error {
+	trust := 0.0
+	if uc.trust != nil {
+		trust = uc.trust.DomainTrust(ctx, domainName)
+	}
+	return uc.limitIngest(ctx, "ingest:domain:"+domainName, uc.config.IngestLimit.DomainLimit(trust), "too many commits from "+domainName)
+}
+
 // limitIngest counts one commit against the bucket and returns a
 // domain.RateLimitError when it is over perMinute. A limiter failure lets the
 // commit through: losing the limit for a while is better than refusing all
