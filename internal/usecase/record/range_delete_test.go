@@ -305,10 +305,10 @@ func TestCommitRangeDeleteSubtree(t *testing.T) {
 	}
 }
 
-// A deleted document with onUpdate=retain keeps its history: neither its
-// commit nor the delete commit is flagged for gc, so a repository replay
-// reproduces the document and its deletion.
-func TestCommitDeleteRetainKeepsHistory(t *testing.T) {
+// onUpdate=retain keeps a version readable while its key moves on, not after
+// it is deleted: a deleted retained document is flagged for gc like any
+// other, and so is the delete commit itself.
+func TestCommitDeleteFlagsRetainedTargets(t *testing.T) {
 	ccid, priv := newIdentity(t)
 	cfg := &domain.Config{FQDN: "example.com"}
 
@@ -316,32 +316,37 @@ func TestCommitDeleteRetainKeepsHistory(t *testing.T) {
 	retained.Document = strings.Replace(retained.Document, `"kind":"record"`, `"kind":"record","onUpdate":"retain"`, 1)
 	forgotten := subtreeRecord(t, rangeBaseURI+"/a")
 
-	t.Run("retained target keeps both commits", func(t *testing.T) {
-		repo := &rangeDeleteRepo{subtree: []concrnt.SignedDocument{retained}}
-		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, &recordingDeliveryQueue{}, nil)
+	for _, tc := range []struct {
+		name    string
+		targets []concrnt.SignedDocument
+	}{
+		{"retained target", []concrnt.SignedDocument{retained}},
+		{"retained and forgotten targets", []concrnt.SignedDocument{retained, forgotten}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &rangeDeleteRepo{subtree: tc.targets}
+			uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, &recordingDeliveryQueue{}, nil)
 
-		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
-		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
-			t.Fatalf("Commit returned error: %v", err)
-		}
-		if len(repo.gcFlagged) != 0 {
-			t.Fatalf("nothing may be flagged for gc when the target is retained, got %v", repo.gcFlagged)
-		}
-	})
+			sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
+			if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
+				t.Fatalf("Commit returned error: %v", err)
+			}
 
-	t.Run("one retained target keeps the delete for all", func(t *testing.T) {
-		repo := &rangeDeleteRepo{subtree: []concrnt.SignedDocument{retained, forgotten}}
-		uc := newRangeDeleteUsecase(ccid, cfg, repo, &denyKeysPolicyService{}, &recordingDeliveryQueue{}, nil)
-
-		sd := signedDelete(t, ccid, priv, rangeBaseURI+"*")
-		if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeExecute); err != nil {
-			t.Fatalf("Commit returned error: %v", err)
-		}
-		forgottenID, _ := forgotten.CDID()
-		if !slices.Equal(repo.gcFlagged, []string{forgottenID}) {
-			t.Fatalf("gc flagged = %v, want only the forgotten target %s", repo.gcFlagged, forgottenID)
-		}
-	})
+			deleteID, _ := sd.CDID()
+			want := []string{}
+			for _, target := range tc.targets {
+				id, _ := target.CDID()
+				want = append(want, id)
+			}
+			want = append(want, deleteID)
+			got := slices.Clone(repo.gcFlagged)
+			slices.Sort(got)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("gc flagged = %v, want every target and the delete itself %v", got, want)
+			}
+		})
+	}
 }
 
 // A children-only range delete ("...l1/*") enumerates without includeSelf.

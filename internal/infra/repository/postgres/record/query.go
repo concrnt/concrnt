@@ -24,33 +24,34 @@ func (r *Repository) QueryByPrefix(
 
 	query := r.db.WithContext(ctx).
 		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id").
-		Where("uri LIKE ?", prefix+"%")
+		Joins("Document").
+		Where("record_keys.record_id IS NOT NULL").
+		Where("record_keys.uri LIKE ?", prefix+"%")
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		query = query.Where("record_keys.schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		query = query.Where("record_keys.author = ?", author)
 	}
 	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
+		query = query.Where("record_keys.record_created_at >= ?", *since)
 	}
 	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
+		query = query.Where("record_keys.record_created_at <= ?", *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
+		query = query.Order("record_keys.record_created_at DESC, record_keys.record_id DESC")
 	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
+		query = query.Order("record_keys.record_created_at ASC, record_keys.record_id ASC")
 	}
 
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -73,17 +74,18 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 
 	query := r.db.WithContext(ctx).
 		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("Document").
+		Where("record_keys.record_id IS NOT NULL")
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
 	if includeSelf {
-		query = query.Where(`uri = ? OR uri LIKE ? ESCAPE '\'`, base, subtreePattern)
+		query = query.Where(`record_keys.uri = ? OR record_keys.uri LIKE ? ESCAPE '\'`, base, subtreePattern)
 	} else {
-		query = query.Where(`uri LIKE ? ESCAPE '\'`, subtreePattern)
+		query = query.Where(`record_keys.uri LIKE ? ESCAPE '\'`, subtreePattern)
 	}
 
 	var rks []RecordKey
-	if err := query.Order("uri ASC").Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Order("record_keys.uri ASC").Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -91,18 +93,18 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	sds := make([]concrnt.SignedDocument, 0, len(rks))
 	for _, rk := range rks {
 		var proof concrnt.Proof
-		err := json.Unmarshal([]byte(rk.Record.Document.Proof), &proof)
+		err := json.Unmarshal([]byte(rk.Document.Proof), &proof)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err
 		}
 
-		ccfs := concrnt.ComposeCCFSURI(rk.Record.Owner, concrnt.CCFSTypeConcrnt, rk.Record.DocumentID)
+		ccfs := concrnt.ComposeCCFSURI(rk.Owner, concrnt.CCFSTypeConcrnt, *rk.RecordID)
 
 		sds = append(sds, concrnt.SignedDocument{
 			CCKV:     &rk.URI,
 			CCFS:     &ccfs,
-			Document: rk.Record.Document.Document,
+			Document: rk.Document.Document,
 			Proof:    proof,
 		})
 	}
@@ -122,9 +124,14 @@ func (r *Repository) QueryByParent(
 
 	var rks []RecordKey
 
+	// record_created_at IS NOT NULL keeps placeholders out and matches the
+	// predicate of the partial idx_record_keys_parent_created_at_record_id,
+	// which serves the ordering, so the limit applies before the commit log
+	// join.
 	query := r.db.WithContext(ctx).
 		Model(&RecordKey{}).
-		Joins("JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("Document").
+		Where("record_keys.record_id IS NOT NULL AND record_keys.record_created_at IS NOT NULL")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
 	// keys carry parent_id NULL (getOrCreateParentRecordKey), so the root is
@@ -135,35 +142,35 @@ func (r *Repository) QueryByParent(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`record_keys.parent_id IS NULL AND record_keys.uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+		query = query.Where("record_keys.parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		query = query.Where("record_keys.schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		query = query.Where("record_keys.author = ?", author)
 	}
 	if since != nil {
-		query = query.Where("r.created_at >= ?", *since)
+		query = query.Where("record_keys.record_created_at >= ?", *since)
 	}
 	if until != nil {
-		query = query.Where("r.created_at <= ?", *until)
+		query = query.Where("record_keys.record_created_at <= ?", *until)
 	}
 
 	if order == "desc" {
-		query = query.Order("r.created_at DESC, r.document_id DESC")
+		query = query.Order("record_keys.record_created_at DESC, record_keys.record_id DESC")
 	} else {
-		query = query.Order("r.created_at ASC, r.document_id ASC")
+		query = query.Order("record_keys.record_created_at ASC, record_keys.record_id ASC")
 	}
 
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -172,9 +179,9 @@ func (r *Repository) QueryByParent(
 }
 
 // QueryByParentOrderByKey lists parent's direct children ordered by their
-// cckv (CIP-5 orderby=key). The LEFT JOIN keeps placeholder keys (record_id
-// NULL) so intermediate keys come back as key-only rows; a schema or author
-// filter compares record columns and so drops them. since/until are
+// cckv (CIP-5 orderby=key). Placeholder keys (record_id NULL; the commit log
+// join is a LEFT JOIN) come back as key-only rows; a schema or author filter
+// compares record columns and so drops them. since/until are
 // inclusive key bounds, the cursors of §3.3 for this ordering.
 func (r *Repository) QueryByParentOrderByKey(
 	ctx context.Context,
@@ -190,7 +197,7 @@ func (r *Repository) QueryByParentOrderByKey(
 
 	query := r.db.WithContext(ctx).
 		Model(&RecordKey{}).
-		Joins("LEFT JOIN records r ON r.document_id = record_keys.record_id")
+		Joins("Document")
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -198,16 +205,16 @@ func (r *Repository) QueryByParentOrderByKey(
 		return nil, err
 	}
 	if parsedParent.Key == "" {
-		query = query.Where(`parent_id IS NULL AND uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
+		query = query.Where(`record_keys.parent_id IS NULL AND record_keys.uri LIKE ? ESCAPE '\'`, likeEscaper.Replace("cckv://"+parsedParent.Owner)+"/%")
 	} else {
-		query = query.Where("parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
+		query = query.Where("record_keys.parent_id = (SELECT id FROM record_keys WHERE uri = ?)", parent)
 	}
 
 	if schema != "" {
-		query = query.Where("r.schema = ?", schema)
+		query = query.Where("record_keys.schema = ?", schema)
 	}
 	if author != "" {
-		query = query.Where("r.author = ?", author)
+		query = query.Where("record_keys.author = ?", author)
 	}
 	if since != nil {
 		query = query.Where("record_keys.uri >= ?", *since)
@@ -226,7 +233,7 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Preload("Record.Document").Find(&rks).Error; err != nil {
+	if err := query.Find(&rks).Error; err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

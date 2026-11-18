@@ -19,6 +19,10 @@ const leaseKey = "net.concrnt.migration"
 
 var migrations = make(map[string]func(ctx context.Context) error)
 
+type ContextKey string
+
+const PostgresKey ContextKey = "postgres"
+
 type Repository interface {
 	GetState(ctx context.Context, name string) (string, error)
 	SetState(ctx context.Context, name string, state string) error
@@ -94,7 +98,20 @@ func (m *Migrator) Do(ctx context.Context, version string) error {
 		return semver.Compare(allMigrations[i], currentVersion) > 0
 	})
 
-	toRun := allMigrations[splitter:]
+	// Migrations above the running version belong to a release this binary is
+	// not: they wait for the binary that is.
+	limit := sort.Search(len(allMigrations), func(i int) bool {
+		return semver.Compare(allMigrations[i], version) > 0
+	})
+	if limit < splitter {
+		limit = splitter
+	}
+
+	toRun := allMigrations[splitter:limit]
+
+	if held := allMigrations[limit:]; len(held) > 0 {
+		slog.Warn("migrations above the running version are not run", "version", version, "versions", held)
+	}
 
 	if len(toRun) == 0 {
 		slog.Info("no migrations to run")

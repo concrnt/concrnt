@@ -126,25 +126,20 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 		Where("record_created_at < ?", chunkDate).
 		Order("record_created_at DESC").
 		Limit(defaultChunkSize).
-		Preload("Record").
-		Preload("Record.Document").
 		Find(&members).Error
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	// Judge window coverage by record_created_at — the same column the queries
-	// filter and order by — not the joined Record.CreatedAt, which can diverge
-	// (e.g. backdated records) and would skip the window scan.
+	// Judge window coverage by record_created_at, the column the queries
+	// filter and order by.
 	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
 		err = r.db.WithContext(ctx).
 			Where("parent_id = ?", parentRecordKey.ID).
 			Where("record_created_at < ?", chunkDate).
 			Where("record_created_at >= ?", prevChunkDate).
 			Order("record_created_at DESC").
-			Preload("Record").
-			Preload("Record.Document").
 			Find(&members).Error
 		if err != nil {
 			span.RecordError(err)
@@ -158,11 +153,11 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 
 		href := member.URI
 		contentType := "application/concrnt.document+json"
-		if member.Record.Redirect != nil {
-			href = *member.Record.Redirect
+		if member.Redirect != nil {
+			href = *member.Redirect
 		}
 
-		timestamp := member.Record.CreatedAt
+		var timestamp time.Time
 		if member.RecordCreatedAt != nil {
 			timestamp = *member.RecordCreatedAt
 		}

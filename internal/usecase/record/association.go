@@ -150,23 +150,16 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 				span.RecordError(err)
 				return nil, errors.Join(errors.New("target document failed signature verification"), err)
 			}
-
-			var targetDoc concrnt.Document[any]
-			err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-
-			distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
-		} else { // あるとき
-			dists, err := uc.repo.GetDistributions(ctx, target)
-			if err != nil {
-				span.RecordError(err)
-				return nil, err
-			}
-			distributions = append(distributions, dists...)
 		}
+
+		var targetDoc concrnt.Document[any]
+		err = json.Unmarshal([]byte(targetSD.Document), &targetDoc)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+
+		distributions = append(distributions, distributionsFromPtr(targetDoc.Distributes)...)
 
 		// 各タイムラインを購読しているクライアントに、そのタイムラインにassociationが追加されたことを通知するために、
 		// association本体をリモートサーバーに転送し、eventの発生を促す。

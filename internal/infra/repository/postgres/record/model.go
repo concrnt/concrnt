@@ -19,8 +19,11 @@ import (
 //     pgrecord.Repository.QueryCommitLogs.
 //   - idx_commit_logs_gc_candidate (gc_candidate): marks commits for later GC
 //     scans; set by pgrecord.Repository.CreateRecord when replacing a key
-//     and by pgrecord.Repository.MarkCommitLogsGcCandidateByOwner on
-//     unregister.
+//     (unless the replaced version asked to be retained), by
+//     pgrecord.Repository.MarkCommitLogGcCandidate on delete and by
+//     pgrecord.Repository.MarkCommitLogsGcCandidateByOwner on unregister.
+//     A flagged commit is no longer served by ccfs
+//     (pgrecord.Repository.GetSignedDocument).
 type CommitLog struct {
 	ID          string    `json:"id" gorm:"primaryKey;type:text;index:idx_commit_logs_c_date_id,priority:2"`
 	IP          string    `json:"ip" gorm:"type:text"`
@@ -31,6 +34,15 @@ type CommitLog struct {
 	CDate       time.Time `json:"cdate" gorm:"type:timestamp with time zone;not null;default:clock_timestamp();index:idx_commit_logs_owner_c_date,priority:2;index:idx_commit_logs_c_date_id,priority:1"`
 }
 
+// RecordKey is one cckv slot and, while it holds one, the record written to
+// it: the record's columns live on the key row itself, so a listing reads one
+// table (plus commit_logs for the signed document). A placeholder key (an
+// ancestor materialized by a child write, or a removed key that still has
+// children) has RecordID NULL and every record column NULL. A version the
+// key has moved on from is not on any row: when it asked to be retained
+// (onUpdate "retain") it stays readable through its commit log by ccfs,
+// otherwise its commit log is flagged gc_candidate.
+//
 // Indexes:
 //   - PRIMARY KEY (id): internal key identity; used by parent_id references and
 //     associations.target_id joins in pgrecord.Repository.GetAssociated*.
@@ -38,57 +50,52 @@ type CommitLog struct {
 //     pgrecord.getRecordKeyByURI, getOrCreateParentRecordKey, CreateRecord,
 //     GetSignedDocument, ChunklineRepository.GetChunklineManifest/LookupLocalItrs,
 //     and association target lookups.
-//   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup
-//     and record joins; used by pgrecord.Repository.GetSignedDocument and
-//     GetHierarchicalRecordPolicies.
-//   - idx_record_keys_parent_id_record_id (parent_id, record_id): parent member
-//     lookup and record preload joins; used by pgrecord.Repository.QueryByParent.
+//   - idx_record_keys_record_id UNIQUE (record_id): reverse ccfs-to-cckv lookup;
+//     used by pgrecord.Repository.GetSignedDocument,
+//     GetHierarchicalRecordPolicies and DeleteRecordByDocumentID.
+//   - idx_record_keys_uri_pattern (uri text_pattern_ops): URI prefix
+//     matches (uri LIKE 'prefix%'), which the unique index cannot serve
+//     under a non-C collation; used by pgrecord.Repository.QueryByPrefix,
+//     QueryRecordSubtree and the owner-root branches of QueryByParent and
+//     QueryByParentOrderByKey.
 //   - idx_record_keys_parent_created_at_record_id
 //     (parent_id, record_created_at DESC, record_id) WHERE parent_id IS NOT NULL
-//     AND record_created_at IS NOT NULL: timeline/chunkline range scans without
-//     joining records; used by pgrecord.ChunklineRepository.GetChunklineManifest,
-//     LookupLocalItrs, and LoadLocalBody.
+//     AND record_created_at IS NOT NULL: parent listings and timeline/chunkline
+//     range scans; used by pgrecord.Repository.QueryByParent and
+//     pgrecord.ChunklineRepository.GetChunklineManifest, LookupLocalItrs, and
+//     LoadLocalBody.
 //   - idx_record_keys_parent_id_uri (parent_id, uri): key-ordered child listing
-//     including placeholder keys (no record_created_at predicate); used by
-//     pgrecord.Repository.QueryByParentOrderByKey.
+//     including placeholder keys (no record_created_at predicate) and the
+//     child-existence checks of a key removal; used by
+//     pgrecord.Repository.QueryByParentOrderByKey and removeRecordKey.
+//   - idx_record_keys_schema_created_at_record_id
+//     (schema, record_created_at, record_id): schema/time-ordered record
+//     searches; used by pgrecord.Repository.QueryByPrefix and QueryByParent
+//     when a schema filter is present.
+//   - idx_record_keys_author_created_at_record_id
+//     (author, record_created_at, record_id): author/time-ordered record
+//     searches; used by pgrecord.Repository.QueryByPrefix and QueryByParent
+//     when the author filter is present.
 type RecordKey struct {
-	ID              int64      `json:"id" gorm:"primaryKey;autoIncrement"`
-	ParentID        *int64     `json:"parentID" gorm:"index:idx_record_keys_parent_id_record_id,priority:1;index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
-	URI             string     `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2"`
-	RecordID        *string    `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_id_record_id,priority:2;index:idx_record_keys_parent_created_at_record_id,priority:3,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL"`
-	Record          Record     `json:"record" gorm:"foreignKey:RecordID;references:DocumentID;constraint:OnDelete:CASCADE;"`
-	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone;index:idx_record_keys_parent_created_at_record_id,priority:2,sort:desc,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL"`
-	CleanOnUpdate   bool       `json:"cleanOnUpdate" gorm:"type:boolean;not null;default:false"`
-}
+	ID       int64     `json:"id" gorm:"primaryKey;autoIncrement"`
+	ParentID *int64    `json:"parentID" gorm:"index:idx_record_keys_parent_created_at_record_id,priority:1,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_parent_id_uri,priority:1"`
+	URI      string    `json:"uri" gorm:"type:text;unique;index:idx_record_keys_parent_id_uri,priority:2;index:idx_record_keys_uri_pattern,expression:uri text_pattern_ops"`
+	RecordID *string   `json:"recordID" gorm:"type:text;uniqueIndex;index:idx_record_keys_parent_created_at_record_id,priority:3,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_schema_created_at_record_id,priority:3;index:idx_record_keys_author_created_at_record_id,priority:3"`
+	Document CommitLog `json:"-" gorm:"foreignKey:RecordID;references:ID;constraint:OnDelete:CASCADE;"`
 
-// Indexes:
-//   - PRIMARY KEY (document_id): record payload lookup and foreign-key target;
-//     used by preloads from RecordKey.Record and direct deletes in
-//     pgrecord.Repository.CreateRecord/Delete.
-//   - idx_records_schema_created_at_document_id (schema, created_at, document_id):
-//     schema/time-ordered record searches; used by pgrecord.Repository
-//     QueryByPrefix and QueryByParent when schema/time filters are present.
-//   - idx_records_author_created_at_document_id (author, created_at, document_id):
-//     author/time-ordered record searches; used by pgrecord.Repository
-//     QueryByPrefix and QueryByParent when the author filter is present.
-//   - idx_records_document_id_created_at (document_id, created_at): record join
-//     plus timestamp predicate support for record_keys-to-records joins that still
-//     need records.created_at.
-type Record struct {
-	DocumentID string    `json:"id" gorm:"primaryKey;type:text;index:idx_records_schema_created_at_document_id,priority:3;index:idx_records_author_created_at_document_id,priority:3;index:idx_records_document_id_created_at,priority:1"`
-	Document   CommitLog `json:"documnet" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
-	Owner      string    `json:"owner" gorm:"type:text"`
-	// document author; NULL only on rows written before the column existed
-	// (backfilled by conctl op repair-record-authors)
-	Author        string         `json:"author" gorm:"type:text;index:idx_records_author_created_at_document_id,priority:1"`
+	// The record columns below are NULL on a placeholder key. Owner, Author
+	// and Schema carry `default:null` so that gorm leaves them out of the
+	// INSERT of a placeholder instead of writing "".
+	Owner         string         `json:"owner" gorm:"type:text;default:null"`
+	Author        string         `json:"author" gorm:"type:text;default:null;index:idx_record_keys_author_created_at_record_id,priority:1"`
+	Schema        string         `json:"schema" gorm:"type:text;default:null;index:idx_record_keys_schema_created_at_record_id,priority:1"`
 	Redirect      *string        `json:"redirect" gorm:"type:text"`
-	Schema        string         `json:"schema" gorm:"type:text;index:idx_records_schema_created_at_document_id,priority:1"`
 	Policies      *string        `json:"policies" gorm:"type:text"`
 	Distributions pq.StringArray `json:"distributions" gorm:"type:text[]"`
-	// user-provided creation time
-	CreatedAt time.Time `json:"createdAt" gorm:"type:timestamp with time zone;not null;index:idx_records_schema_created_at_document_id,priority:2;index:idx_records_author_created_at_document_id,priority:2;index:idx_records_document_id_created_at,priority:2"`
-	// record creation time in the system
-	CDate time.Time `json:"cdate" gorm:"->;<-:create;type:timestamp with time zone;not null;default:clock_timestamp()"`
+	// the record's user-provided creation time (the document's createdAt, or
+	// the referenced document's for a reference record)
+	RecordCreatedAt *time.Time `json:"recordCreatedAt,omitempty" gorm:"type:timestamp with time zone;index:idx_record_keys_parent_created_at_record_id,priority:2,sort:desc,where:parent_id IS NOT NULL AND record_created_at IS NOT NULL;index:idx_record_keys_schema_created_at_record_id,priority:2;index:idx_record_keys_author_created_at_record_id,priority:2"`
+	CleanOnUpdate   bool       `json:"cleanOnUpdate" gorm:"type:boolean;not null;default:false"`
 }
 
 // Indexes:

@@ -186,30 +186,76 @@ func main() {
 	serverRepo := pgserver.New(&domainConfig, db, cl)
 	stateRepo := pgstate.New(db)
 
-	migrationLease := pglease.New(db)
-	err = migrations.Migrate(ctx, migrationLease, abuseRepo, entityMetaRepo, notificationRepo, recordRepo, serverRepo, stateRepo)
+	sqlDB, err := db.DB()
 	if err != nil {
-		panic("failed to migrate database: " + err.Error())
+		panic("failed to get sql.DB: " + err.Error())
 	}
+	observeDatabase(sqlDB)
 
-	migrator := migrations.NewMigrator(stateRepo, migrationLease)
+	watchdog := health.NewWatchdog()
 
-	err = migrator.Do(ctx, version)
-	if err != nil {
-		panic("failed to run migrations: " + err.Error())
-	}
+	readiness := health.NewReadiness(readinessTimeout)
+	readiness.Add("postgres", sqlDB.PingContext)
+	readiness.Add("redis", func(ctx context.Context) error {
+		return redis.Ping(ctx).Err()
+	})
+	readiness.Add("memcached", func(ctx context.Context) error {
+		return mc.Ping()
+	})
+
+	probes := rest.NewProbeHandler(watchdog, readiness)
+	probes.Starting("schema-migration")
 
 	internalPort := os.Getenv("CONCRNT_INTERNAL_PORT")
 	if internalPort == "" {
 		internalPort = "8001"
 	}
 
+	internal := echo.NewWithConfig(echoConfig)
+	internal.GET("/metrics", echoprometheus.NewHandler())
+	probes.RegisterRoutes(internal)
+
+	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
+		done <- echo.StartConfig{
+			Address:         address,
+			HideBanner:      true,
+			HidePort:        true,
+			GracefulTimeout: 15 * time.Second,
+			BeforeServeFunc: func(s *http.Server) error {
+				// repository imports and proxied uploads may legitimately
+				// take longer than echo's default 30s whole-request timeout
+				s.ReadTimeout = 0
+				s.ReadHeaderTimeout = 10 * time.Second
+				return nil
+			},
+		}.Start(ctx, handler)
+	}
+
+	// opens before the migrations so that /ready and /metrics answer while
+	// they run
+	internalDone := make(chan error, 1)
+	go start(context.Background(), ":"+internalPort, internal, internalDone)
+
+	migrationLease := pglease.New(db)
+	err = migrations.Migrate(ctx, migrationLease, abuseRepo, entityMetaRepo, notificationRepo, recordRepo, serverRepo, stateRepo)
+	if err != nil {
+		panic("failed to migrate database: " + err.Error())
+	}
+
+	probes.Starting("data-migration")
+	migrator := migrations.NewMigrator(stateRepo, migrationLease)
+
+	err = migrator.Do(context.WithValue(ctx, migrations.PostgresKey, db), version)
+	if err != nil {
+		panic("failed to run migrations: " + err.Error())
+	}
+
+	probes.Starting("wiring")
+
 	clustered := conf.Concrnt.Cluster.Enable
 	if clustered && conf.Concrnt.Cluster.ElectorEndpoint == "" {
 		panic("concrnt.cluster.enable requires concrnt.cluster.electorEndpoint")
 	}
-
-	watchdog := health.NewWatchdog()
 
 	var elector cluster.Elector
 	var discovery worker.PeerDiscovery // nil in standalone mode: no peers to poll
@@ -353,53 +399,24 @@ func main() {
 		})
 	}
 
-	internal := echo.NewWithConfig(echoConfig)
-	internal.GET("/metrics", echoprometheus.NewHandler())
+	coordinationDone := make(chan error, 1)
+	if clustered {
+		coordinationPort := os.Getenv("CONCRNT_COORDINATION_PORT")
+		if coordinationPort == "" {
+			coordinationPort = "8003"
+		}
 
-	sqlDB, err := db.DB()
-	if err != nil {
-		panic("failed to get sql.DB: " + err.Error())
+		coordination := echo.NewWithConfig(echoConfig)
+		rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector).RegisterRoutes(coordination)
+		go start(context.Background(), ":"+coordinationPort, coordination, coordinationDone)
 	}
-	observeDatabase(sqlDB)
-
-	readiness := health.NewReadiness(readinessTimeout)
-	readiness.Add("postgres", sqlDB.PingContext)
-	readiness.Add("redis", func(ctx context.Context) error {
-		return redis.Ping(ctx).Err()
-	})
-	readiness.Add("memcached", func(ctx context.Context) error {
-		return mc.Ping()
-	})
-
-	probes := rest.NewProbeHandler(watchdog, readiness)
-	probes.RegisterRoutes(internal)
-
-	coordination := rest.NewSubscriberCoordinationHandler(subscriptionUC, leaderSub, leaderSub, elector)
-	coordination.RegisterRoutes(internal)
 
 	apiCtx, stopAPI := context.WithCancel(context.Background())
 	defer stopAPI()
 
-	start := func(ctx context.Context, address string, handler *echo.Echo, done chan<- error) {
-		done <- echo.StartConfig{
-			Address:         address,
-			HideBanner:      true,
-			HidePort:        true,
-			GracefulTimeout: 15 * time.Second,
-			BeforeServeFunc: func(s *http.Server) error {
-				// repository imports and proxied uploads may legitimately
-				// take longer than echo's default 30s whole-request timeout
-				s.ReadTimeout = 0
-				s.ReadHeaderTimeout = 10 * time.Second
-				return nil
-			},
-		}.Start(ctx, handler)
-	}
-
 	apiDone := make(chan error, 1)
-	internalDone := make(chan error, 1)
-	go start(context.Background(), ":"+internalPort, internal, internalDone)
 	go start(apiCtx, ":8000", e, apiDone)
+	probes.Started()
 
 	select {
 	case <-ctx.Done():
@@ -408,6 +425,9 @@ func main() {
 		os.Exit(1)
 	case err := <-internalDone:
 		slog.Error("internal listener stopped unexpectedly", slog.String("error", err.Error()))
+		os.Exit(1)
+	case err := <-coordinationDone:
+		slog.Error("coordination listener stopped unexpectedly", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 

@@ -12,6 +12,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
+	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/testutil"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/schemas"
@@ -54,15 +55,11 @@ func TestRecordRepositoryWrites(t *testing.T) {
 
 		requireCommitOwner(t, db, "record-1-old", "con1owner")
 
-		var stored Record
-		require.NoError(t, db.Where("document_id = ?", "record-1-old").Take(&stored).Error)
-		require.Equal(t, "con1owner", stored.Owner)
-		require.Equal(t, "https://schema.example/post.json", stored.Schema)
-		require.Equal(t, distributions, []string(stored.Distributions))
-		require.True(t, stored.CreatedAt.Equal(createdAt))
-
 		var recordKey RecordKey
 		require.NoError(t, db.Where("uri = ?", key).Take(&recordKey).Error)
+		require.Equal(t, "con1owner", recordKey.Owner)
+		require.Equal(t, "https://schema.example/post.json", recordKey.Schema)
+		require.Equal(t, distributions, []string(recordKey.Distributions))
 		require.NotNil(t, recordKey.RecordID)
 		require.Equal(t, "record-1-old", *recordKey.RecordID)
 		require.NotNil(t, recordKey.RecordCreatedAt)
@@ -97,14 +94,12 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		require.NoError(t, db.Where("id = ?", "record-1-old").Take(&commit).Error)
 		require.True(t, commit.GcCandidate)
 
-		var oldRecordCount int64
-		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "record-1-old").Count(&oldRecordCount).Error)
-		require.Zero(t, oldRecordCount)
+		// the forgotten version is no longer served by ccfs
+		_, err = repo.GetSignedDocument(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, "record-1-old"))
+		require.ErrorIs(t, err, domain.ErrNotFound)
 
-		var newRecord Record
-		require.NoError(t, db.Where("document_id = ?", "record-2-new").Take(&newRecord).Error)
-		require.Equal(t, "https://schema.example/post.v2.json", newRecord.Schema)
-		require.True(t, newRecord.CreatedAt.Equal(newCreatedAt))
+		require.Equal(t, "https://schema.example/post.v2.json", recordKey.Schema)
+		require.Empty(t, recordKey.Distributions)
 
 		// accept-if-newer: a replayed older (or identical) document must not
 		// roll the key back, and must not tombstone the stored newer version.
@@ -124,9 +119,8 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		var keptCommit CommitLog
 		require.NoError(t, db.Where("id = ?", "record-2-new").Take(&keptCommit).Error)
 		require.False(t, keptCommit.GcCandidate)
-		var newRecordCount int64
-		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "record-2-new").Count(&newRecordCount).Error)
-		require.EqualValues(t, 1, newRecordCount)
+		require.Equal(t, "https://schema.example/post.v2.json", keptRecordKey.Schema)
+		require.True(t, keptRecordKey.RecordCreatedAt.Equal(newCreatedAt))
 	})
 
 	// CIP-1 §5.7: omitting onUpdate means forget — replacing the key must drop
@@ -172,12 +166,13 @@ func TestRecordRepositoryWrites(t *testing.T) {
 				require.NoError(t, db.Where("id = ?", oldID).Take(&commit).Error)
 				require.Equal(t, tc.forgets, commit.GcCandidate)
 
-				var oldRecordCount int64
-				require.NoError(t, db.Model(&Record{}).Where("document_id = ?", oldID).Count(&oldRecordCount).Error)
+				// a retained version stays readable by ccfs, a forgotten one does not
+				oldSD, err := repo.GetSignedDocument(ctx, concrnt.ComposeCCFSURI("con1owner", concrnt.CCFSTypeConcrnt, oldID))
 				if tc.forgets {
-					require.Zero(t, oldRecordCount)
+					require.ErrorIs(t, err, domain.ErrNotFound)
 				} else {
-					require.EqualValues(t, 1, oldRecordCount)
+					require.NoError(t, err)
+					require.Nil(t, oldSD.CCKV, "the key has moved on from the retained version")
 				}
 			})
 		}
@@ -260,12 +255,12 @@ func TestRecordRepositoryWrites(t *testing.T) {
 			return err
 		})
 
-		var stored Record
-		require.NoError(t, db.Where("document_id = ?", "reference-record").Take(&stored).Error)
+		var stored RecordKey
+		require.NoError(t, db.Where("record_id = ?", "reference-record").Take(&stored).Error)
 		require.NotNil(t, stored.Redirect)
 		require.Equal(t, targetURI, *stored.Redirect)
 		require.Equal(t, "https://schema.example/target.json", stored.Schema)
-		require.True(t, stored.CreatedAt.Equal(targetCreatedAt))
+		require.True(t, stored.RecordCreatedAt.Equal(targetCreatedAt))
 	})
 
 	t.Run("timeline removal tuple matches chunkline body IDs", func(t *testing.T) {
@@ -475,7 +470,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		var count int64
 		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "rollback-record").Count(&count).Error)
 		require.Zero(t, count)
-		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "rollback-record").Count(&count).Error)
+		require.NoError(t, db.Model(&RecordKey{}).Where("record_id = ?", "rollback-record").Count(&count).Error)
 		require.Zero(t, count)
 	})
 
@@ -505,7 +500,7 @@ func TestRecordRepositoryWrites(t *testing.T) {
 		})
 
 		var count int64
-		require.NoError(t, db.Model(&Record{}).Where("document_id = ?", "delete-target").Count(&count).Error)
+		require.NoError(t, db.Model(&RecordKey{}).Where("uri = ?", deleteKey).Count(&count).Error)
 		require.Zero(t, count)
 		require.NoError(t, db.Model(&CommitLog{}).Where("id = ?", "delete-target").Count(&count).Error)
 		require.EqualValues(t, 1, count)
@@ -715,13 +710,11 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 			return nil
 		})
 
-		// the subtree is gone: records and their key rows
+		// the subtree is gone, key rows included: the base became a
+		// placeholder while its children were still there and was pruned once
+		// the last of them went
 		var count int64
-		for i := range 3 {
-			require.NoError(t, db.Model(&Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
-			require.Zero(t, count, "record %d must be deleted", i)
-		}
-		require.NoError(t, db.Model(&RecordKey{}).Where("uri IN ?", []string{base, base + "/a", base + "/a/b"}).Where("record_id IS NOT NULL").Count(&count).Error)
+		require.NoError(t, db.Model(&RecordKey{}).Where("uri IN ?", []string{base, base + "/a", base + "/a/b"}).Count(&count).Error)
 		require.Zero(t, count)
 
 		// the association on the deleted child cascaded away
@@ -730,7 +723,7 @@ func TestRecordSubtreeQueryAndDelete(t *testing.T) {
 
 		// siblings and decoys survive
 		for i := 3; i < 5; i++ {
-			require.NoError(t, db.Model(&Record{}).Where("document_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
+			require.NoError(t, db.Model(&RecordKey{}).Where("record_id = ?", fmt.Sprintf("subtree-%d", i)).Count(&count).Error)
 			require.EqualValues(t, 1, count, "record %d must survive", i)
 		}
 

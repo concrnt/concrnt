@@ -17,10 +17,12 @@ import (
 // only when one of the process's own loops has stalled, never because a
 // backend is down — restarting would not bring the backend back. Readiness
 // (/ready) asks whether this replica should receive traffic: it fails while
-// any backend the public API depends on is unreachable, and while draining.
+// the process is still starting up, while any backend the public API depends
+// on is unreachable, and while draining.
 type ProbeHandler struct {
 	watchdog  *health.Watchdog
 	readiness *health.Readiness
+	phase     atomic.Pointer[string] // startup phase in progress; nil once started
 	draining  atomic.Bool
 }
 
@@ -33,6 +35,15 @@ func (h *ProbeHandler) RegisterRoutes(e *echo.Echo) {
 	e.GET("/ready", h.handleReady)
 }
 
+// Starting makes /ready answer 503 naming phase, until Started is called.
+func (h *ProbeHandler) Starting(phase string) {
+	h.phase.Store(&phase)
+}
+
+func (h *ProbeHandler) Started() {
+	h.phase.Store(nil)
+}
+
 // Drain makes /ready answer 503 from now on, so the endpoint controller
 // stops routing here before the listeners close. Liveness is unaffected.
 func (h *ProbeHandler) Drain() {
@@ -43,6 +54,7 @@ func (h *ProbeHandler) Drain() {
 // name so a failing probe says what failed without a log lookup.
 type probeReport struct {
 	Status string            `json:"status"`
+	Phase  string            `json:"phase,omitempty"`
 	Checks map[string]string `json:"checks,omitempty"`
 }
 
@@ -69,6 +81,9 @@ func (h *ProbeHandler) handleHealth(c *echo.Context) error {
 func (h *ProbeHandler) handleReady(c *echo.Context) error {
 	if h.draining.Load() {
 		return c.JSON(http.StatusServiceUnavailable, probeReport{Status: "draining"})
+	}
+	if phase := h.phase.Load(); phase != nil {
+		return c.JSON(http.StatusServiceUnavailable, probeReport{Status: "starting", Phase: *phase})
 	}
 
 	report := probeReport{Status: "ok", Checks: map[string]string{}}
