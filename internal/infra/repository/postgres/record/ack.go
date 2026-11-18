@@ -11,7 +11,6 @@ import (
 
 	"github.com/concrnt/concrnt"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
-	uctrust "github.com/concrnt/concrnt/internal/usecase/trust"
 )
 
 func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, documentID string, from string, to string, schema string, createdAt time.Time, valid bool) (bool, error) {
@@ -330,31 +329,4 @@ func (r *Repository) GetAcknowledgeRecordCounts(ctx context.Context, from, to, s
 		span.RecordError(err)
 		return nil, err
 	}
-}
-
-// GetLocalAckEdges lists the valid acknowledgements made by entities of
-// localDomain, each with the domain its target lives on. schemas, when not
-// empty, restricts them to those schemas. Acknowledgements whose target
-// entity this server does not hold are left out.
-func (r *Repository) GetLocalAckEdges(ctx context.Context, localDomain string, schemas []string) ([]uctrust.AckEdge, error) {
-	ctx, span := tracer.Start(ctx, "Repository.Record.GetLocalAckEdges")
-	defer span.End()
-
-	query := r.db.WithContext(ctx).
-		Table("acks").
-		Select(`acks."from" AS "from", acks."to" AS "to", target.domain AS to_domain`).
-		Joins(`JOIN entities AS source ON source.id = acks."from"`).
-		Joins(`JOIN entities AS target ON target.id = acks."to"`).
-		Where("acks.valid = ?", true).
-		Where("source.domain = ?", localDomain)
-	if len(schemas) > 0 {
-		query = query.Where("acks.schema IN ?", schemas)
-	}
-
-	var edges []uctrust.AckEdge
-	if err := query.Scan(&edges).Error; err != nil {
-		span.RecordError(err)
-		return nil, err
-	}
-	return edges, nil
 }

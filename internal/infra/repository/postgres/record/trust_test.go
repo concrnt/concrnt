@@ -15,16 +15,17 @@ import (
 	uctrust "github.com/concrnt/concrnt/internal/usecase/trust"
 )
 
-// GetLocalAckEdges feeds the trust computation: only the valid
-// acknowledgements local users make count, each with its target's domain.
-func TestGetLocalAckEdges(t *testing.T) {
+// The trust computation's storage: seeds are a flag on the entity, the edges
+// are the valid acknowledgements local users make, and the result is stored
+// per entity and added up per domain.
+func TestTrustRepository(t *testing.T) {
 	db, cleanup := testutil.CreateDB()
 	t.Cleanup(cleanup)
 
-	testGetLocalAckEdges(t, db)
+	testTrustRepository(t, db)
 }
 
-func testGetLocalAckEdges(t *testing.T, db *gorm.DB) {
+func testTrustRepository(t *testing.T, db *gorm.DB) {
 	require.NoError(t, New(db).Migrate())
 
 	ctx := context.Background()
@@ -102,4 +103,77 @@ func testGetLocalAckEdges(t *testing.T, db *gorm.DB) {
 	}, edges(vouch))
 
 	require.Len(t, edges(follow, vouch), 3)
+
+	// seeds
+	seeds, err := repo.GetTrustSeeds(ctx)
+	require.NoError(t, err)
+	require.Empty(t, seeds)
+
+	found, err := repo.SetTrustSeed(ctx, "con1alice", true)
+	require.NoError(t, err)
+	require.True(t, found)
+	found, err = repo.SetTrustSeed(ctx, "con1stranger", true)
+	require.NoError(t, err)
+	require.False(t, found, "an entity this server does not hold cannot be a seed")
+
+	seeds, err = repo.GetTrustSeeds(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"con1alice"}, seeds)
+
+	// scores
+	stored := func() map[string]float64 {
+		t.Helper()
+		var rows []Entity
+		require.NoError(t, db.Where("trust > 0").Find(&rows).Error)
+		got := map[string]float64{}
+		for _, row := range rows {
+			got[row.ID] = row.Trust
+		}
+		return got
+	}
+
+	require.NoError(t, repo.SaveEntityTrust(ctx, map[string]float64{
+		"con1alice":    1,
+		"con1bob":      0.5,
+		"con1remote":   0.25,
+		"con1moved":    0.125,
+		"con1stranger": 0.75, // no entity row: nowhere to store it
+	}))
+	require.Equal(t, map[string]float64{"con1alice": 1, "con1bob": 0.5, "con1remote": 0.25, "con1moved": 0.125}, stored())
+
+	totals, err := repo.GetDomainTrust(ctx)
+	require.NoError(t, err)
+	require.Equal(t, map[string]float64{
+		"example.com":           1.5,
+		"remote.example.net":    0.25,
+		"elsewhere.example.org": 0.125,
+	}, totals)
+
+	// a newer entity document must leave the seed flag and the score alone
+	commit("con1alice", func(tx ucrecord.RepositoryTx, id string) error {
+		applied, err := repo.CreateEntity(ctx, tx, "con1alice", nil, "example.com", id, now.Add(time.Hour))
+		require.True(t, applied)
+		return err
+	})
+	seeds, err = repo.GetTrustSeeds(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"con1alice"}, seeds)
+	require.Equal(t, 1.0, stored()["con1alice"])
+
+	// the next result replaces the last one: entities it leaves out drop to 0
+	require.NoError(t, repo.SaveEntityTrust(ctx, map[string]float64{"con1alice": 1, "con1remote": 0.5}))
+	require.Equal(t, map[string]float64{"con1alice": 1, "con1remote": 0.5}, stored())
+
+	require.NoError(t, repo.SaveEntityTrust(ctx, nil))
+	require.Empty(t, stored())
+	totals, err = repo.GetDomainTrust(ctx)
+	require.NoError(t, err)
+	require.Empty(t, totals)
+
+	found, err = repo.SetTrustSeed(ctx, "con1alice", false)
+	require.NoError(t, err)
+	require.True(t, found)
+	seeds, err = repo.GetTrustSeeds(ctx)
+	require.NoError(t, err)
+	require.Empty(t, seeds)
 }

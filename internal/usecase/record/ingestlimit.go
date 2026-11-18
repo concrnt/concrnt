@@ -29,7 +29,7 @@ func (uc *Usecase) limitUnknownAuthor(ctx context.Context, author string) error 
 // server trusts it.
 func (uc *Usecase) limitDomain(ctx context.Context, domainName string) error {
 	trust := 0.0
-	if uc.trust != nil {
+	if uc.trust != nil && uc.config.IngestLimit.ScalesWithTrust() {
 		trust = uc.trust.DomainTrust(ctx, domainName)
 	}
 	return uc.limitIngest(ctx, "ingest:domain:"+domainName, uc.config.IngestLimit.DomainLimit(trust), "too many commits from "+domainName)

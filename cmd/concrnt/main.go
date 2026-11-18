@@ -285,7 +285,7 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
-	trustUC := trust.New(recordRepo, &domainConfig)
+	trustUC := trust.New(recordRepo, &domainConfig, redisKVS)
 	recordUC.SetIngestLimiter(ratelimit.New(redisKVS), trustUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 

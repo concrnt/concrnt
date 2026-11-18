@@ -24,21 +24,17 @@ type IngestLimit struct {
 	// its known users.
 	Min int `yaml:"min"`
 	// Max is the bucket of a fully trusted remote domain. Domains in between
-	// get a bucket between Min and Max by their trust. Without Max, or
-	// without Trust.Seeds, every domain gets Min.
-	Max   int         `yaml:"max"`
-	Trust IngestTrust `yaml:"trust"`
+	// get a bucket between Min and Max by their trust (see the trust
+	// usecase). Without Max every domain gets Min.
+	Max int `yaml:"max"`
+	// TrustAckSchemas are the schemas of the acknowledgements that pass
+	// trust on. Empty means every acknowledgement does.
+	TrustAckSchemas []string `yaml:"trustAckSchemas"`
 }
 
-// IngestTrust configures how remote domains are trusted; see the trust
-// usecase.
-type IngestTrust struct {
-	// Seeds are the CCIDs of the local users trusted outright. Trust reaches
-	// everyone else through whom they acknowledge.
-	Seeds []string `yaml:"seeds"`
-	// AckSchemas are the schemas of the acknowledgements that pass trust on.
-	// Empty means every acknowledgement does.
-	AckSchemas []string `yaml:"ackSchemas"`
+// ScalesWithTrust reports whether a domain's bucket depends on its trust.
+func (l IngestLimit) ScalesWithTrust() bool {
+	return l.Min > 0 && l.Max > l.Min
 }
 
 // DomainLimit is the bucket of a remote domain trusted by trust (0 to 1).
@@ -46,7 +42,7 @@ type IngestTrust struct {
 // multiplies the bucket rather than adding to it: a little trust lifts a
 // domain only a little above Min.
 func (l IngestLimit) DomainLimit(trust float64) int {
-	if l.Min <= 0 || l.Max <= l.Min || trust <= 0 {
+	if !l.ScalesWithTrust() || trust <= 0 {
 		return l.Min
 	}
 	if trust >= 1 {
