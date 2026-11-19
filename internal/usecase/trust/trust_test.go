@@ -211,49 +211,6 @@ func TestRefreshReadsStoredScoresWithoutRecomputing(t *testing.T) {
 	requireTrust(t, uc, "remote.example.net", 0.25)
 }
 
-// The leader's worker recomputes at once and then on its interval, and stops
-// when leadership is lost.
-func TestRecomputingRunsUntilLeadershipIsLost(t *testing.T) {
-	repo := &stubRepo{edges: []AckEdge{{From: "seed", To: "r", ToDomain: "remote.example.net"}}}
-	uc := newTrustUsecase(repo, "seed")
-
-	saves := func() int {
-		n, _ := repo.counts()
-		return n
-	}
-	waitForSaves := func(want int) {
-		t.Helper()
-		deadline := time.Now().Add(2 * time.Second)
-		for saves() < want {
-			if time.Now().After(deadline) {
-				t.Fatalf("recomputed %d times, want at least %d", saves(), want)
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}
-
-	leadCtx, loseLeadership := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		uc.recomputeEvery(leadCtx, 5*time.Millisecond)
-		close(done)
-	}()
-
-	waitForSaves(3)
-
-	loseLeadership()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("worker still running after leadership was lost")
-	}
-	stopped := saves()
-	time.Sleep(30 * time.Millisecond)
-	if saves() != stopped {
-		t.Fatalf("recomputed after leadership was lost")
-	}
-}
-
 // DomainTrust never waits on the repository: stale scores are served while a
 // single background refresh replaces them.
 func TestDomainTrustRefreshesInTheBackgroundWhenStale(t *testing.T) {

@@ -18,14 +18,9 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
-const (
-	// recomputeInterval is how often the leader recomputes the entities'
-	// scores.
-	recomputeInterval = 5 * time.Minute
-	// reloadInterval is how stale a replica's copy of the domain scores may
-	// get before it reads them again.
-	reloadInterval = time.Minute
-)
+// reloadInterval is how stale a replica's copy of the domain scores may get
+// before it reads them again.
+const reloadInterval = time.Minute
 
 // AckEdge is a local user's acknowledgement, with the domain its target
 // lives on.
@@ -61,29 +56,6 @@ type Usecase struct {
 
 func New(repo Repository, config *domain.Config) *Usecase {
 	return &Usecase{repo: repo, config: config, now: time.Now}
-}
-
-// StartRecomputing recomputes the entities' scores now and then every
-// recomputeInterval, until ctx is cancelled. It is a singleton worker: run it
-// on the cluster's leader only, with the leadership context.
-func (uc *Usecase) StartRecomputing(ctx context.Context) {
-	go uc.recomputeEvery(ctx, recomputeInterval)
-}
-
-func (uc *Usecase) recomputeEvery(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		if err := uc.Recompute(ctx); err != nil && ctx.Err() == nil {
-			slog.Error("failed to recompute entity trust", slog.String("error", err.Error()))
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-	}
 }
 
 // DomainTrust is how much this server trusts domain, from 0 (nobody trusted
@@ -144,7 +116,8 @@ func (uc *Usecase) load(ctx context.Context) (map[string]float64, error) {
 }
 
 // Recompute scores every entity from the current seeds and acknowledgements
-// and stores the result.
+// and stores the result. The cluster's leader runs it on a schedule (see
+// worker.TrustRecomputer).
 func (uc *Usecase) Recompute(ctx context.Context) error {
 	ctx, span := tracer.Start(ctx, "Usecase.Trust.Recompute")
 	defer span.End()

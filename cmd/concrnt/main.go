@@ -337,14 +337,20 @@ func main() {
 		notificationReactor = worker.NewNotificationReactor(notificationUC, subscriptionUC, notificationDeduper, *webpushOpts, watchdog)
 	}
 
+	// without a limit that scales with trust nobody reads the scores
+	var trustRecomputer *worker.TrustRecomputer
+	if domainConfig.IngestLimit.ScalesWithTrust() {
+		trustRecomputer = worker.NewTrustRecomputer(trustUC, watchdog)
+	}
+
 	go elector.Run(ctx, func(leadCtx context.Context) {
 		leaderSub.Start(leadCtx)
 		chunklineGateway.StartWorker(leadCtx, leaderSub)
 		if notificationReactor != nil {
 			notificationReactor.Start(leadCtx)
 		}
-		if domainConfig.IngestLimit.ScalesWithTrust() {
-			trustUC.StartRecomputing(leadCtx)
+		if trustRecomputer != nil {
+			trustRecomputer.Start(leadCtx)
 		}
 	})
 
