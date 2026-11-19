@@ -3,7 +3,10 @@ package presenter
 import (
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/labstack/echo/v5"
 )
@@ -58,6 +61,14 @@ func InternalError(c *echo.Context, err error) error {
 func Forbidden(c *echo.Context, msg string) error {
 	slog.Warn("forbidden", slog.String("error", msg))
 	return c.JSON(http.StatusForbidden, errorResponse{Error: msg})
+}
+
+// TooManyRequests renders a 429, telling the caller when to come back.
+func TooManyRequests(c *echo.Context, err error, retryAfter time.Duration) error {
+	slog.Warn("too many requests", slog.String("error", err.Error()))
+	seconds := max(1, int(math.Ceil(retryAfter.Seconds())))
+	c.Response().Header().Set(echo.HeaderRetryAfter, strconv.Itoa(seconds))
+	return c.JSON(http.StatusTooManyRequests, errorResponse{Error: err.Error()})
 }
 
 func Redirect(c *echo.Context, location string, body any) error {

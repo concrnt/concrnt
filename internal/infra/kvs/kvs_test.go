@@ -50,3 +50,12 @@ func TestRedisSetNX(t *testing.T) {
 		t.Fatalf("SetNX on a different key = false, want true")
 	}
 }
+
+// IncrExpire / Decr / GetInt are the counter primitives behind the rate
+// limiter (ratelimit.Store).
+func TestRedisCounter(t *testing.T) {
+	rdb, cleanup := testutil.CreateRDB()
+	defer cleanup()
+
+	testRedisCounter(t, rdb)
+}

@@ -174,6 +174,10 @@ func (h *Handler) handleCommit(c *echo.Context) error {
 		if errors.Is(err, domain.ErrPermissionDenied) {
 			return presenter.Forbidden(c, "permission denied")
 		}
+		var limited domain.RateLimitError
+		if errors.As(err, &limited) {
+			return presenter.TooManyRequests(c, limited, limited.RetryAfter)
+		}
 		if errors.Is(err, domain.ErrValidation) {
 			return presenter.BadRequest(c, err)
 		}

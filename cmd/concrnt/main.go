@@ -42,10 +42,12 @@ import (
 	"github.com/concrnt/concrnt/internal/usecase/abuse"
 	"github.com/concrnt/concrnt/internal/usecase/chunkline"
 	"github.com/concrnt/concrnt/internal/usecase/notification"
+	"github.com/concrnt/concrnt/internal/usecase/ratelimit"
 	"github.com/concrnt/concrnt/internal/usecase/record"
 	"github.com/concrnt/concrnt/internal/usecase/residence"
 	"github.com/concrnt/concrnt/internal/usecase/server"
 	"github.com/concrnt/concrnt/internal/usecase/subscription"
+	"github.com/concrnt/concrnt/internal/usecase/trust"
 	"github.com/concrnt/concrnt/internal/worker"
 )
 
@@ -283,6 +285,8 @@ func main() {
 	serverUC := server.New(serverRepo, &domainConfig, softwareInfo, moduleManager, cl)
 
 	recordUC := record.New(recordRepo, entityMetaRepo, serverUC, &domainConfig, cl, redisPubsub, policy, jobQueue, redisKVS)
+	trustUC := trust.New(recordRepo, &domainConfig)
+	recordUC.SetIngestLimiter(ratelimit.New(redisKVS), trustUC)
 	residenceUC := residence.New(recordRepo, entityMetaRepo, recordUC, &domainConfig)
 
 	chunklineRepo := pgrecord.NewChunklineRepository(db)
@@ -333,11 +337,20 @@ func main() {
 		notificationReactor = worker.NewNotificationReactor(notificationUC, subscriptionUC, notificationDeduper, *webpushOpts, watchdog)
 	}
 
+	// without a limit that scales with trust nobody reads the scores
+	var trustRecomputer *worker.TrustRecomputer
+	if domainConfig.IngestLimit.ScalesWithTrust() {
+		trustRecomputer = worker.NewTrustRecomputer(trustUC, watchdog)
+	}
+
 	go elector.Run(ctx, func(leadCtx context.Context) {
 		leaderSub.Start(leadCtx)
 		chunklineGateway.StartWorker(leadCtx, leaderSub)
 		if notificationReactor != nil {
 			notificationReactor.Start(leadCtx)
+		}
+		if trustRecomputer != nil {
+			trustRecomputer.Start(leadCtx)
 		}
 	})
 
