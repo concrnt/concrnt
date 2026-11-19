@@ -30,7 +30,7 @@ services:
 
   web:
     restart: always
-    image: ghcr.io/concrnt/world-app:2026.11.19
+    image: ghcr.io/concrnt/world-app:latest
     ports:
       - "80:80"
     networks:
