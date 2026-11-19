@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
@@ -16,7 +17,7 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return false, err
@@ -28,28 +29,19 @@ func (r *Repository) CreateAssociation(ctx context.Context, tx ucrecord.Reposito
 		return false, err
 	}
 
-	association := Association{
-		TargetID:   targetRK.ID,
-		DocumentID: documentID,
-		Unique:     unique,
-
-		Owner:     owner,
-		Author:    author,
-		Variant:   variant,
-		Schema:    schema,
-		CreatedAt: createdAt,
-	}
-
 	// A targetless ON CONFLICT DO NOTHING suppresses duplicates on both the
 	// document_id primary key (same document re-delivered) and
 	// uni_associations_unique (same logical association under a new document
 	// id), making duplicate deliveries a silent success like record/ack.
-	result := db.Clauses(clause.OnConflict{
-		DoNothing: true,
-	}).Create(&association)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	result := gorm.WithResult()
+	err = gorm.G[any](db, result).Exec(ctx, `
+INSERT INTO associations (document_id, target_id, owner, author, schema, variant, "unique", created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT DO NOTHING`,
+		documentID, targetRK.ID, owner, author, schema, variant, unique, createdAt)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
 	}
 
 	return result.RowsAffected > 0, nil
@@ -59,13 +51,14 @@ func (r *Repository) DeleteAssociation(ctx context.Context, tx ucrecord.Reposito
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteAssociation")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
-	return db.Delete(&Association{}, "document_id = ?", documentID).Error
+	_, err = gorm.G[Association](db).Where("document_id = ?", documentID).Delete(ctx)
+	return err
 }
 
 func (r *Repository) GetAssociatedRecords(
@@ -78,13 +71,9 @@ func (r *Repository) GetAssociatedRecords(
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecords")
 	defer span.End()
 
-	var associations []Association
-
-	query := r.db.WithContext(ctx).
-		Model(&Association{}).
-		Preload("Document").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI)
+	query := gorm.G[Association](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
+		Where("associations.target_id = (SELECT id FROM record_keys WHERE uri = ?)", targetURI)
 
 	if schema != "" {
 		query = query.Where("associations.schema = ?", schema)
@@ -112,7 +101,9 @@ func (r *Repository) GetAssociatedRecords(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&associations).Error; err != nil {
+	associations, err := query.Find(ctx)
+	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
@@ -144,19 +135,17 @@ func (r *Repository) GetAssociatedRecordCountsBySchema(ctx context.Context, targ
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsBySchema")
 	defer span.End()
 
-	var counts []struct {
+	type schemaCount struct {
 		Schema string
 		Count  int64
 	}
 
-	err := r.db.WithContext(ctx).
-		Model(&Association{}).
-		Select("associations.schema AS schema, COUNT(*) AS count").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Group("associations.schema").
-		Scan(&counts).Error
-
+	counts, err := gorm.G[schemaCount](r.db).Raw(`
+SELECT a.schema AS schema, COUNT(*) AS count
+FROM associations a
+JOIN record_keys rk ON rk.id = a.target_id
+WHERE rk.uri = ?
+GROUP BY a.schema`, targetURI).Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -174,21 +163,19 @@ func (r *Repository) GetAssociatedRecordCountsByVariant(ctx context.Context, tar
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAssociatedRecordCountsByVariant")
 	defer span.End()
 
-	var counts []struct {
+	type variantCount struct {
 		Variant  string
 		Count    int64
 		MinCDate time.Time
 	}
 
-	err := r.db.WithContext(ctx).
-		Model(&Association{}).
-		Select("variant, COUNT(*) AS count, MIN(created_at) AS min_created_at").
-		Joins("JOIN record_keys rk ON rk.id = associations.target_id").
-		Where("rk.uri = ?", targetURI).
-		Where("associations.schema = ?", schema).
-		Group("variant").
-		Order("min_created_at ASC").
-		Scan(&counts).Error
+	counts, err := gorm.G[variantCount](r.db).Raw(`
+SELECT a.variant, COUNT(*) AS count, MIN(a.created_at) AS min_created_at
+FROM associations a
+JOIN record_keys rk ON rk.id = a.target_id
+WHERE rk.uri = ? AND a.schema = ?
+GROUP BY a.variant
+ORDER BY min_created_at ASC`, targetURI, schema).Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err

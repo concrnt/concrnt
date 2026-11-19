@@ -34,8 +34,5 @@ func (r *Repository) CreateAbuseReport(ctx context.Context, report *concrnt.Abus
 		Body:      report.Body,
 	}
 
-	if err := r.db.WithContext(ctx).Create(abuseReport).Error; err != nil {
-		return err
-	}
-	return nil
+	return gorm.G[AbuseReport](r.db).Create(ctx, abuseReport)
 }

@@ -19,8 +19,7 @@ func localEntityChecker(ctx context.Context, db *gorm.DB, fqdn string) func(ccid
 		if v, ok := cache[ccid]; ok {
 			return v, nil
 		}
-		var entity pgrecord.Entity
-		err := db.WithContext(ctx).Select("id", "domain").Where("id = ?", ccid).Take(&entity).Error
+		entity, err := gorm.G[pgrecord.Entity](db).Select("id, domain").Where("id = ?", ccid).Take(ctx)
 		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return false, err
 		}

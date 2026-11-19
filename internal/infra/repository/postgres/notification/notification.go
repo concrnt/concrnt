@@ -56,8 +56,24 @@ func (r *Repository) Subscribe(ctx context.Context, subscription domain.Notifica
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Subscribe")
 	defer span.End()
 
-	model := domainToModelNotification(subscription)
-	if err := r.db.WithContext(ctx).Save(&model).Error; err != nil {
+	// c_date is left to its default and is not touched on conflict, so a
+	// re-subscription keeps the time the subscription was first made.
+	model, err := gorm.G[Subscription](r.db).Raw(`
+INSERT INTO subscriptions (vendor_id, owner, schemas, prefixes, subscription, m_date)
+VALUES (?, ?, ?, ?, ?, now())
+ON CONFLICT (vendor_id, owner) DO UPDATE
+SET schemas = excluded.schemas,
+    prefixes = excluded.prefixes,
+    subscription = excluded.subscription,
+    m_date = excluded.m_date
+RETURNING *`,
+		subscription.VendorID,
+		subscription.Owner,
+		pq.StringArray(subscription.Schemas),
+		pq.StringArray(subscription.Prefixes),
+		subscription.Subscription,
+	).Take(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return domain.NotificationSubscription{}, err
 	}
@@ -69,8 +85,8 @@ func (r *Repository) List(ctx context.Context) ([]domain.NotificationSubscriptio
 	ctx, span := tracer.Start(ctx, "Repository.Notification.List")
 	defer span.End()
 
-	var models []Subscription
-	if err := r.db.WithContext(ctx).Find(&models).Error; err != nil {
+	models, err := gorm.G[Subscription](r.db).Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -86,10 +102,9 @@ func (r *Repository) Get(ctx context.Context, vendorID, owner string) (domain.No
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Get")
 	defer span.End()
 
-	var model Subscription
-	err := r.db.WithContext(ctx).
+	model, err := gorm.G[Subscription](r.db).
 		Where("vendor_id = ? AND owner = ?", vendorID, owner).
-		Take(&model).Error
+		Take(ctx)
 	if err != nil {
 		span.RecordError(err)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -105,9 +120,9 @@ func (r *Repository) Delete(ctx context.Context, vendorID, owner string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Notification.Delete")
 	defer span.End()
 
-	if err := r.db.WithContext(ctx).
+	if _, err := gorm.G[Subscription](r.db).
 		Where("vendor_id = ? AND owner = ?", vendorID, owner).
-		Delete(&Subscription{}).Error; err != nil {
+		Delete(ctx); err != nil {
 		span.RecordError(err)
 		return err
 	}

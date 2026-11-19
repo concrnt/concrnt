@@ -7,7 +7,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/client"
@@ -63,10 +62,9 @@ func (r *Repository) GetAndCacheByCSID(ctx context.Context, csid string, hint *s
 	ctx, span := tracer.Start(ctx, "Repository.Server.GetAndCacheByCSID")
 	defer span.End()
 
-	var server Server
-	err := r.db.WithContext(ctx).
+	server, err := gorm.G[Server](r.db).
 		Where("cs_id = ?", csid).
-		Take(&server).Error
+		Take(ctx)
 	if err == nil && server.WellKnown != "" {
 		return modelToDomainServer(&server)
 	}
@@ -87,33 +85,30 @@ func (r *Repository) GetAndCacheByCSID(ctx context.Context, csid string, hint *s
 		return nil, err
 	}
 
-	newServer := Server{
-		ID:        wkc.Domain,
-		CSID:      wkc.CSID,
-		Layer:     wkc.Layer,
-		Tag:       "",
-		WellKnown: string(serialized),
-	}
-
-	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known"}),
-	}).Create(&newServer).Error
+	err = gorm.G[any](r.db).Exec(ctx, `
+INSERT INTO servers (id, cs_id, layer, tag, well_known, m_date)
+VALUES (?, ?, ?, '', ?, now())
+ON CONFLICT (id) DO UPDATE
+SET cs_id = excluded.cs_id,
+    layer = excluded.layer,
+    tag = excluded.tag,
+    well_known = excluded.well_known`,
+		wkc.Domain, wkc.CSID, wkc.Layer, string(serialized))
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
-	return modelToDomainServer(&newServer)
+	return &domain.Server{WellKnown: wkc}, nil
 }
 
 func (r *Repository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domain.Server, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Server.GetAndCacheByFQDN")
 	defer span.End()
 
-	var server Server
-	err := r.db.WithContext(ctx).
+	server, err := gorm.G[Server](r.db).
 		Where("id = ?", fqdn).
-		Take(&server).Error
+		Take(ctx)
 	if err == nil && server.WellKnown != "" {
 		return modelToDomainServer(&server)
 	}
@@ -130,23 +125,21 @@ func (r *Repository) GetAndCacheByFQDN(ctx context.Context, fqdn string) (*domai
 		return nil, err
 	}
 
-	newServer := Server{
-		ID:        wkc.Domain,
-		CSID:      wkc.CSID,
-		Layer:     wkc.Layer,
-		Tag:       "",
-		WellKnown: string(serialized),
-	}
-
-	err = r.db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"cs_id", "layer", "tag", "well_known"}),
-	}).Create(&newServer).Error
+	err = gorm.G[any](r.db).Exec(ctx, `
+INSERT INTO servers (id, cs_id, layer, tag, well_known, m_date)
+VALUES (?, ?, ?, '', ?, now())
+ON CONFLICT (id) DO UPDATE
+SET cs_id = excluded.cs_id,
+    layer = excluded.layer,
+    tag = excluded.tag,
+    well_known = excluded.well_known`,
+		wkc.Domain, wkc.CSID, wkc.Layer, string(serialized))
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
-	return modelToDomainServer(&newServer)
+	return &domain.Server{WellKnown: wkc}, nil
 }
 
 func (r *Repository) List(ctx context.Context) ([]*concrnt.WellKnownConcrnt, error) {

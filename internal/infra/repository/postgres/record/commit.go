@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
@@ -17,11 +16,10 @@ func (r *Repository) HasCommitLog(ctx context.Context, id string) (bool, error) 
 	ctx, span := tracer.Start(ctx, "Repository.Record.HasCommitLog")
 	defer span.End()
 
-	var commitLog CommitLog
-	err := r.db.WithContext(ctx).
+	_, err := gorm.G[CommitLog](r.db).
 		Select("id").
 		Where("id = ?", id).
-		Take(&commitLog).Error
+		Take(ctx)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return false, nil
 	}
@@ -37,7 +35,7 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateCommitLog")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -49,17 +47,12 @@ func (r *Repository) CreateCommitLog(ctx context.Context, tx ucrecord.Repository
 		return err
 	}
 
-	commitLog := CommitLog{
-		ID:       id,
-		IP:       ip,
-		Document: document,
-		Owner:    owner,
-		Proof:    string(proofBytes),
-	}
-
-	if err := db.Clauses(clause.OnConflict{
-		DoNothing: true,
-	}).Create(&commitLog).Error; err != nil {
+	err = gorm.G[any](db).Exec(ctx, `
+INSERT INTO commit_logs (id, ip, document, proof, owner)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT DO NOTHING`,
+		id, ip, document, string(proofBytes), owner)
+	if err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -71,15 +64,15 @@ func (r *Repository) MarkCommitLogGcCandidate(ctx context.Context, tx ucrecord.R
 	ctx, span := tracer.Start(ctx, "Repository.Record.MarkCommitLogGcCandidate")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
-	if err := db.Model(&CommitLog{}).
+	if _, err := gorm.G[CommitLog](db).
 		Where("id = ?", documentID).
-		Update("gc_candidate", true).Error; err != nil {
+		Update(ctx, "gc_candidate", true); err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -91,11 +84,10 @@ func (r *Repository) GetAllCommitLogs(ctx context.Context, owner string) ([]conc
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetAllCommitLogs")
 	defer span.End()
 
-	var commitLogs []CommitLog
-	err := r.db.WithContext(ctx).
+	commitLogs, err := gorm.G[CommitLog](r.db).
 		Where("owner = ?", owner).
 		Order("c_date ASC").
-		Find(&commitLogs).Error
+		Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -122,9 +114,12 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryCommitLogs")
 	defer span.End()
 
-	var commitLogs []CommitLog
+	orderBy := "c_date ASC, id ASC"
+	if order == "desc" {
+		orderBy = "c_date DESC, id DESC"
+	}
 
-	query := r.db.WithContext(ctx).Model(&CommitLog{})
+	query := gorm.G[CommitLog](r.db).Order(orderBy)
 
 	if owner != "" {
 		query = query.Where("owner = ?", owner)
@@ -136,17 +131,12 @@ func (r *Repository) QueryCommitLogs(ctx context.Context, owner string, since, u
 		query = query.Where("c_date <= ?", *until)
 	}
 
-	if order == "desc" {
-		query = query.Order("c_date DESC, id DESC")
-	} else {
-		query = query.Order("c_date ASC, id ASC")
-	}
-
 	if limit > 0 {
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&commitLogs).Error; err != nil {
+	commitLogs, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

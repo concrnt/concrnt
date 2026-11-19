@@ -34,14 +34,11 @@ func (r *ChunklineRepository) GetChunklineManifest(ctx context.Context, uri stri
 	}
 
 	var firstChunk *int64
-	firstCollectionMember := RecordKey{}
-	err = r.db.WithContext(ctx).
-		Model(&RecordKey{}).
+	firstCollectionMember, err := gorm.G[RecordKey](r.db).
 		Where("record_keys.parent_id = ?", recordKey.ID).
 		Where("record_keys.record_created_at IS NOT NULL").
 		Order("record_keys.record_created_at ASC").
-		Limit(1).
-		Take(&firstCollectionMember).Error
+		Take(ctx)
 	if err == nil {
 		chunk := firstCollectionMember.RecordCreatedAt.Unix() / 600
 		firstChunk = &chunk
@@ -74,23 +71,17 @@ func (r *ChunklineRepository) LookupLocalItrs(ctx context.Context, uris []string
 		MaxCreatedAt *time.Time `gorm:"column:max_created_at"`
 	}
 
-	var res []TimelineRow
-
 	cutoff := time.Unix((chunkID+1)*600, 0) // descending order
 
-	latestSubQuery := r.db.
-		Table("record_keys AS child").
-		Select("child.record_created_at").
-		Where("child.parent_id = parent.id").
-		Where("child.record_created_at < ?", cutoff).
-		Order("child.record_created_at DESC").
-		Limit(1)
-
-	err := r.db.WithContext(ctx).
-		Table("record_keys AS parent").
-		Select("parent.uri AS uri, (?) AS max_created_at", latestSubQuery).
-		Where("parent.uri IN ?", uris).
-		Scan(&res).Error
+	res, err := gorm.G[TimelineRow](r.db).Raw(`
+SELECT parent.uri AS uri, (
+  SELECT child.record_created_at FROM record_keys child
+  WHERE child.parent_id = parent.id AND child.record_created_at < ?
+  ORDER BY child.record_created_at DESC
+  LIMIT 1
+) AS max_created_at
+FROM record_keys parent
+WHERE parent.uri IN ?`, cutoff, uris).Find(ctx)
 
 	if err != nil {
 		span.RecordError(err)
@@ -120,13 +111,12 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 		return nil, err
 	}
 
-	var members []RecordKey
-	err = r.db.WithContext(ctx).
+	members, err := gorm.G[RecordKey](r.db).
 		Where("parent_id = ?", parentRecordKey.ID).
 		Where("record_created_at < ?", chunkDate).
 		Order("record_created_at DESC").
 		Limit(defaultChunkSize).
-		Find(&members).Error
+		Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -135,12 +125,12 @@ func (r *ChunklineRepository) LoadLocalBody(ctx context.Context, uri string, chu
 	// Judge window coverage by record_created_at, the column the queries
 	// filter and order by.
 	if len(members) == 0 || members[len(members)-1].RecordCreatedAt == nil || !members[len(members)-1].RecordCreatedAt.Before(prevChunkDate) {
-		err = r.db.WithContext(ctx).
+		members, err = gorm.G[RecordKey](r.db).
 			Where("parent_id = ?", parentRecordKey.ID).
 			Where("record_created_at < ?", chunkDate).
 			Where("record_created_at >= ?", prevChunkDate).
 			Order("record_created_at DESC").
-			Find(&members).Error
+			Find(ctx)
 		if err != nil {
 			span.RecordError(err)
 			return nil, err

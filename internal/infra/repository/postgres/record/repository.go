@@ -79,10 +79,12 @@ func (tx *recordTx) Rollback(ctx context.Context) error {
 	return tx.tx.WithContext(ctx).Rollback().Error
 }
 
-func getRecordTx(ctx context.Context, tx ucrecord.RepositoryTx) (*gorm.DB, error) {
+// getRecordTx unwraps the transaction handle. The statements run on it go
+// through gorm.G, which binds the context per call.
+func getRecordTx(tx ucrecord.RepositoryTx) (*gorm.DB, error) {
 	recordTx, ok := tx.(*recordTx)
 	if !ok || recordTx == nil || recordTx.tx == nil {
 		return nil, errors.New("invalid record repository transaction")
 	}
-	return recordTx.tx.WithContext(ctx), nil
+	return recordTx.tx, nil
 }

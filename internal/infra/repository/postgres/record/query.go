@@ -6,6 +6,9 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
 	"github.com/concrnt/concrnt"
 	ucrecord "github.com/concrnt/concrnt/internal/usecase/record"
 )
@@ -20,11 +23,8 @@ func (r *Repository) QueryByPrefix(
 	ctx, span := tracer.Start(ctx, "Repository.Record.Query")
 	defer span.End()
 
-	var rks []RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("Document").
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
 		Where("record_keys.record_id IS NOT NULL").
 		Where("record_keys.uri LIKE ?", prefix+"%")
 
@@ -51,7 +51,8 @@ func (r *Repository) QueryByPrefix(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&rks).Error; err != nil {
+	rks, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -72,9 +73,8 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryRecordSubtree")
 	defer span.End()
 
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("Document").
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
 		Where("record_keys.record_id IS NOT NULL")
 
 	subtreePattern := likeEscaper.Replace(base) + `/%`
@@ -84,8 +84,8 @@ func (r *Repository) QueryRecordSubtree(ctx context.Context, base string, includ
 		query = query.Where(`record_keys.uri LIKE ? ESCAPE '\'`, subtreePattern)
 	}
 
-	var rks []RecordKey
-	if err := query.Order("record_keys.uri ASC").Find(&rks).Error; err != nil {
+	rks, err := query.Order("record_keys.uri ASC").Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -122,15 +122,12 @@ func (r *Repository) QueryByParent(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParent")
 	defer span.End()
 
-	var rks []RecordKey
-
 	// record_created_at IS NOT NULL keeps placeholders out and matches the
 	// predicate of the partial idx_record_keys_parent_created_at_record_id,
 	// which serves the ordering, so the limit applies before the commit log
 	// join.
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("Document").
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
 		Where("record_keys.record_id IS NOT NULL AND record_keys.record_created_at IS NOT NULL")
 
 	// The owner root (cckv://<owner>) has no record_keys row and its top-level
@@ -170,7 +167,8 @@ func (r *Repository) QueryByParent(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&rks).Error; err != nil {
+	rks, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
@@ -193,11 +191,8 @@ func (r *Repository) QueryByParentOrderByKey(
 	ctx, span := tracer.Start(ctx, "Repository.Record.QueryByParentOrderByKey")
 	defer span.End()
 
-	var rks []RecordKey
-
-	query := r.db.WithContext(ctx).
-		Model(&RecordKey{}).
-		Joins("Document")
+	query := gorm.G[RecordKey](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil)
 
 	parsedParent, err := concrnt.ParseCCURI(parent)
 	if err != nil {
@@ -233,7 +228,8 @@ func (r *Repository) QueryByParentOrderByKey(
 		query = query.Limit(limit)
 	}
 
-	if err := query.Find(&rks).Error; err != nil {
+	rks, err := query.Find(ctx)
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
