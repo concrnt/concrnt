@@ -20,6 +20,8 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+
+	"github.com/concrnt/concrnt/internal/infra/database"
 )
 
 var (
@@ -146,6 +148,14 @@ func CreateDB() (*gorm.DB, func()) {
 	}); err != nil {
 		log.Fatalf("Could not connect to docker: %s", err)
 	}
+
+	// bounded like database.NewPostgres: the record repository sizes its
+	// transaction cap from the pool
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatalf("Could not get sql.DB: %s", err)
+	}
+	sqlDB.SetMaxOpenConns(database.DefaultMaxConns)
 
 	return db, cleanup
 }

@@ -33,6 +33,9 @@ concrnt:
 
 backends:
   postgresDsn: "host=db user=postgres password=postgres dbname=postgres port=5432 sslmode=disable"
+  # connections one process keeps to postgres (default 16); half of them may
+  # run transactions at once
+  # postgresMaxConns: 16
   gatewayAddr: http://concrnt:8000
   redisAddr: "redis:6379"
   memcachedAddr: "memcached:11211"

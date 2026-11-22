@@ -1,6 +1,7 @@
 package database
 
 import (
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
@@ -14,10 +15,18 @@ import (
 	"gorm.io/plugin/opentelemetry/tracing"
 )
 
-// MaxOpenConns is the size of the connection pool of one process.
-const MaxOpenConns = 16
+// DefaultMaxConns is the size of the connection pool of one process when
+// backends.postgresMaxConns is unset.
+const DefaultMaxConns = 16
 
-func NewPostgres(dsn string) (*gorm.DB, error) {
+func NewPostgres(dsn string, maxConns int) (*gorm.DB, error) {
+	if maxConns == 0 {
+		maxConns = DefaultMaxConns
+	}
+	// the record repository runs transactions on half of the pool
+	if maxConns < 2 {
+		return nil, fmt.Errorf("backends.postgresMaxConns must be at least 2, got %d", maxConns)
+	}
 
 	gormLogger := logger.New(
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
@@ -50,13 +59,10 @@ func NewPostgres(dsn string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// A transaction holds one connection while the reads issued inside it
-	// (through the repository's plain db handle) take another one from this
-	// same pool, so the pool must be larger than the number of transactions
-	// allowed at once (postgres.MaxConcurrentTx); otherwise that many
-	// concurrent commits block each other until their context expires.
-	sqlDB.SetMaxOpenConns(MaxOpenConns)
-	sqlDB.SetMaxIdleConns(MaxOpenConns)
+	// The record repository sizes its transaction cap from this pool
+	// (record.New), so the pool must stay bounded.
+	sqlDB.SetMaxOpenConns(maxConns)
+	sqlDB.SetMaxIdleConns(maxConns)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 	sqlDB.SetConnMaxIdleTime(0)
 

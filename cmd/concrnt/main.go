@@ -163,7 +163,7 @@ func main() {
 
 	observeBuildInfo()
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
+	db, err := database.NewPostgres(conf.Backends.PostgresDsn, conf.Backends.PostgresMaxConns)
 	if err != nil {
 		panic("failed to connect database")
 	}
