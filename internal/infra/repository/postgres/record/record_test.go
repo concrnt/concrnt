@@ -804,6 +804,84 @@ func TestRecordQueryAuthorFilter(t *testing.T) {
 	})
 }
 
+// QueryByPrefix matches the literal prefix in byte order: '_' and '%' in it
+// match only themselves, a prefix ending in a character whose UTF-8 encoding
+// ends in 0xBF ("み", E3 81 BF) still matches its own keys, and the limit
+// keeps the newest (desc) or oldest (asc) records of the prefix in order.
+func TestRecordQueryByPrefix(t *testing.T) {
+	db, cleanup := testutil.CreateDB()
+	t.Cleanup(cleanup)
+	require.NoError(t, New(db).Migrate())
+
+	ctx := context.Background()
+	repo := New(db)
+
+	keys := []string{
+		"cckv://con1owner/t_/e1",
+		"cckv://con1owner/t_/e2",
+		"cckv://con1owner/t_/e3",
+		"cckv://con1owner/tx/e4",
+		"cckv://con1owner/み/e5",
+		"cckv://con1owner/む/e6",
+	}
+	createdAt := time.Date(2026, 11, 24, 9, 10, 11, 0, time.UTC)
+	for i, key := range keys {
+		id := fmt.Sprintf("prefix-%d", i)
+		sd := repositorySignedDocument(t, concrnt.Document[map[string]string]{
+			Kind:      "record",
+			Key:       key,
+			Value:     map[string]string{"body": key},
+			Author:    "con1owner",
+			Schema:    "https://schema.example/item.json",
+			CreatedAt: createdAt.Add(time.Duration(i) * time.Second),
+		})
+		withRepositoryTx(t, ctx, repo, id, "127.0.0.1", sd, "con1owner", func(tx ucrecord.RepositoryTx) error {
+			_, err := repo.CreateRecord(ctx, tx, id, key, "con1owner", "con1owner", "https://schema.example/item.json", nil, nil, []string{}, nil, createdAt.Add(time.Duration(i)*time.Second))
+			return err
+		})
+	}
+
+	urisOfRows := func(rows []ucrecord.QueryRow) []string {
+		uris := make([]string, 0, len(rows))
+		for _, row := range rows {
+			require.NotNil(t, row.Row.CCKV)
+			uris = append(uris, *row.Row.CCKV)
+		}
+		return uris
+	}
+
+	t.Run("metacharacters match only themselves", func(t *testing.T) {
+		rows, err := repo.QueryByPrefix(ctx, "cckv://con1owner/t_/", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{keys[0], keys[1], keys[2]}, urisOfRows(rows))
+	})
+
+	t.Run("prefix ending in a 0xBF byte", func(t *testing.T) {
+		rows, err := repo.QueryByPrefix(ctx, "cckv://con1owner/み", "", "", nil, nil, 0, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{keys[4]}, urisOfRows(rows))
+	})
+
+	t.Run("limit keeps the newest in desc order", func(t *testing.T) {
+		rows, err := repo.QueryByPrefix(ctx, "cckv://con1owner/t_/", "", "", nil, nil, 2, "desc")
+		require.NoError(t, err)
+		require.Equal(t, []string{keys[2], keys[1]}, urisOfRows(rows))
+	})
+
+	t.Run("limit keeps the oldest in asc order", func(t *testing.T) {
+		rows, err := repo.QueryByPrefix(ctx, "cckv://con1owner/t_/", "", "", nil, nil, 2, "asc")
+		require.NoError(t, err)
+		require.Equal(t, []string{keys[0], keys[1]}, urisOfRows(rows))
+	})
+
+	t.Run("until bounds the window", func(t *testing.T) {
+		until := createdAt.Add(time.Second)
+		rows, err := repo.QueryByPrefix(ctx, "cckv://con1owner/t_/", "", "", nil, &until, 1, "desc")
+		require.NoError(t, err)
+		require.Equal(t, []string{keys[1]}, urisOfRows(rows))
+	})
+}
+
 // CIP-12 §5.3: the hierarchical policy stack is emitted root-first with the
 // target resource itself last.
 func TestHierarchicalRecordPoliciesRootFirst(t *testing.T) {
