@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt/cdid"
 	"github.com/concrnt/concrnt/internal/domain"
@@ -88,10 +89,9 @@ var gcCommitlogCmd = &cobra.Command{
 		cutoff := cdid.New([10]byte{}, time.Now().Add(-gcCommitlogRetention)).String()
 
 		if gcCommitlogDryRun {
-			var count int64
-			err := op.DB.WithContext(ctx).
+			count, err := gorm.G[int64](op.DB).
 				Raw("SELECT count(*) FROM commit_logs WHERE gc_candidate AND id < ?", cutoff).
-				Scan(&count).Error
+				Take(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to count commit logs: %w", err)
 			}
@@ -109,10 +109,11 @@ var gcCommitlogCmd = &cobra.Command{
 			for {
 				// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
 				// each statement (and its cascade) bounded.
-				res := op.DB.WithContext(ctx).
-					Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT ?)", cutoff, gcCommitlogBatchSize)
-				if res.Error != nil {
-					return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+				res := gorm.WithResult()
+				err := gorm.G[any](op.DB, res).
+					Exec(ctx, "DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE gc_candidate AND id < ? LIMIT ?)", cutoff, gcCommitlogBatchSize)
+				if err != nil {
+					return fmt.Errorf("failed to delete commit logs: %w", err)
 				}
 				if res.RowsAffected == 0 {
 					break
@@ -141,14 +142,14 @@ var gcCommitlogCmd = &cobra.Command{
 		var ids []string
 		cursor := ""
 		for {
-			var logs []pgrecord.CommitLog
-			q := op.DB.WithContext(ctx).
+			q := gorm.G[pgrecord.CommitLog](op.DB).
 				Where("gc_candidate AND id < ?", cutoff).
 				Order("id ASC").Limit(gcCommitlogBatchSize)
 			if cursor != "" {
 				q = q.Where("id > ?", cursor)
 			}
-			if err := q.Find(&logs).Error; err != nil {
+			logs, err := q.Find(ctx)
+			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}
 			if len(logs) == 0 {
@@ -182,9 +183,10 @@ var gcCommitlogCmd = &cobra.Command{
 		// Only now, with the backup durable, delete exactly the backed-up rows.
 		for start := 0; start < len(ids); start += gcCommitlogBatchSize {
 			batch := ids[start:min(start+gcCommitlogBatchSize, len(ids))]
-			res := op.DB.WithContext(ctx).Exec("DELETE FROM commit_logs WHERE id IN ?", batch)
-			if res.Error != nil {
-				return fmt.Errorf("failed to delete commit logs: %w", res.Error)
+			res := gorm.WithResult()
+			err := gorm.G[any](op.DB, res).Exec(ctx, "DELETE FROM commit_logs WHERE id IN ?", batch)
+			if err != nil {
+				return fmt.Errorf("failed to delete commit logs: %w", err)
 			}
 			if res.RowsAffected != int64(len(batch)) {
 				fmt.Fprintf(os.Stderr, "warning: expected to delete %d commit logs but deleted %d (concurrent gc?)\n", len(batch), res.RowsAffected)

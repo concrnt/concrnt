@@ -6,7 +6,6 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 
 	"github.com/concrnt/concrnt/internal/domain"
 	"github.com/concrnt/concrnt/internal/usecase"
@@ -32,16 +31,21 @@ func (r *Repository) Save(ctx context.Context, meta domain.EntityMeta) error {
 	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Save")
 	defer span.End()
 
-	modelMeta := EntityMeta{
-		ID:      meta.ID,
-		Inviter: meta.Inviter,
-		Info:    meta.Info,
+	// info is jsonb: an empty value is stored as JSON null
+	info := meta.Info
+	if info == "" {
+		info = "null"
 	}
 
-	if err := r.db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "id"}},
-		DoUpdates: clause.AssignmentColumns([]string{"inviter", "info"}),
-	}).Create(&modelMeta).Error; err != nil {
+	err := gorm.G[any](r.db).Exec(ctx, `
+INSERT INTO entity_meta (id, inviter, info, m_date)
+VALUES (?, ?, ?, now())
+ON CONFLICT (id) DO UPDATE
+SET inviter = excluded.inviter,
+    info = excluded.info`,
+		meta.ID, meta.Inviter, info)
+	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -52,8 +56,7 @@ func (r *Repository) Get(ctx context.Context, ccid string) (*domain.EntityMeta, 
 	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Get")
 	defer span.End()
 
-	var meta EntityMeta
-	err := r.db.Where("id = ?", ccid).Take(&meta).Error
+	meta, err := gorm.G[EntityMeta](r.db).Where("id = ?", ccid).Take(ctx)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, domain.NotFoundError{Resource: ccid}
@@ -74,12 +77,12 @@ func (r *Repository) Update(ctx context.Context, ccid string, info string) error
 	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Update")
 	defer span.End()
 
-	result := r.db.WithContext(ctx).Model(&EntityMeta{}).Where("id = ?", ccid).Update("info", info)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return result.Error
+	rowsAffected, err := gorm.G[EntityMeta](r.db).Where("id = ?", ccid).Update(ctx, "info", info)
+	if err != nil {
+		span.RecordError(err)
+		return err
 	}
-	if result.RowsAffected == 0 {
+	if rowsAffected == 0 {
 		return domain.NotFoundError{Resource: "entity meta"}
 	}
 
@@ -90,7 +93,7 @@ func (r *Repository) Delete(ctx context.Context, ccid string) error {
 	ctx, span := tracer.Start(ctx, "Repository.EntityMeta.Delete")
 	defer span.End()
 
-	if err := r.db.WithContext(ctx).Where("id = ?", ccid).Delete(&EntityMeta{}).Error; err != nil {
+	if _, err := gorm.G[EntityMeta](r.db).Where("id = ?", ccid).Delete(ctx); err != nil {
 		span.RecordError(err)
 		return err
 	}
@@ -103,11 +106,13 @@ func (r *Repository) List(ctx context.Context, owner string) ([]domain.EntityMet
 	defer span.End()
 
 	var metas []EntityMeta
-	q := r.db.WithContext(ctx)
+	var err error
 	if owner != "" {
-		q = q.Where("id = ?", owner)
+		metas, err = gorm.G[EntityMeta](r.db).Where("id = ?", owner).Find(ctx)
+	} else {
+		metas, err = gorm.G[EntityMeta](r.db).Find(ctx)
 	}
-	if err := q.Find(&metas).Error; err != nil {
+	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}

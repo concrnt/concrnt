@@ -42,7 +42,7 @@ func newOperationContext() (*operationContext, error) {
 
 	globalConfig := conf.DomainConfig()
 
-	db, err := database.NewPostgres(conf.Backends.PostgresDsn)
+	db, err := database.NewPostgres(conf.Backends.PostgresDsn, conf.Backends.PostgresMaxConns)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect database: %w", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gorm.io/gorm"
 
 	"github.com/concrnt/concrnt"
 	"github.com/concrnt/concrnt/cdid"
@@ -109,11 +110,12 @@ var dumpCommitlogCmd = &cobra.Command{
 		// is not part of the commit log, and import must restore them before
 		// replaying entity commits. Time filters don't apply to meta; --owner does.
 		var metas []pgentitymeta.EntityMeta
-		mq := op.DB.WithContext(ctx)
 		if dumpCommitlogOwner != "" {
-			mq = mq.Where("id = ?", dumpCommitlogOwner)
+			metas, err = gorm.G[pgentitymeta.EntityMeta](op.DB).Where("id = ?", dumpCommitlogOwner).Find(ctx)
+		} else {
+			metas, err = gorm.G[pgentitymeta.EntityMeta](op.DB).Find(ctx)
 		}
-		if err := mq.Find(&metas).Error; err != nil {
+		if err != nil {
 			return fmt.Errorf("failed to query entity meta: %w", err)
 		}
 		for _, m := range metas {
@@ -143,8 +145,7 @@ var dumpCommitlogCmd = &cobra.Command{
 		first := true
 		total := 0
 		for {
-			var logs []pgrecord.CommitLog
-			q := op.DB.WithContext(ctx).Order("commit_logs.id ASC").Limit(dumpCommitlogPageSize)
+			q := gorm.G[pgrecord.CommitLog](op.DB).Order("commit_logs.id ASC").Limit(dumpCommitlogPageSize)
 			if first {
 				q = q.Where("commit_logs.id >= ?", cursor)
 			} else {
@@ -156,7 +157,8 @@ var dumpCommitlogCmd = &cobra.Command{
 			if dumpCommitlogOwner != "" {
 				q = q.Where("commit_logs.owner = ?", dumpCommitlogOwner)
 			}
-			if err := q.Find(&logs).Error; err != nil {
+			logs, err := q.Find(ctx)
+			if err != nil {
 				return fmt.Errorf("failed to query commit logs: %w", err)
 			}
 			if len(logs) == 0 {

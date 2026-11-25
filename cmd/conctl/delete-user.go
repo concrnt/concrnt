@@ -145,8 +145,7 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 
 	// What the server knows about this user, for the operator to confirm the
 	// target before anything happens.
-	var entity pgrecord.Entity
-	switch err := db.WithContext(ctx).Where("id = ?", ccid).Take(&entity).Error; {
+	switch entity, err := gorm.G[pgrecord.Entity](db).Where("id = ?", ccid).Take(ctx); {
 	case err == nil:
 		alias := ""
 		if entity.Alias != nil {
@@ -158,16 +157,16 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 	default:
 		return stats, fmt.Errorf("failed to query entity: %w", err)
 	}
-	var metas []pgentitymeta.EntityMeta
-	if err := db.WithContext(ctx).Where("id = ?", ccid).Find(&metas).Error; err != nil {
+	metas, err := gorm.G[pgentitymeta.EntityMeta](db).Where("id = ?", ccid).Find(ctx)
+	if err != nil {
 		return stats, fmt.Errorf("failed to query entity meta: %w", err)
 	}
-	var subscriptions []pgnotification.Subscription
-	if err := db.WithContext(ctx).Where("owner = ?", ccid).Find(&subscriptions).Error; err != nil {
+	subscriptions, err := gorm.G[pgnotification.Subscription](db).Where("owner = ?", ccid).Find(ctx)
+	if err != nil {
 		return stats, fmt.Errorf("failed to query subscriptions: %w", err)
 	}
-	var commits int64
-	if err := db.WithContext(ctx).Model(&pgrecord.CommitLog{}).Where("owner = ?", ccid).Count(&commits).Error; err != nil {
+	commits, err := gorm.G[pgrecord.CommitLog](db).Where("owner = ?", ccid).Count(ctx, "*")
+	if err != nil {
 		return stats, fmt.Errorf("failed to count commit logs: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "registered: %t, commit logs: %d, subscriptions: %d\n", len(metas) > 0, commits, len(subscriptions))
@@ -190,10 +189,11 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		for {
 			// Postgres has no DELETE ... LIMIT; batching via a subquery keeps
 			// each statement (and its cascade) bounded.
-			res := db.WithContext(ctx).
-				Exec("DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE owner = ? LIMIT ?)", ccid, deleteUserBatchSize)
-			if res.Error != nil {
-				return stats, fmt.Errorf("failed to delete commit logs: %w", res.Error)
+			res := gorm.WithResult()
+			err := gorm.G[any](db, res).
+				Exec(ctx, "DELETE FROM commit_logs WHERE id IN (SELECT id FROM commit_logs WHERE owner = ? LIMIT ?)", ccid, deleteUserBatchSize)
+			if err != nil {
+				return stats, fmt.Errorf("failed to delete commit logs: %w", err)
 			}
 			if res.RowsAffected == 0 {
 				break
@@ -224,14 +224,14 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		var ids []string
 		cursor := ""
 		for {
-			var logs []pgrecord.CommitLog
-			q := db.WithContext(ctx).
+			q := gorm.G[pgrecord.CommitLog](db).
 				Where("owner = ?", ccid).
 				Order("id ASC").Limit(deleteUserBatchSize)
 			if cursor != "" {
 				q = q.Where("id > ?", cursor)
 			}
-			if err := q.Find(&logs).Error; err != nil {
+			logs, err := q.Find(ctx)
+			if err != nil {
 				return stats, fmt.Errorf("failed to query commit logs: %w", err)
 			}
 			if len(logs) == 0 {
@@ -293,9 +293,10 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		// Only now, with every backup durable, delete exactly the backed-up commits.
 		for start := 0; start < len(ids); start += deleteUserBatchSize {
 			batch := ids[start:min(start+deleteUserBatchSize, len(ids))]
-			res := db.WithContext(ctx).Exec("DELETE FROM commit_logs WHERE id IN ?", batch)
-			if res.Error != nil {
-				return stats, fmt.Errorf("failed to delete commit logs: %w", res.Error)
+			res := gorm.WithResult()
+			err := gorm.G[any](db, res).Exec(ctx, "DELETE FROM commit_logs WHERE id IN ?", batch)
+			if err != nil {
+				return stats, fmt.Errorf("failed to delete commit logs: %w", err)
 			}
 			if res.RowsAffected != int64(len(batch)) {
 				fmt.Fprintf(os.Stderr, "warning: expected to delete %d commit logs but deleted %d (concurrent gc?)\n", len(batch), res.RowsAffected)
@@ -305,17 +306,17 @@ func deleteUser(ctx context.Context, db *gorm.DB, ccid string, backup *deleteUse
 		}
 	}
 
-	res := db.WithContext(ctx).Where("owner = ?", ccid).Delete(&pgnotification.Subscription{})
-	if res.Error != nil {
-		return stats, fmt.Errorf("failed to delete subscriptions: %w", res.Error)
+	deletedSubscriptions, err := gorm.G[pgnotification.Subscription](db).Where("owner = ?", ccid).Delete(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to delete subscriptions: %w", err)
 	}
-	stats.Subscriptions = res.RowsAffected
+	stats.Subscriptions = int64(deletedSubscriptions)
 
-	res = db.WithContext(ctx).Where("id = ?", ccid).Delete(&pgentitymeta.EntityMeta{})
-	if res.Error != nil {
-		return stats, fmt.Errorf("failed to delete entity meta: %w", res.Error)
+	deletedMetas, err := gorm.G[pgentitymeta.EntityMeta](db).Where("id = ?", ccid).Delete(ctx)
+	if err != nil {
+		return stats, fmt.Errorf("failed to delete entity meta: %w", err)
 	}
-	stats.Metas = res.RowsAffected
+	stats.Metas = int64(deletedMetas)
 
 	return stats, nil
 }

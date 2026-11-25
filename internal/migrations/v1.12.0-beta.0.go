@@ -41,18 +41,17 @@ func foldRecordsIntoRecordKeys(ctx context.Context) error {
 	if !ok || db == nil {
 		return nil
 	}
-	db = db.WithContext(ctx)
 
-	if !db.Migrator().HasTable("records") {
+	if !db.WithContext(ctx).Migrator().HasTable("records") {
 		return nil
 	}
 	var legacyForeignKeys []string
-	err := db.Raw(`
+	err := gorm.G[string](db).Raw(`
 SELECT conname FROM pg_constraint
 WHERE contype = 'f'
   AND conrelid = 'record_keys'::regclass
   AND confrelid = 'records'::regclass`).
-		Scan(&legacyForeignKeys).Error
+		Scan(ctx, &legacyForeignKeys)
 	if err != nil {
 		return fmt.Errorf("find record_keys foreign keys to records: %w", err)
 	}
@@ -66,7 +65,8 @@ WHERE contype = 'f'
 	// writes "" for a record without one, so every batch makes progress).
 	total := int64(0)
 	for {
-		result := db.Exec(`
+		result := gorm.WithResult()
+		err := gorm.G[any](db, result).Exec(ctx, `
 UPDATE record_keys k
 SET owner = r.owner,
     author = r.author,
@@ -83,8 +83,8 @@ WHERE r.document_id = k.record_id
     WHERE k2.schema IS NULL
     LIMIT ?
   )`, foldRecordsBatchSize)
-		if result.Error != nil {
-			return fmt.Errorf("copy records into record_keys: %w", result.Error)
+		if err != nil {
+			return fmt.Errorf("copy records into record_keys: %w", err)
 		}
 		total += result.RowsAffected
 		if result.RowsAffected == 0 {
@@ -100,7 +100,8 @@ WHERE r.document_id = k.record_id
 	// Deletes no longer keep retained history, so those versions and every
 	// delete commit not flagged yet (the ones that deleted a retained
 	// version) become gc candidates like any other deleted document.
-	result := db.Exec(`
+	result := gorm.WithResult()
+	err = gorm.G[any](db, result).Exec(ctx, `
 UPDATE commit_logs c
 SET gc_candidate = true
 WHERE NOT c.gc_candidate
@@ -110,18 +111,18 @@ WHERE NOT c.gc_candidate
       AND NOT EXISTS (SELECT 1 FROM records r WHERE r.document_id = c.id))
     OR c.document::jsonb->>'kind' = 'delete'
   )`)
-	if result.Error != nil {
-		return fmt.Errorf("flag deleted retained versions: %w", result.Error)
+	if err != nil {
+		return fmt.Errorf("flag deleted retained versions: %w", err)
 	}
 	slog.InfoContext(ctx, "flagged deleted retained versions and their deletes for gc", "rows", result.RowsAffected)
 
 	// 3. drop the record_keys index that only served the join to records,
 	// then record_keys' foreign key to records (last: see above).
-	if err := db.Exec(`DROP INDEX IF EXISTS idx_record_keys_parent_id_record_id`).Error; err != nil {
+	if err := gorm.G[any](db).Exec(ctx, `DROP INDEX IF EXISTS idx_record_keys_parent_id_record_id`); err != nil {
 		return fmt.Errorf("drop idx_record_keys_parent_id_record_id: %w", err)
 	}
 	for _, name := range legacyForeignKeys {
-		if err := db.Exec(fmt.Sprintf(`ALTER TABLE record_keys DROP CONSTRAINT %q`, name)).Error; err != nil {
+		if err := gorm.G[any](db).Exec(ctx, fmt.Sprintf(`ALTER TABLE record_keys DROP CONSTRAINT %q`, name)); err != nil {
 			return fmt.Errorf("drop record_keys foreign key %s: %w", name, err)
 		}
 	}

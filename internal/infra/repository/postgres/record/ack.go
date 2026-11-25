@@ -17,18 +17,9 @@ func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, d
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAck")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		return false, err
-	}
-
-	ack := Ack{
-		From:       from,
-		To:         to,
-		Schema:     schema,
-		DocumentID: documentID,
-		Valid:      valid,
-		CreatedAt:  createdAt,
 	}
 
 	// CIP-10 §4: only a document with a strictly newer createdAt may move
@@ -36,14 +27,19 @@ func (r *Repository) processAck(ctx context.Context, tx ucrecord.RepositoryTx, d
 	// (RowsAffected 0). The key is createdAt alone — never the document id —
 	// so the acker's and the associate owner's servers, which hold different
 	// documents with the same createdAt, reach the same decision.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
-		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": createdAt}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("acks.created_at < excluded.created_at")}},
-	}).Create(&ack)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	result := gorm.WithResult()
+	err = gorm.G[any](db, result).Exec(ctx, `
+INSERT INTO acks ("from", "to", schema, document_id, valid, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT ("from", "to", schema) DO UPDATE
+SET valid = excluded.valid,
+    document_id = excluded.document_id,
+    created_at = excluded.created_at
+WHERE acks.created_at < excluded.created_at`,
+		from, to, schema, documentID, valid, createdAt)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
 	}
 
 	return result.RowsAffected > 0, nil
@@ -63,18 +59,9 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 	ctx, span := tracer.Start(ctx, "Repository.Record.processAcked")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		return false, err
-	}
-
-	ack := Acked{
-		From:       from,
-		To:         to,
-		Schema:     schema,
-		DocumentID: documentID,
-		Valid:      valid,
-		CreatedAt:  createdAt,
 	}
 
 	// CIP-10 §4: only a document with a strictly newer createdAt may move
@@ -82,14 +69,19 @@ func (r *Repository) processAcked(ctx context.Context, tx ucrecord.RepositoryTx,
 	// (RowsAffected 0). The key is createdAt alone — never the document id —
 	// so the acker's and the associate owner's servers, which hold different
 	// documents with the same createdAt, reach the same decision.
-	result := db.Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "from"}, {Name: "to"}, {Name: "schema"}},
-		DoUpdates: clause.Assignments(map[string]any{"valid": valid, "document_id": documentID, "created_at": createdAt}),
-		Where:     clause.Where{Exprs: []clause.Expression{gorm.Expr("ackeds.created_at < excluded.created_at")}},
-	}).Create(&ack)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	result := gorm.WithResult()
+	err = gorm.G[any](db, result).Exec(ctx, `
+INSERT INTO ackeds ("from", "to", schema, document_id, valid, created_at)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT ("from", "to", schema) DO UPDATE
+SET valid = excluded.valid,
+    document_id = excluded.document_id,
+    created_at = excluded.created_at
+WHERE ackeds.created_at < excluded.created_at`,
+		from, to, schema, documentID, valid, createdAt)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
 	}
 
 	return result.RowsAffected > 0, nil
@@ -109,10 +101,8 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckRecords")
 	defer span.End()
 
-	var acks []Ack
-	query := r.db.WithContext(ctx).
-		Model(&Ack{}).
-		Preload("Document").
+	query := gorm.G[Ack](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
 		Where("acks.from = ?", from).
 		Where("acks.valid = ?", true)
 
@@ -137,7 +127,7 @@ func (r *Repository) getAckRecords(ctx context.Context, from, schema string, sin
 		query = query.Limit(limit)
 	}
 
-	err := query.Find(&acks).Error
+	acks, err := query.Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -171,10 +161,8 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 	ctx, span := tracer.Start(ctx, "Repository.Record.getAckedRecords")
 	defer span.End()
 
-	var acked []Acked
-	query := r.db.WithContext(ctx).
-		Model(&Acked{}).
-		Preload("Document").
+	query := gorm.G[Acked](r.db).
+		Joins(clause.LeftJoin.Association("Document"), nil).
 		Where("ackeds.to = ?", to).
 		Where("ackeds.valid = ?", true)
 
@@ -199,7 +187,7 @@ func (r *Repository) getAckedRecords(ctx context.Context, to, schema string, sin
 		query = query.Limit(limit)
 	}
 
-	err := query.Find(&acked).Error
+	acked, err := query.Find(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -257,8 +245,7 @@ func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string
 
 	var results []result
 
-	query := r.db.WithContext(ctx).
-		Model(&Ack{}).
+	query := gorm.G[Ack](r.db).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("acks.from = ?", from)
@@ -267,7 +254,7 @@ func (r *Repository) getAckRecordCounts(ctx context.Context, from, schema string
 		query = query.Where("acks.schema = ?", schema)
 	}
 
-	err := query.Group("schema").Scan(&results).Error
+	err := query.Group("schema").Scan(ctx, &results)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -292,8 +279,7 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 
 	var results []result
 
-	query := r.db.WithContext(ctx).
-		Model(&Acked{}).
+	query := gorm.G[Acked](r.db).
 		Select("schema, COUNT(*) AS count").
 		Where("valid = ?", true).
 		Where("ackeds.to = ?", to)
@@ -302,7 +288,7 @@ func (r *Repository) getAckedRecordCounts(ctx context.Context, to, schema string
 		query = query.Where("ackeds.schema = ?", schema)
 	}
 
-	err := query.Group("schema").Scan(&results).Error
+	err := query.Group("schema").Scan(ctx, &results)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err

@@ -34,7 +34,7 @@ func (r *Repository) CreateRecord(
 	ctx, span := tracer.Start(ctx, "Repository.Record.CreateRecord")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return false, err
@@ -45,11 +45,10 @@ func (r *Repository) CreateRecord(
 	// key, an equal or older one is a no-op. Deciding under the row lock
 	// closes the read-then-write race between concurrent commits, same as
 	// CreateEntity's conditional upsert.
-	var oldRecordKey RecordKey
-	err = db.Clauses(clause.Locking{Strength: "UPDATE"}).
+	oldRecordKey, err := gorm.G[RecordKey](db, clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", key).
-		Take(&oldRecordKey).Error
-	if err != nil && err != gorm.ErrRecordNotFound {
+		Take(ctx)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		span.RecordError(err)
 		return false, err
 	}
@@ -70,45 +69,33 @@ func (r *Repository) CreateRecord(
 	}
 	cleanOnUpdate := onUpdate == nil || *onUpdate != "retain"
 
-	// RecordKeyを作る
-	rk := RecordKey{
-		URI:             key,
-		ParentID:        pid,
-		RecordID:        &documentID,
-		Owner:           owner,
-		Author:          author,
-		Schema:          schema,
-		Redirect:        redirect,
-		Policies:        policies,
-		Distributions:   distributions,
-		RecordCreatedAt: &createdAt,
-		CleanOnUpdate:   cleanOnUpdate,
-	}
-
 	// The FOR UPDATE fast-path above cannot lock a RecordKey row that does not
 	// exist yet, so two concurrent commits to a fresh key both pass it. The
 	// conditional upsert closes that window the same way CreateEntity does:
 	// only a strictly newer document may take the key. IS NULL keeps normal
-	// writes to parent placeholder rows (RecordID nil) working.
-	result := db.Clauses(clause.OnConflict{
-		Columns: []clause.Column{{Name: "uri"}},
-		DoUpdates: clause.Assignments(map[string]any{
-			"record_id":         documentID,
-			"parent_id":         pid,
-			"owner":             owner,
-			"author":            author,
-			"schema":            schema,
-			"redirect":          redirect,
-			"policies":          policies,
-			"distributions":     pq.StringArray(distributions),
-			"record_created_at": createdAt,
-			"clean_on_update":   cleanOnUpdate,
-		}),
-		Where: clause.Where{Exprs: []clause.Expression{gorm.Expr("record_keys.record_id IS NULL OR record_keys.record_created_at IS NULL OR record_keys.record_created_at < excluded.record_created_at")}},
-	}).Create(&rk)
-	if result.Error != nil {
-		span.RecordError(result.Error)
-		return false, result.Error
+	// writes to parent placeholder rows (record_id NULL) working.
+	result := gorm.WithResult()
+	err = gorm.G[any](db, result).Exec(ctx, `
+INSERT INTO record_keys (uri, parent_id, record_id, owner, author, schema, redirect, policies, distributions, record_created_at, clean_on_update)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (uri) DO UPDATE
+SET parent_id = excluded.parent_id,
+    record_id = excluded.record_id,
+    owner = excluded.owner,
+    author = excluded.author,
+    schema = excluded.schema,
+    redirect = excluded.redirect,
+    policies = excluded.policies,
+    distributions = excluded.distributions,
+    record_created_at = excluded.record_created_at,
+    clean_on_update = excluded.clean_on_update
+WHERE record_keys.record_id IS NULL
+   OR record_keys.record_created_at IS NULL
+   OR record_keys.record_created_at < excluded.record_created_at`,
+		key, pid, documentID, owner, author, schema, redirect, policies, pq.StringArray(distributions), createdAt, cleanOnUpdate)
+	if err != nil {
+		span.RecordError(err)
+		return false, err
 	}
 	if result.RowsAffected == 0 {
 		return false, nil
@@ -117,9 +104,9 @@ func (r *Repository) CreateRecord(
 	// 古いRecordKeyが指していたCommitのGCフラグを立てる。retainを要求した版は
 	// commit logだけに残り、ccfsで読める
 	if oldRecordKey.CleanOnUpdate && oldRecordKey.RecordID != nil && *oldRecordKey.RecordID != documentID {
-		if err := db.Model(&CommitLog{}).
-			Where("id = ?", oldRecordKey.RecordID).
-			Update("gc_candidate", true).Error; err != nil {
+		if _, err := gorm.G[CommitLog](db).
+			Where("id = ?", *oldRecordKey.RecordID).
+			Update(ctx, "gc_candidate", true); err != nil {
 			span.RecordError(err)
 			return false, err
 		}
@@ -154,11 +141,10 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 		if parsed.Type != concrnt.CCFSTypeConcrnt {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
-		var commitLog CommitLog
-		err = r.db.WithContext(ctx).
+		commitLog, err := gorm.G[CommitLog](r.db).
 			Select("document").
 			Where("id = ? AND NOT gc_candidate", parsed.CDID).
-			Take(&commitLog).Error
+			Take(ctx)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, domain.NotFoundError{Resource: uri}
 		}
@@ -206,12 +192,11 @@ func (r *Repository) GetHierarchicalRecordPolicies(ctx context.Context, uri stri
 	}
 
 	var entries []policyTuple
-	err = r.db.WithContext(ctx).
-		Model(&RecordKey{}).
+	err = gorm.G[RecordKey](r.db).
 		Select("uri, policies AS policy, distributions").
 		Where("uri IN ?", hierarchy).
 		Where("record_id IS NOT NULL").
-		Find(&entries).Error
+		Scan(ctx, &entries)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
@@ -277,11 +262,16 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 
 	switch parsed.Scheme {
 	case "cckv":
-		var recordKey RecordKey
-		err = r.db.WithContext(ctx).
-			Joins("Document").
-			Where("record_keys.uri = ?", uri).
-			Take(&recordKey).Error
+		type recordRow struct {
+			RecordID *string
+			Document string
+			Proof    string
+		}
+		recordKey, err := gorm.G[recordRow](r.db).Raw(`
+SELECT k.record_id, c.document, c.proof
+FROM record_keys k
+LEFT JOIN commit_logs c ON c.id = k.record_id
+WHERE k.uri = ?`, uri).Take(ctx)
 		if err != nil {
 			span.RecordError(errors.Join(errors.New("failed to query recordkey from cckv"), err))
 			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
@@ -294,7 +284,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 		}
 
 		var proof concrnt.Proof
-		err = json.Unmarshal([]byte(recordKey.Document.Proof), &proof)
+		err = json.Unmarshal([]byte(recordKey.Proof), &proof)
 		if err != nil {
 			span.RecordError(errors.Join(errors.New("failed to unmarshal proof from recordkey"), err))
 			return nil, err
@@ -305,7 +295,7 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 		return &concrnt.SignedDocument{
 			CCKV:     &uri,
 			CCFS:     &ccfs,
-			Document: recordKey.Document.Document,
+			Document: recordKey.Document,
 			Proof:    proof,
 		}, nil
 
@@ -316,21 +306,19 @@ func (r *Repository) GetSignedDocument(ctx context.Context, uri string) (*concrn
 		// A commit flagged for gc is a version that was deleted or replaced
 		// without asking to be retained: it stays in the log only as a replay
 		// tombstone and is not served.
-		var commitLog CommitLog
-		err = r.db.WithContext(ctx).
+		commitLog, err := gorm.G[CommitLog](r.db).
 			Where("id = ? AND NOT gc_candidate", parsed.CDID).
-			Take(&commitLog).Error
+			Take(ctx)
 		if err != nil {
 			span.RecordError(errors.Join(errors.New("failed to query commitlog from ccfs"), err))
 			return nil, errors.Join(domain.NotFoundError{Resource: uri}, err)
 		}
 
 		var cckv *string = nil
-		var recordKey RecordKey
-		err = r.db.WithContext(ctx).
+		recordKey, err := gorm.G[RecordKey](r.db).
 			Select("uri").
 			Where("record_id = ?", commitLog.ID).
-			Take(&recordKey).Error
+			Take(ctx)
 		if err == nil {
 			cckv = &recordKey.URI
 		}
@@ -359,7 +347,7 @@ func (r *Repository) DeleteRecordByKey(ctx context.Context, tx ucrecord.Reposito
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByKey")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
@@ -380,14 +368,13 @@ func (r *Repository) DeleteRecordByDocumentID(ctx context.Context, tx ucrecord.R
 	ctx, span := tracer.Start(ctx, "Repository.Record.DeleteRecordByDocumentID")
 	defer span.End()
 
-	db, err := getRecordTx(ctx, tx)
+	db, err := getRecordTx(tx)
 	if err != nil {
 		span.RecordError(err)
 		return err
 	}
 
-	var rk RecordKey
-	err = db.Select("uri").Where("record_id = ?", documentID).Take(&rk).Error
+	rk, err := gorm.G[RecordKey](db).Select("uri").Where("record_id = ?", documentID).Take(ctx)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}
@@ -416,10 +403,9 @@ func removeRecordKey(ctx context.Context, db *gorm.DB, uri string) error {
 	ctx, span := tracer.Start(ctx, "Repository.Record.removeRecordKey")
 	defer span.End()
 
-	var rk RecordKey
-	err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+	rk, err := gorm.G[RecordKey](db, clause.Locking{Strength: "UPDATE"}).
 		Where("uri = ?", uri).
-		Take(&rk).Error
+		Take(ctx)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil
 	}
@@ -431,45 +417,44 @@ func removeRecordKey(ctx context.Context, db *gorm.DB, uri string) error {
 		return nil
 	}
 
-	hasChildren, err := recordKeyHasChildren(db, rk.ID)
+	hasChildren, err := recordKeyHasChildren(ctx, db, rk.ID)
 	if err != nil {
 		return err
 	}
 	if hasChildren {
-		err := db.Model(&RecordKey{}).
-			Where("id = ?", rk.ID).
-			Updates(map[string]any{
-				"record_id":         nil,
-				"owner":             nil,
-				"author":            nil,
-				"schema":            nil,
-				"redirect":          nil,
-				"policies":          nil,
-				"distributions":     nil,
-				"record_created_at": nil,
-				"clean_on_update":   false,
-			}).Error
+		err := gorm.G[any](db).Exec(ctx, `
+UPDATE record_keys
+SET record_id = NULL,
+    owner = NULL,
+    author = NULL,
+    schema = NULL,
+    redirect = NULL,
+    policies = NULL,
+    distributions = NULL,
+    record_created_at = NULL,
+    clean_on_update = false
+WHERE id = ?`, rk.ID)
 		if err != nil {
 			return err
 		}
-		return db.Delete(&Association{}, "target_id = ?", rk.ID).Error
-	}
-
-	if err := db.Delete(&RecordKey{}, "id = ?", rk.ID).Error; err != nil {
+		_, err = gorm.G[Association](db).Where("target_id = ?", rk.ID).Delete(ctx)
 		return err
 	}
-	return pruneEmptyPlaceholders(db, rk.ParentID)
+
+	if _, err := gorm.G[RecordKey](db).Where("id = ?", rk.ID).Delete(ctx); err != nil {
+		return err
+	}
+	return pruneEmptyPlaceholders(ctx, db, rk.ParentID)
 }
 
 // pruneEmptyPlaceholders walks up from parentID and deletes placeholder keys
 // that hold no record, no children and no associations, stopping at the
 // first ancestor that still holds something.
-func pruneEmptyPlaceholders(db *gorm.DB, parentID *int64) error {
+func pruneEmptyPlaceholders(ctx context.Context, db *gorm.DB, parentID *int64) error {
 	for parentID != nil {
-		var parent RecordKey
-		err := db.Clauses(clause.Locking{Strength: "UPDATE"}).
+		parent, err := gorm.G[RecordKey](db, clause.Locking{Strength: "UPDATE"}).
 			Where("id = ?", *parentID).
-			Take(&parent).Error
+			Take(ctx)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil
 		}
@@ -480,7 +465,7 @@ func pruneEmptyPlaceholders(db *gorm.DB, parentID *int64) error {
 			return nil
 		}
 
-		hasChildren, err := recordKeyHasChildren(db, parent.ID)
+		hasChildren, err := recordKeyHasChildren(ctx, db, parent.ID)
 		if err != nil {
 			return err
 		}
@@ -488,9 +473,9 @@ func pruneEmptyPlaceholders(db *gorm.DB, parentID *int64) error {
 			return nil
 		}
 
-		var hasAssociations bool
-		err = db.Raw("SELECT EXISTS (SELECT 1 FROM associations WHERE target_id = ?)", parent.ID).
-			Scan(&hasAssociations).Error
+		hasAssociations, err := gorm.G[bool](db).
+			Raw("SELECT EXISTS (SELECT 1 FROM associations WHERE target_id = ?)", parent.ID).
+			Take(ctx)
 		if err != nil {
 			return err
 		}
@@ -498,7 +483,7 @@ func pruneEmptyPlaceholders(db *gorm.DB, parentID *int64) error {
 			return nil
 		}
 
-		if err := db.Delete(&RecordKey{}, "id = ?", parent.ID).Error; err != nil {
+		if _, err := gorm.G[RecordKey](db).Where("id = ?", parent.ID).Delete(ctx); err != nil {
 			return err
 		}
 		parentID = parent.ParentID
@@ -506,21 +491,19 @@ func pruneEmptyPlaceholders(db *gorm.DB, parentID *int64) error {
 	return nil
 }
 
-func recordKeyHasChildren(db *gorm.DB, id int64) (bool, error) {
-	var exists bool
-	err := db.Raw("SELECT EXISTS (SELECT 1 FROM record_keys WHERE parent_id = ?)", id).
-		Scan(&exists).Error
-	return exists, err
+func recordKeyHasChildren(ctx context.Context, db *gorm.DB, id int64) (bool, error) {
+	return gorm.G[bool](db).
+		Raw("SELECT EXISTS (SELECT 1 FROM record_keys WHERE parent_id = ?)", id).
+		Take(ctx)
 }
 
 func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (string, string, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.GetTimelineRemoval")
 	defer span.End()
 
-	var recordKey RecordKey
-	err := r.db.WithContext(ctx).
+	recordKey, err := gorm.G[RecordKey](r.db).
 		Where("uri = ?", keyURI).
-		Take(&recordKey).Error
+		Take(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return "", "", domain.NotFoundError{Resource: keyURI}
@@ -531,11 +514,10 @@ func (r *Repository) GetTimelineRemoval(ctx context.Context, keyURI string) (str
 		return "", "", nil
 	}
 
-	var parent RecordKey
-	err = r.db.WithContext(ctx).
+	parent, err := gorm.G[RecordKey](r.db).
 		Select("uri").
 		Where("id = ?", *recordKey.ParentID).
-		Take(&parent).Error
+		Take(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return "", "", err
@@ -575,11 +557,9 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 	// UPDATE, then DELETE) cannot delete the parent while this child is being
 	// linked to it, and once it has, this lookup finds no row and recreates
 	// the parent. Overwrites of the parent's record are not blocked by it.
-	var parentRK RecordKey
-	err = db.WithContext(ctx).
-		Clauses(clause.Locking{Strength: "KEY SHARE"}).
+	parentRK, err := gorm.G[RecordKey](db, clause.Locking{Strength: "KEY SHARE"}).
 		Where("uri = ?", parentURI).
-		Take(&parentRK).Error
+		Take(ctx)
 	if err == nil {
 		return &parentRK, nil
 	}
@@ -599,46 +579,35 @@ func getOrCreateParentRecordKey(ctx context.Context, db *gorm.DB, uri string) (*
 		pid = &grandParent.ID
 	}
 
-	newRecordKey := RecordKey{
-		URI:      parentURI,
-		RecordID: nil,
-		ParentID: pid,
-	}
-
-	err = db.WithContext(ctx).Clauses(clause.OnConflict{
-		Columns:   []clause.Column{{Name: "uri"}},
-		DoNothing: true,
-	}).Create(&newRecordKey).Error
+	// DO NOTHING: another transaction may have created the parent first.
+	// Either way the row exists now and is read back under the same lock.
+	err = gorm.G[any](db).Exec(ctx, `
+INSERT INTO record_keys (uri, parent_id)
+VALUES (?, ?)
+ON CONFLICT (uri) DO NOTHING`, parentURI, pid)
 	if err != nil {
 		span.RecordError(err)
 		return nil, err
 	}
 
-	// 別トランザクションが先に作成済み（競合）なら ID は 0 のまま → 再取得
-	if newRecordKey.ID == 0 {
-		var existing RecordKey
-		err = db.WithContext(ctx).
-			Clauses(clause.Locking{Strength: "KEY SHARE"}).
-			Where("uri = ?", parentURI).
-			Take(&existing).Error
-		if err != nil {
-			span.RecordError(err)
-			return nil, err
-		}
-		return &existing, nil
+	created, err := gorm.G[RecordKey](db, clause.Locking{Strength: "KEY SHARE"}).
+		Where("uri = ?", parentURI).
+		Take(ctx)
+	if err != nil {
+		span.RecordError(err)
+		return nil, err
 	}
 
-	return &newRecordKey, nil
+	return &created, nil
 }
 
 func getRecordKeyByURI(ctx context.Context, db *gorm.DB, uri string) (*RecordKey, error) {
 	ctx, span := tracer.Start(ctx, "Repository.Record.getRecordKeyByURI")
 	defer span.End()
 
-	var recordKey RecordKey
-	err := db.WithContext(ctx).
+	recordKey, err := gorm.G[RecordKey](db).
 		Where("uri = ?", uri).
-		Take(&recordKey).Error
+		Take(ctx)
 	if err != nil {
 		span.RecordError(err)
 		return nil, domain.NotFoundError{Resource: "record key"}
