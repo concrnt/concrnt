@@ -70,12 +70,13 @@ type WellKnownEntry struct {
 }
 
 type Concrnt struct {
-	FQDN         string  `yaml:"fqdn"`
-	PrivateKey   string  `yaml:"privatekey"`
-	Registration string  `yaml:"registration"` // open, invite, close
-	Layer        string  `yaml:"layer"`
-	Debug        bool    `yaml:"debug"`
-	Cluster      Cluster `yaml:"cluster"`
+	FQDN                 string  `yaml:"fqdn"`
+	PrivateKey           string  `yaml:"privatekey"`
+	Registration         string  `yaml:"registration"` // open, invite, close
+	Layer                string  `yaml:"layer"`
+	Debug                bool    `yaml:"debug"`
+	Cluster              Cluster `yaml:"cluster"`
+	RestoreSchemeSlashes bool    `yaml:"restoreSchemeSlashes"`
 }
 
 type Cluster struct {

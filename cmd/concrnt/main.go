@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"syscall"
 	"time"
 
@@ -113,6 +114,18 @@ func main() {
 	}
 
 	e := echo.NewWithConfig(echoConfig)
+
+	if conf.Concrnt.RestoreSchemeSlashes {
+		schemeSlashes := regexp.MustCompile(`:/+`)
+		e.Pre(func(next echo.HandlerFunc) echo.HandlerFunc {
+			return func(c *echo.Context) error {
+				u := c.Request().URL
+				u.Path = schemeSlashes.ReplaceAllString(u.Path, "://")
+				u.RawPath = schemeSlashes.ReplaceAllString(u.RawPath, "://")
+				return next(c)
+			}
+		})
+	}
 
 	e.Use(echomiddleware.Recover())
 	setupMetrics(e)
