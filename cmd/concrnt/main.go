@@ -150,6 +150,7 @@ func main() {
 		LogResponseSize:  true,
 		LogValuesFunc: func(c *echo.Context, v echomiddleware.RequestLoggerValues) error {
 			attrs := []slog.Attr{
+				slog.String("module", "gateway"),
 				slog.String("remote_ip", v.RemoteIP),
 				slog.String("host", v.Host),
 				slog.String("method", v.Method),
