@@ -182,6 +182,19 @@ func (s fixedEntity) GetEntityByCCID(ctx context.Context, ccid string) (*domain.
 	return s.entity, nil
 }
 
+// onlyEntity serves one entity for its own ccid and nothing else, like the
+// real repository answers a lookup keyed by a domain.
+type onlyEntity struct {
+	entity *domain.Entity
+}
+
+func (s onlyEntity) GetEntityByCCID(ctx context.Context, ccid string) (*domain.Entity, error) {
+	if ccid != s.entity.ID {
+		return nil, domain.ErrNotFound
+	}
+	return s.entity, nil
+}
+
 // testServerRepo serves a fixed server descriptor for every lookup.
 type testServerRepo struct {
 	server *domain.Server
@@ -956,6 +969,42 @@ func TestCommitAssociationUniqueIncludesBody(t *testing.T) {
 	}
 	if repo.uniques[0] != repo.uniques[2] {
 		t.Fatal("associations with identical bodies must share a unique key")
+	}
+}
+
+// An association whose target lives in this server's namespace
+// (cckv://<fqdn>/...) is stored here, like one targeting a local entity.
+func TestCommitAssociationToServerNamespaceIsStored(t *testing.T) {
+	ccid, priv := newIdentity(t)
+	cfg := &domain.Config{FQDN: "example.com"}
+	repo := &associationRecordingRepo{}
+	uc := New(
+		withEntities(repo, onlyEntity{entity: &domain.Entity{ID: ccid, Domain: cfg.FQDN}}),
+		nil,
+		newTestServerUsecase(cfg),
+		cfg,
+		nil,
+		nopSignalService{},
+		nopPolicyService{},
+		nil,
+		nil,
+	)
+
+	associate := concrnt.CCURI{Scheme: "cckv", Owner: cfg.FQDN, Key: "communities/1"}.String()
+	sd := signTestDocument(t, concrnt.Document[any]{
+		Kind:      "association",
+		Associate: &associate,
+		Value:     map[string]any{},
+		Author:    ccid,
+		Schema:    "https://example.com/a/request.json",
+		CreatedAt: time.Now(),
+	}, priv)
+	if _, err := uc.Commit(context.Background(), "127.0.0.1", sd, domain.CommitModeDryRun); err != nil {
+		t.Fatalf("commit returned error: %v", err)
+	}
+
+	if len(repo.uniques) != 1 {
+		t.Fatalf("expected 1 CreateAssociation call, got %d", len(repo.uniques))
 	}
 }
 

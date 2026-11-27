@@ -76,10 +76,14 @@ func (uc *Usecase) createAssociation(ctx context.Context, tx RepositoryTx, ip st
 		CDID:   documentID,
 	}.String()
 
-	isLocal, err := uc.IsLocalEntityByCCID(ctx, targetURI.Owner)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	// a server-namespace target (cckv://<fqdn>/...) has no entity to look up
+	isLocal := targetURI.Owner == uc.config.FQDN
+	if concrnt.IsCCID(targetURI.Owner) {
+		isLocal, err = uc.IsLocalEntityByCCID(ctx, targetURI.Owner)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
 	}
 
 	postProcesses := []PostProcessAction{}
