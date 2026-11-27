@@ -199,6 +199,16 @@ type Entity struct {
 	Domain string  `json:"domain" gorm:"type:text"`
 	Tag    string  `json:"tag" gorm:"type:text;"`
 
+	// IsTrustSeed marks the entities the operator trusts outright (set with
+	// `conctl op trust-seed`); trust reaches every other entity through
+	// acknowledgements. Trust is the entity's score from the latest trust
+	// computation (see the trust usecase), 0 to 1: a result kept for
+	// inspection and for adding up per domain, never an input.
+	//   - idx_entities_is_trust_seed (partial, is_trust_seed): seed lookup.
+	//   - idx_entities_trust (partial, trust > 0): per-domain trust totals.
+	IsTrustSeed bool    `json:"isTrustSeed" gorm:"type:boolean;not null;default:false;index:idx_entities_is_trust_seed,where:is_trust_seed"`
+	Trust       float64 `json:"trust" gorm:"type:double precision;not null;default:0;index:idx_entities_trust,where:trust > 0"`
+
 	DocumentID string    `json:"id" gorm:"type:text"`
 	Document   CommitLog `json:"-" gorm:"foreignKey:DocumentID;references:ID;constraint:OnDelete:CASCADE;"`
 	// document createdAt: the accept-if-newer key (CIP-3 §3.4). Rows written

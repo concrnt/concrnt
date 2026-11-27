@@ -42,6 +42,27 @@ func (r *Redis) Incr(ctx context.Context, key string) (int64, error) {
 	return r.rdb.Incr(ctx, key).Result()
 }
 
+// IncrExpire increments an integer counter (created at 1 when missing), makes
+// it expire ttl from now, and returns the new value. The two commands run in
+// one MULTI/EXEC round trip, so a counter is never left without an expiry.
+func (r *Redis) IncrExpire(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	var incr *redis.IntCmd
+	_, err := r.rdb.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		incr = pipe.Incr(ctx, key)
+		pipe.Expire(ctx, key, ttl)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return incr.Val(), nil
+}
+
+// Decr decrements an integer counter and returns the new value.
+func (r *Redis) Decr(ctx context.Context, key string) (int64, error) {
+	return r.rdb.Decr(ctx, key).Result()
+}
+
 // GetInt reads an integer counter; a missing key reads as 0.
 func (r *Redis) GetInt(ctx context.Context, key string) (int64, error) {
 	value, err := r.rdb.Get(ctx, key).Int64()

@@ -16,7 +16,17 @@ import (
 	"github.com/concrnt/concrnt/internal/domain"
 )
 
+// Commit applies a document handed to this server from outside: a client or
+// another server. It is subject to the ingest limit.
 func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode) (*concrnt.SignedDocument, error) {
+	return uc.commit(ctx, ip, sd, mode, true)
+}
+
+// commit applies a document. ingress is false for the commits this server
+// makes on its own account — entity documents it fetched or found inlined,
+// and its own delivery jobs — which the ingest limit must not count: the
+// request that caused them was already counted, or was a local read.
+func (uc *Usecase) commit(ctx context.Context, ip string, sd concrnt.SignedDocument, mode domain.CommitMode, ingress bool) (*concrnt.SignedDocument, error) {
 	ctx, span := tracer.Start(ctx, "Usecase.Record.Commit")
 	defer span.End()
 
@@ -63,6 +73,22 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		err := domain.ValidationError{Field: "createdAt", Message: "createdAt is too far in the future"}
 		span.RecordError(err)
 		return nil, err
+	}
+
+	// Dump imports and registrations (LocalOnlyExecute) are authenticated
+	// local operations, not federation traffic.
+	limited := ingress && uc.ingest != nil && !isServiceAccount && mode == domain.CommitModeExecute
+
+	// Checked before anything is verified or resolved, so a flood of
+	// documents by never-seen authors is turned away at the cost of one
+	// local lookup. The author is still an unverified claim here, which is
+	// fine for a bucket nobody owns; a domain's own bucket is only charged
+	// below, once the signature has proven the author.
+	if limited {
+		if err := uc.limitUnknownAuthor(ctx, doc.Author); err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
 	}
 
 	if !isServiceAccount {
@@ -155,6 +181,13 @@ func (uc *Usecase) Commit(ctx context.Context, ip string, sd concrnt.SignedDocum
 		}
 		if isAckedKind {
 			requester = &domain.Entity{ID: requesterID}
+		}
+	}
+
+	if limited && requester != nil && requester.Domain != "" && !uc.IsLocalEntity(ctx, requester) {
+		if err := uc.limitDomain(ctx, requester.Domain); err != nil {
+			span.RecordError(err)
+			return nil, err
 		}
 	}
 

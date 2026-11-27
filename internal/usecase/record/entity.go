@@ -183,7 +183,7 @@ func (uc *Usecase) GetEntity(ctx context.Context, uri string) (*domain.Entity, e
 			return nil, err
 		}
 
-		_, err = uc.Commit(ctx, hint, sd, domain.CommitModeExecute)
+		_, err = uc.commit(ctx, hint, sd, domain.CommitModeExecute, false)
 		if err != nil {
 			return nil, err
 		}
@@ -247,7 +247,7 @@ func (uc *Usecase) recheckEntityByHint(ctx context.Context, ccid, hint string) (
 		return fmt.Errorf("hint %s served a %q document by %s for %s", hint, fetched.Kind, fetched.Author, ccid)
 	}
 
-	if _, err := uc.Commit(ctx, hint, sd, domain.CommitModeExecute); err != nil {
+	if _, err := uc.commit(ctx, hint, sd, domain.CommitModeExecute, false); err != nil {
 		return err
 	}
 	slog.Info("entity document rechecked by hint",
@@ -303,7 +303,7 @@ func (uc *Usecase) getEntityWithReference(ctx context.Context, ip string, ccid s
 	}
 
 	if newer {
-		if _, err := uc.Commit(ctx, ip, ref, domain.CommitModeExecute); err != nil {
+		if _, err := uc.commit(ctx, ip, ref, domain.CommitModeExecute, false); err != nil {
 			span.RecordError(err)
 			slog.Warn("failed to apply inlined entity document",
 				slog.String("ccid", ccid),

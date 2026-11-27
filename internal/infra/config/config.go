@@ -77,6 +77,9 @@ type Concrnt struct {
 	Debug                bool    `yaml:"debug"`
 	Cluster              Cluster `yaml:"cluster"`
 	RestoreSchemeSlashes bool    `yaml:"restoreSchemeSlashes"`
+	// IngestLimit rate-limits commits from other servers' users; see
+	// domain.IngestLimit.
+	IngestLimit domain.IngestLimit `yaml:"ingestLimit"`
 }
 
 type Cluster struct {
@@ -235,5 +238,6 @@ func (c Config) DomainConfig() domain.Config {
 		CSID:         csid,
 		Meta:         c.Meta,
 		Debug:        c.Concrnt.Debug,
+		IngestLimit:  c.Concrnt.IngestLimit,
 	}
 }
